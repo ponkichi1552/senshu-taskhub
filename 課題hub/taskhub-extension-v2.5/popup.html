@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>課題通知Hub連携</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --green: #2f855a;
+        --blue: #2563eb;
+        --border: #d8dee4;
+        --bg: #f6f8fa;
+        --text: #24292f;
+        --muted: #6e7781;
+        --danger: #cf222e;
+      }
+
+      body {
+        width: 360px;
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--text);
+        background: white;
+      }
+
+      header {
+        padding: 12px 14px;
+        color: white;
+        background: var(--green);
+        font-weight: 700;
+      }
+
+      main {
+        padding: 12px 14px 14px;
+      }
+
+      .hint {
+        margin: 0 0 10px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.55;
+      }
+
+      button {
+        border: 0;
+        border-radius: 8px;
+        padding: 9px 12px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .primary {
+        width: 100%;
+        color: white;
+        background: var(--blue);
+      }
+
+      .secondary {
+        color: var(--blue);
+        background: #eef4ff;
+      }
+
+      label {
+        display: block;
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      input,
+      select {
+        box-sizing: border-box;
+        width: 100%;
+        margin-top: 5px;
+        padding: 8px 9px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        font: inherit;
+        font-size: 12px;
+      }
+
+      .setting-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-top: 10px;
+        padding: 9px 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg);
+      }
+
+      .setting-title {
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .setting-sub {
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.35;
+      }
+
+      .setting-select {
+        flex: 0 0 86px;
+        width: 86px;
+        margin-top: 0;
+        background: white;
+      }
+
+      .switch {
+        position: relative;
+        display: inline-flex;
+        flex: 0 0 auto;
+        width: 42px;
+        height: 24px;
+      }
+
+      .switch input {
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+      }
+
+      .slider {
+        position: absolute;
+        inset: 0;
+        border-radius: 999px;
+        background: #afb8c1;
+        cursor: pointer;
+        transition: background 0.16s ease;
+      }
+
+      .slider::before {
+        content: "";
+        position: absolute;
+        top: 3px;
+        left: 3px;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: white;
+        transition: transform 0.16s ease;
+      }
+
+      .switch input:checked + .slider {
+        background: var(--green);
+      }
+
+      .switch input:checked + .slider::before {
+        transform: translateX(18px);
+      }
+
+      .row {
+        display: flex;
+        gap: 8px;
+        margin-top: 8px;
+      }
+
+      .row button {
+        flex: 1;
+      }
+
+      .token-row {
+        display: grid;
+        grid-template-columns: 1fr 72px;
+        gap: 8px;
+        align-items: end;
+      }
+
+      .token-row input {
+        min-width: 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      .token-row button {
+        margin-top: 5px;
+        padding-left: 8px;
+        padding-right: 8px;
+      }
+
+      pre {
+        box-sizing: border-box;
+        max-height: 260px;
+        overflow: auto;
+        margin: 10px 0 0;
+        padding: 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg);
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .status {
+        min-height: 18px;
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .error {
+        color: var(--danger);
+      }
+
+      .sync-summary {
+        display: none;
+        margin-top: 10px;
+      }
+
+      .sync-summary.visible {
+        display: block;
+      }
+
+      .summary-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      .summary-title {
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .summary-badge {
+        padding: 2px 7px;
+        border-radius: 999px;
+        color: white;
+        background: var(--green);
+        font-size: 11px;
+        font-weight: 700;
+      }
+
+      .summary-badge.error {
+        background: var(--danger);
+      }
+
+      .summary-badge.skipped {
+        background: var(--muted);
+      }
+
+      .summary-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 6px;
+      }
+
+      .summary-item {
+        padding: 7px 6px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg);
+        text-align: center;
+      }
+
+      .summary-value {
+        font-size: 15px;
+        font-weight: 800;
+      }
+
+      .summary-label {
+        margin-top: 1px;
+        color: var(--muted);
+        font-size: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>課題通知Hub連携</header>
+    <main>
+      <p class="hint">
+        inCampusの課題抽出と、Google Classroomの完了状態同期を行います。ID/パスワードは読み取りません。
+      </p>
+      <button id="extract" class="primary" type="button">inCampusこのページから抽出</button>
+      <label for="webAppUrl">GAS WebアプリURL</label>
+      <input id="webAppUrl" type="url" placeholder="https://script.google.com/macros/s/.../exec">
+      <label for="apiToken">APIトークン</label>
+      <div class="token-row">
+        <input id="apiToken" type="password" autocomplete="off" spellcheck="false" placeholder="Hubのセキュリティ設定からコピー">
+        <button id="toggleApiToken" class="secondary" type="button">表示</button>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-title">inCampus自動同期</div>
+          <div class="setting-sub">inCampusホーム到達時に自動でHubへ送信</div>
+        </div>
+        <label class="switch" for="autoSyncEnabled" aria-label="inCampus自動同期">
+          <input id="autoSyncEnabled" type="checkbox">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-title">Classroom自動同期</div>
+          <div class="setting-sub">Classroomホーム・未提出・完了で自動同期</div>
+        </div>
+        <label class="switch" for="classroomAutoSyncEnabled" aria-label="Classroom自動同期">
+          <input id="classroomAutoSyncEnabled" type="checkbox">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-title">同期対象件数</div>
+          <div class="setting-sub">更新一覧から取得する上限</div>
+        </div>
+        <select id="syncLimit" class="setting-select" aria-label="同期対象件数">
+          <option value="10">10件</option>
+          <option value="25">25件</option>
+          <option value="50">50件</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-title">プレビューのみ</div>
+          <div class="setting-sub">抽出だけ行い、Hubへ送信しない</div>
+        </div>
+        <label class="switch" for="previewOnly" aria-label="プレビューのみ">
+          <input id="previewOnly" type="checkbox">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="row">
+        <button id="copy" class="secondary" type="button" disabled>JSONをコピー</button>
+        <button id="send" class="secondary" type="button" disabled>Hubへ送信</button>
+        <button id="clear" class="secondary" type="button">クリア</button>
+      </div>
+      <div class="row">
+        <button id="syncNow" class="secondary" type="button">更新一覧から同期</button>
+        <button id="reloadStatus" class="secondary" type="button">直近結果</button>
+      </div>
+      <div class="row">
+        <button id="classroomSync" class="secondary" type="button">Classroom完了同期</button>
+        <button id="classroomDueSync" class="secondary" type="button">Classroom期限同期</button>
+      </div>
+      <div class="row">
+        <button id="incampusDebug" class="secondary" type="button">inCampus送信予定を見る</button>
+        <button id="classroomDebug" class="secondary" type="button">Classroom送信予定を見る</button>
+      </div>
+      <div class="row">
+        <button id="checkSetup" class="secondary" type="button">設定チェック</button>
+      </div>
+      <div id="status" class="status"></div>
+      <div id="syncSummary" class="sync-summary"></div>
+      <pre id="output">まだ抽出していません。</pre>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

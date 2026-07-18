@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "課題通知Hub連携",
+  "version": "2.5.5",
+  "description": "inCampus課題情報とGoogle Classroomの完了状態・期限時刻を課題通知Hubへ送信します。",
+  "permissions": ["activeTab", "clipboardWrite", "storage"],
+  "host_permissions": [
+    "https://ic.ss.senshu-u.ac.jp/*",
+    "https://classroom.google.com/*",
+    "https://script.google.com/*",
+    "https://script.googleusercontent.com/*"
+  ],
+  "action": {
+    "default_title": "課題通知Hub連携",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://ic.ss.senshu-u.ac.jp/*",
+        "https://classroom.google.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
