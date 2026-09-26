@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html>
   <head>
+    <meta charset="utf-8">
     <base target="_top">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <?!= include('Styles'); ?>
@@ -41,7 +42,7 @@
 
     <nav class="bottom-nav" aria-label="画面切り替え">
       <button id="bottom-home-button" class="bottom-nav-button" onclick="loadNotifications()">課題通知</button>
-      <button id="bottom-active-button" class="bottom-nav-button" type="button" disabled>大学からのお知らせ</button>
+      <button id="bottom-active-button" class="bottom-nav-button" type="button" onclick="showUniversityNotices()">大学からのお知らせ</button>
       <button id="bottom-completed-button" class="bottom-nav-button" type="button" disabled>大学情報まとめ</button>
       <button id="bottom-course-button" class="bottom-nav-button" type="button" disabled>過去問データベース</button>
     </nav>
@@ -101,6 +102,8 @@
       </section>
     </div>
 
+    <?!= include('UniversityView'); ?>
+    <?!= include('UniversityScripts'); ?>
     <?!= include('Scripts'); ?>
   </body>
 </html>

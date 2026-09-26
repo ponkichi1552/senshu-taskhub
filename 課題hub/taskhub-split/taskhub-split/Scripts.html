@@ -6,7 +6,10 @@
 
   let lastUndoMessageId = '';
   let undoToastTimerId = null;
-  let pendingUndoMessageIds = new Set();
+  const notificationData = {active: [], completed: []};
+  const notificationRequestIds = {active: 0, completed: 0};
+  const notificationStatusChanges = new Map();
+  let notificationStatusGeneration = 0;
   let currentViewMode = 'active';
   let currentRawData = [];
   let homeRawData = [];
@@ -22,7 +25,7 @@
   showHelpOnFirstVisit();
 
   setInterval(() => {
-    if (currentViewMode === 'active') {
+    if (currentScreen === 'active' || currentScreen === 'home') {
       refreshNotifications();
     }
   }, AUTO_REFRESH_INTERVAL);
@@ -32,49 +35,28 @@
   }
 
   function loadHomeNotifications() {
-    const syncText = document.getElementById('home-sync-text');
-
-    if (syncText) {
-      syncText.textContent = '同期中...';
-    }
-
-    google.script.run
-      .withSuccessHandler(data => {
-        homeRawData = Array.isArray(data) ? data : [];
-        rememberExistingNotifications(data);
-
-        if (currentScreen === 'home') {
-          renderHome();
-          updateBottomNavState();
-        }
-
-        updateHomeSyncText();
-      })
-      .withFailureHandler(error => {
-        console.error(error);
-
-        if (syncText) {
-          syncText.textContent = '同期失敗';
-        }
-      })
-      .refreshAndGetNotificationsForWeb();
+    requestNotificationData('active', {
+      method: 'refreshAndGetNotificationsForWeb', remember: true, homeSync: true
+    });
   }
 
   function showHomeView() {
     currentScreen = 'home';
+    currentViewMode = 'active';
     closeCourseFilterPanel();
     setAppView('home');
-    renderHome();
-    updateBottomNavState();
+    refreshCurrentView();
   }
 
   function showAssignmentView(viewMode = 'active') {
     currentScreen = viewMode === 'completed' ? 'completed' : 'active';
+    currentViewMode = currentScreen;
     setAppView('assignment');
-    updateBottomNavState();
+    refreshCurrentView();
   }
 
   function setAppView(viewName) {
+    document.getElementById('university-view').classList.toggle('is-active', viewName === 'university');
     const homeView = document.getElementById('home-view');
     const assignmentView = document.getElementById('assignment-view');
 
@@ -427,81 +409,64 @@
     messageElement.classList.toggle('is-error', Boolean(isError));
   }
 
-  function runListRequest(loadingText, successHandler) {
+  function requestNotificationData(viewMode, options = {}) {
+    const requestId = ++notificationRequestIds[viewMode];
+    const statusGeneration = notificationStatusGeneration;
     const list = document.getElementById('list');
-    list.textContent = loadingText;
+    const syncText = document.getElementById('home-sync-text');
+    const isCurrentRequest = () => requestId === notificationRequestIds[viewMode]
+      && statusGeneration === notificationStatusGeneration;
 
-    return google.script.run
-      .withSuccessHandler(successHandler)
-      .withFailureHandler(error => {
-        console.error(error);
-        list.textContent = 'エラーが発生しました：' + getErrorMessage(error);
-      });
-  }
+    if (options.loadingText && currentScreen === viewMode) {
+      list.textContent = options.loadingText;
+    }
+    if (options.homeSync && syncText) {
+      syncText.textContent = '同期中...';
+    }
 
-  function runSilentRequest(successHandler) {
-    return google.script.run
-      .withSuccessHandler(successHandler)
+    const runner = google.script.run
+      .withSuccessHandler(data => {
+        if (!isCurrentRequest()) return;
+        setNotificationData(data, viewMode);
+        if (options.remember) rememberExistingNotifications(data);
+        if (options.notify) notifyNewNotifications(notificationData[viewMode]);
+        if (viewMode === 'active') updateHomeSyncText();
+      })
       .withFailureHandler(error => {
+        if (!isCurrentRequest()) return;
         console.error(error);
+        if (options.loadingText && currentScreen === viewMode) {
+          list.textContent = 'エラーが発生しました：' + getErrorMessage(error);
+        }
+        if (viewMode === 'active' && syncText) syncText.textContent = '同期失敗';
       });
-  }
-
-  function runAlertingRequest(failureMessage, successHandler) {
-    return google.script.run
-      .withSuccessHandler(successHandler)
-      .withFailureHandler(error => {
-        console.error(error);
-        alert(failureMessage + getErrorMessage(error));
-      });
+    const method = options.method || (viewMode === 'completed'
+      ? 'getCompletedNotificationsForWeb' : 'getNotificationsForWeb');
+    runner[method]();
   }
 
   function rebuildNotifications() {
-  runListRequest(
-    '通知一覧を再構築中...',
-    data => {
-      setNotificationData(data, 'active');
-      rememberExistingNotifications(data);
-    }
-  )
-    .rebuildAndGetNotificationsForWeb();
-}
+    requestNotificationData('active', {
+      method: 'rebuildAndGetNotificationsForWeb',
+      loadingText: '通知一覧を再構築中...', remember: true
+    });
+  }
 
   function loadNotifications() {
-  closeCourseFilterPanel();
-  showAssignmentView('active');
-
-  runListRequest(
-    '読み込み中...',
-    data => {
-      setNotificationData(data, 'active');
-      rememberExistingNotifications(data);
-    }
-  )
-    .getNotificationsForWeb();
-}
+    closeCourseFilterPanel();
+    showAssignmentView('active');
+    requestNotificationData('active', {loadingText: '読み込み中...', remember: true});
+  }
 
   function loadCompletedNotifications() {
-  closeCourseFilterPanel();
-  showAssignmentView('completed');
-
-  runListRequest(
-    '完了済み一覧を読み込み中...',
-    data => {
-      setNotificationData(data, 'completed');
-    }
-  )
-    .getCompletedNotificationsForWeb();
-}
-
+    closeCourseFilterPanel();
+    showAssignmentView('completed');
+    requestNotificationData('completed', {loadingText: '完了済み一覧を読み込み中...'});
+  }
 
   function refreshNotifications() {
-  runSilentRequest(data => {
-    setNotificationData(data, 'active');
-    notifyNewNotifications(data);
-  })
-    .refreshAndGetNotificationsForWeb();
-}
+    requestNotificationData('active', {method: 'refreshAndGetNotificationsForWeb', notify: true});
+  }
 
   function requestBrowserNotificationPermission() {
     if (!('Notification' in window)) {
@@ -520,24 +485,13 @@
 
   function manualRefreshNotifications() {
     if (currentScreen === 'completed') {
-      runListRequest(
-        '完了済み一覧を更新中...',
-        data => {
-          setNotificationData(data, 'completed');
-        }
-      )
-        .getCompletedNotificationsForWeb();
+      requestNotificationData('completed', {loadingText: '完了済み一覧を更新中...'});
       return;
     }
 
-    runListRequest(
-      '更新中...',
-      data => {
-        setNotificationData(data, 'active');
-        notifyNewNotifications(data);
-      }
-    )
-      .refreshAndGetNotificationsForWeb();
+    requestNotificationData('active', {
+      method: 'refreshAndGetNotificationsForWeb', loadingText: '更新中...', notify: true
+    });
   }
 
   function notifyNewNotifications(data) {
@@ -616,9 +570,15 @@
   }
 
   function refreshCurrentView() {
+    homeRawData = notificationData.active;
     if (currentScreen === 'home') {
+      currentViewMode = 'active';
+      currentRawData = notificationData.active;
       renderHome();
-    } else {
+    } else if (currentScreen === 'active' || currentScreen === 'completed') {
+      currentViewMode = currentScreen;
+      currentRawData = notificationData[currentScreen];
+      if (!hasCourseName(currentRawData, selectedCourseName)) selectedCourseName = 'すべて';
       renderCourseFilterList();
       renderFilteredNotifications();
       updateActiveFilterBar();
@@ -628,18 +588,16 @@
   }
 
   function setNotificationData(data, viewMode = 'active') {
-    currentViewMode = viewMode;
-    currentRawData = Array.isArray(data) ? data : [];
-
-    if (viewMode === 'active') {
-      homeRawData = currentRawData;
+    notificationData[viewMode] = Array.isArray(data) ? data.slice() : [];
+    // Reads may finish while a status change is still in flight. Preserve the
+    // latest local intent until the serialized writes finish and we read again.
+    notificationStatusChanges.forEach((change, messageId) => {
+      applyNotificationStatusToCache(messageId, change.desiredDone, change.item);
+    });
+    homeRawData = notificationData.active;
+    if (currentScreen === viewMode || (viewMode === 'active' && currentScreen === 'home')) {
+      refreshCurrentView();
     }
-
-    if (!hasCourseName(currentRawData, selectedCourseName)) {
-      selectedCourseName = 'すべて';
-    }
-
-    refreshCurrentView();
   }
 
   function hasCourseName(data, courseName) {
@@ -689,21 +647,32 @@
       }))
     ];
 
-    container.innerHTML = buttons.map(item => {
-      const activeClass = item.name === selectedCourseName ? ' active' : '';
-      const encodedName = encodeURIComponent(item.name);
+    container.innerHTML = '';
 
-      return `
-        <button class="course-filter-chip${activeClass}" onclick="selectCourseFilter('${encodedName}')">
-          <span class="course-filter-name">${escapeHtml(item.name)}</span>
-          <span class="course-filter-count">${item.count}件</span>
-        </button>
-      `;
-    }).join('');
+    buttons.forEach(item => {
+      const button = document.createElement('button');
+      const name = document.createElement('span');
+      const count = document.createElement('span');
+
+      button.type = 'button';
+      button.className = 'course-filter-chip';
+      button.classList.toggle('active', item.name === selectedCourseName);
+      button.addEventListener('click', () => selectCourseFilter(item.name));
+
+      name.className = 'course-filter-name';
+      name.textContent = item.name;
+
+      count.className = 'course-filter-count';
+      count.textContent = `${item.count}件`;
+
+      button.appendChild(name);
+      button.appendChild(count);
+      container.appendChild(button);
+    });
   }
 
-  function selectCourseFilter(encodedCourseName) {
-    selectedCourseName = decodeURIComponent(encodedCourseName || 'すべて');
+  function selectCourseFilter(courseName) {
+    selectedCourseName = String(courseName || 'すべて');
 
     refreshCurrentView();
     closeCourseFilterPanel();
@@ -762,12 +731,19 @@
 
     if (currentScreen === 'home') {
       setBottomNavButton(homeButton, '課題通知', loadNotifications, false, false);
-      setBottomNavButton(activeButton, '大学からのお知らせ', null, false, true);
+      setBottomNavButton(activeButton, '大学からのお知らせ', showUniversityNotices, false, false);
       setBottomNavButton(completedButton, '大学情報まとめ', null, false, true);
       setBottomNavButton(courseButton, '過去問データベース', null, false, true);
       return;
     }
 
+    if (currentScreen === 'university') {
+      setBottomNavButton(homeButton, 'ホーム', showHomeView, false, false);
+      setBottomNavButton(activeButton, '大学からのお知らせ', showUniversityNotices, true, false);
+      setBottomNavButton(completedButton, '課題通知', loadNotifications, false, false);
+      setBottomNavButton(courseButton, '大学情報まとめ', null, false, true);
+      return;
+    }
     setBottomNavButton(homeButton, 'ホーム', showHomeView, false, false);
     setBottomNavButton(activeButton, '未完了', loadNotifications, currentScreen === 'active', false);
     setBottomNavButton(completedButton, '完了済み', loadCompletedNotifications, currentScreen === 'completed', false);
@@ -859,8 +835,6 @@ function toggleGroup(viewMode, groupKey) {
 }
 
   function renderNotifications(data, viewMode = 'active') {
-  currentViewMode = viewMode;
-
   const list = document.getElementById('list');
 
   if (!data || data.length === 0) {
@@ -921,7 +895,8 @@ function toggleGroup(viewMode, groupKey) {
         <div class="title">${escapeHtml(item.title || 'タイトル未抽出')}</div>
         <div class="due">期限：${escapeHtml(item.dueDate || '未検出')}</div>
         <div class="status">状態：${escapeHtml(getDisplayDueStatus(item.dueStatus))} / ${escapeHtml(getDisplayStatus(item.status))}</div>
-        <div class="status">受信：${escapeHtml(item.receivedAt || '')}</div>
+        <div class="status">メール受信：${escapeHtml(item.receivedAt || '')}</div>
+        ${item.supplementKey ? '<div class="status">inCampusの課題詳細で補足済み</div>' : ''}
 
         <div class="button-row">
           ${getClassroomOpenButtonHtml(item)}
@@ -1273,33 +1248,84 @@ function toggleGroup(viewMode, groupKey) {
 
   function markAsDone(encodedMessageId) {
     const messageId = decodeURIComponent(encodedMessageId || '');
-
-    if (!messageId) {
-      return;
-    }
-
-    currentRawData = currentRawData.filter(item => String(item.messageId || '') !== messageId);
-    refreshCurrentView();
+    if (!messageId) return;
+    requestNotificationStatus(messageId, true, '完了状態の更新に失敗しました：');
     showUndoToast(messageId);
+  }
 
-    google.script.run
-      .withSuccessHandler(data => {
-        if (pendingUndoMessageIds.has(messageId)) {
-          restoreNotificationAfterUndo(messageId);
-          return;
-        }
+  function applyNotificationStatusToCache(messageId, done, fallbackItem) {
+    const matches = item => String(item.messageId || '') === messageId;
+    const item = notificationData.active.find(matches)
+      || notificationData.completed.find(matches) || fallbackItem;
+    notificationData.active = notificationData.active.filter(item => !matches(item));
+    notificationData.completed = notificationData.completed.filter(item => !matches(item));
+    if (item) {
+      notificationData[done ? 'completed' : 'active'].push({
+        ...item, status: done ? '完了' : '未確認',
+        completedAtTime: done ? (item.completedAtTime || Date.now()) : 0
+      });
+    }
+  }
 
-        if (currentViewMode === 'active') {
-          setNotificationData(data, 'active');
+  function requestNotificationStatus(messageId, done, failureMessage) {
+    let change = notificationStatusChanges.get(messageId);
+    if (!change) {
+      const item = notificationData.active.concat(notificationData.completed)
+        .find(item => String(item.messageId || '') === messageId);
+      change = {item, confirmedDone: Boolean(item && item.status === '完了'), version: 0, inFlight: false};
+      notificationStatusChanges.set(messageId, change);
+    }
+    change.desiredDone = done;
+    change.failureMessage = failureMessage;
+    change.version++;
+    notificationStatusGeneration++;
+    applyNotificationStatusToCache(messageId, done, change.item);
+    refreshCurrentView();
+    if (!change.inFlight) sendNotificationStatus(messageId, change);
+  }
+
+  function sendNotificationStatus(messageId, change) {
+    const done = change.desiredDone;
+    const version = change.version;
+    change.inFlight = true;
+    const runner = google.script.run
+      .withSuccessHandler(() => {
+        change.inFlight = false;
+        change.confirmedDone = done;
+        notificationStatusGeneration++;
+        if (change.desiredDone !== done) {
+          sendNotificationStatus(messageId, change);
+        } else {
+          finishNotificationStatus(messageId);
         }
       })
       .withFailureHandler(error => {
+        change.inFlight = false;
+        notificationStatusGeneration++;
         console.error(error);
-        pendingUndoMessageIds.delete(messageId);
-        alert('完了状態の更新に失敗しました：' + getErrorMessage(error));
-        loadNotifications();
-      })
-      .markNotificationDone(messageId);
+        // A newer click takes precedence even if the previous RPC failed. Send
+        // it explicitly, since a transport failure can follow a server write.
+        if (change.version !== version) {
+          sendNotificationStatus(messageId, change);
+          return;
+        }
+        applyNotificationStatusToCache(messageId, change.confirmedDone, change.item);
+        if (lastUndoMessageId === messageId) hideUndoToast();
+        alert(change.failureMessage + getErrorMessage(error));
+        finishNotificationStatus(messageId);
+      });
+    runner[done ? 'markNotificationDone' : 'markNotificationUndone'](messageId);
+  }
+
+  function finishNotificationStatus(messageId) {
+    notificationStatusChanges.delete(messageId);
+    refreshCurrentView();
+    if (notificationStatusChanges.size === 0) {
+      // Mutation responses contain whole-list snapshots which may predate a
+      // different task's update. Read both caches after all pending writes.
+      requestNotificationData('active');
+      requestNotificationData('completed');
+    }
   }
 
   function showUndoToast(messageId) {
@@ -1344,31 +1370,8 @@ function toggleGroup(viewMode, groupKey) {
       return;
     }
 
-    pendingUndoMessageIds.add(messageId);
     hideUndoToast();
-
-    runAlertingRequest(
-      '取消に失敗しました：',
-      () => {
-        loadNotifications();
-      }
-    )
-      .markNotificationUndone(messageId);
-  }
-
-  function restoreNotificationAfterUndo(messageId) {
-    google.script.run
-      .withSuccessHandler(() => {
-        pendingUndoMessageIds.delete(messageId);
-        loadNotifications();
-      })
-      .withFailureHandler(error => {
-        console.error(error);
-        pendingUndoMessageIds.delete(messageId);
-        alert('取消に失敗しました：' + getErrorMessage(error));
-        loadNotifications();
-      })
-      .markNotificationUndone(messageId);
+    requestNotificationStatus(messageId, false, '取消に失敗しました：');
   }
 
   function markAsUndone(encodedMessageId) {
@@ -1378,13 +1381,7 @@ function toggleGroup(viewMode, groupKey) {
       return;
     }
 
-    runAlertingRequest(
-      '未完了への戻しに失敗しました：',
-      data => {
-        setNotificationData(data, 'completed');
-      }
-    )
-      .markNotificationUndone(messageId);
+    requestNotificationStatus(messageId, false, '未完了への戻しに失敗しました：');
   }
 
   function escapeHtml(text) {

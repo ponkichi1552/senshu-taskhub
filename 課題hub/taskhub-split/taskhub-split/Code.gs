@@ -1,10 +1,28 @@
 const CONFIG = {
-  SHEET_NAME: '通知一覧',
-  QUERY: '(from:classroom.google.com OR from:no-reply-incampus@isc.senshu-u.ac.jp) newer_than:30d',
-  MAX_THREADS: 100,
-  LOOKBACK_DAYS: 30,
+  LEGACY_SHEET_NAME: '通知一覧',
+  CLASSROOM_SHEET_NAME: 'Classroom通知',
+  INCAMPUS_NOTIFICATION_SHEET_NAME: 'inCampus通知',
+  NOTIFICATION_RETENTION_MONTHS: 2,
   BODY_LIMIT: 5000
 };
+
+const NOTIFICATION_STORAGE_CONFIGS = [
+  {
+    source: 'Google Classroom',
+    sheetName: CONFIG.CLASSROOM_SHEET_NAME,
+    // Search slightly beyond two calendar months; filter each message precisely.
+    query: 'from:classroom.google.com newer_than:63d',
+    batchSize: 100
+  },
+  {
+    source: 'inCampus',
+    sheetName: CONFIG.INCAMPUS_NOTIFICATION_SHEET_NAME,
+    query: 'from:no-reply-incampus@isc.senshu-u.ac.jp newer_than:63d',
+    batchSize: 100
+  }
+];
+
+const AUTO_FETCH_HANDLER = 'saveClassroomMailsToSheet';
 
 const HEADER_ROW = [
   '保存日時',
@@ -20,7 +38,9 @@ const HEADER_ROW = [
   'Gmailリンク',
   '本文',
   '確認状態',
-  '完了日時'
+  '完了日時',
+  '更新レコード状態',
+  '適用済み提出記録'
 ];
 
 const TASK_KEYWORDS = [
@@ -39,19 +59,6 @@ const TASK_KEYWORDS = [
   'アクティビティ'
 ];
 
-const ANNOUNCEMENT_TASK_KEYWORDS = [
-  '課題',
-  '宿題',
-  'レポート',
-  '提出',
-  '小テスト',
-  'リフレクション',
-  '予習',
-  '復習',
-  '確認テスト',
-  'アクティビティ'
-];
-
 function doGet() {
   ensureUserStorageForWeb_();
 
@@ -66,16 +73,23 @@ function include(filename) {
 }
 
 function ensureUserStorageForWeb_() {
+  return runWithUserLock_('保存データ処理', () => ensureUserStorageForWebLocked_());
+}
+
+function ensureUserStorageForWebLocked_() {
   try {
     const ss = getOrCreateSpreadsheet_();
 
-    setupHeader_(getOrCreateSheet_(ss));
+    ensureNotificationStorage_(ss);
     getOrCreateInCampusSheet_();
+    const autoFetchTrigger = ensureAutoFetchTrigger_();
 
     return {
       ok: true,
       spreadsheetId: ss.getId(),
-      spreadsheetUrl: ss.getUrl()
+      spreadsheetUrl: ss.getUrl(),
+      autoFetchTriggerCreated: autoFetchTrigger.created,
+      removedDuplicateTriggers: autoFetchTrigger.removedDuplicates
     };
   } catch (error) {
     Logger.log('ユーザー用スプレッドシート初期化に失敗: ' + (error && error.message ? error.message : error));
@@ -117,120 +131,106 @@ function saveClassroomMailsToSheet() {
   return runWithUserLock_('メール保存処理', saveClassroomMailsToSheetLocked_);
 }
 
+// Globals are isolated per Apps Script execution. Nested operations share its lock.
+let userStorageLockDepth_ = 0;
 function runWithUserLock_(label, callback) {
+  if (userStorageLockDepth_ > 0) return callback();
   const lock = LockService.getUserLock();
   let hasLock = false;
-
   try {
     if (!lock.tryLock(5000)) {
       throw new Error((label || '処理') + 'が混み合っています。少し待ってから再実行してください。');
     }
-
     hasLock = true;
+    userStorageLockDepth_++;
     return callback();
   } finally {
     if (hasLock) {
-      lock.releaseLock();
+      try { SpreadsheetApp.flush(); }
+      finally { userStorageLockDepth_--; lock.releaseLock(); }
     }
   }
 }
 
 function saveClassroomMailsToSheetLocked_() {
   const ss = getOrCreateSpreadsheet_();
-  const sheet = getOrCreateSheet_(ss);
-
-  setupHeader_(sheet);
-
-  const savedMessageIds = getSavedMessageIds_(sheet);
-  const threads = GmailApp.search(CONFIG.QUERY, 0, CONFIG.MAX_THREADS);
-
+  const sheetsBySource = ensureNotificationStorage_(ss);
+  const retentionCutoff = getNotificationRetentionCutoff_(new Date());
   let savedCount = 0;
+  const savedCountsBySource = {};
 
-  threads.forEach(thread => {
-    const messages = thread.getMessages();
+  NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+    const sheet = sheetsBySource[storageConfig.source];
+    const savedMessageIds = getSavedMessageIds_(sheet);
+    const newRows = [];
 
-    if (!messages || messages.length === 0) {
-      return;
+    for (let offset = 0; ; offset += storageConfig.batchSize) {
+      const threads = GmailApp.search(storageConfig.query, offset, storageConfig.batchSize);
+      threads.forEach(thread => {
+        const messages = thread.getMessages();
+
+        if (!messages || messages.length === 0) {
+          return;
+        }
+
+        const gmailLink = thread.getPermalink();
+
+        messages.forEach(message => {
+          const messageId = String(message.getId() || '');
+
+          if (!messageId || savedMessageIds.has(messageId)) {
+            return;
+          }
+
+          const from = message.getFrom();
+          const source = detectSource_(from);
+
+          if (source !== storageConfig.source) {
+            return;
+          }
+
+          const receivedDate = message.getDate();
+
+          if (!receivedDate || receivedDate.getTime() <= retentionCutoff.getTime()) {
+            return;
+          }
+
+          const subject = message.getSubject();
+          const body = message.getPlainBody() || '';
+          const extracted = extractNotificationInfo_(source, subject, body, receivedDate);
+
+          newRows.push(toSafeSpreadsheetRow_([
+            new Date(),
+            messageId,
+            source,
+            extracted.courseName,
+            extracted.title,
+            extracted.dueDate,
+            extracted.dueStatus,
+            subject,
+            from,
+            receivedDate,
+            gmailLink,
+            body.slice(0, CONFIG.BODY_LIMIT),
+            '未確認',
+            ''
+          ]));
+
+          savedMessageIds.add(messageId);
+        });
+      });
+
+      if (threads.length < storageConfig.batchSize) break;
     }
 
-    const gmailLink = thread.getPermalink();
-
-    messages.forEach(message => {
-      const messageId = String(message.getId() || '');
-
-      if (!messageId || savedMessageIds.has(messageId)) {
-        return;
-      }
-
-      const from = message.getFrom();
-      const source = detectSource_(from);
-
-      if (source === 'その他') {
-        return;
-      }
-
-      const receivedDate = message.getDate();
-
-      if (!isWithinLookback_(receivedDate, CONFIG.LOOKBACK_DAYS)) {
-        return;
-      }
-
-      const subject = message.getSubject();
-      const body = message.getPlainBody() || '';
-      const submissionRecords = source === 'inCampus'
-        ? extractInCampusSubmissionRecords_(subject, body)
-        : [];
-
-      if (submissionRecords.length > 0) {
-        const firstRecord = submissionRecords[0];
-
-        sheet.appendRow(toSafeSpreadsheetRow_([
-          new Date(),
-          messageId,
-          source,
-          firstRecord.courseName || extractInCampusCourseName_(body),
-          firstRecord.title || subject,
-          '',
-          '提出記録',
-          subject,
-          from,
-          receivedDate,
-          gmailLink,
-          body.slice(0, CONFIG.BODY_LIMIT),
-          '完了記録',
-          firstRecord.submittedAt || receivedDate
-        ]));
-
-        savedMessageIds.add(messageId);
-        savedCount++;
-        return;
-      }
-
-      const extracted = extractNotificationInfo_(source, subject, body, receivedDate);
-
-      sheet.appendRow(toSafeSpreadsheetRow_([
-        new Date(),
-        messageId,
-        source,
-        extracted.courseName,
-        extracted.title,
-        extracted.dueDate,
-        extracted.dueStatus,
-        subject,
-        from,
-        receivedDate,
-        gmailLink,
-        body.slice(0, CONFIG.BODY_LIMIT),
-        '未確認',
-        ''
-      ]));
-
-      savedMessageIds.add(messageId);
-      savedCount++;
-    });
+    appendNotificationRows_(sheet, newRows);
+    normalizeNotificationSheet_(sheet, storageConfig);
+    savedCountsBySource[storageConfig.source] = newRows.length;
+    savedCount += newRows.length;
   });
 
-  const autoCompletedCount = applySavedInCampusSubmissionRecords_(sheet);
+  const inCampusSheet = sheetsBySource.inCampus;
+  const autoCompletedCount = applySavedInCampusSubmissionRecords_(inCampusSheet);
 
   Logger.log('保存件数: ' + savedCount);
   Logger.log('inCampus提出記録による自動完了件数: ' + autoCompletedCount);
@@ -238,6 +238,8 @@ function saveClassroomMailsToSheetLocked_() {
 
   return {
     savedCount,
+    classroomSavedCount: savedCountsBySource['Google Classroom'] || 0,
+    inCampusSavedCount: savedCountsBySource.inCampus || 0,
     autoCompletedCount,
     spreadsheetId: ss.getId(),
     spreadsheetUrl: ss.getUrl()
@@ -245,6 +247,10 @@ function saveClassroomMailsToSheetLocked_() {
 }
 
 function getOrCreateSpreadsheet_() {
+  return runWithUserLock_('保存データ処理', () => getOrCreateSpreadsheetLocked_());
+}
+
+function getOrCreateSpreadsheetLocked_() {
   const configuredId = getConfiguredSpreadsheetId_();
 
   if (configuredId) {
@@ -282,29 +288,201 @@ function getConfiguredSpreadsheetId_() {
   return '';
 }
 
-function getOrCreateSheet_(ss) {
-  let sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+function getNotificationStorageConfigForSource_(source) {
+  return NOTIFICATION_STORAGE_CONFIGS.find(config => config.source === source) || null;
+}
 
-  if (!sheet) {
-    sheet = ss.insertSheet(CONFIG.SHEET_NAME);
+function getOrCreateNotificationSheet_(ss, source) {
+  const storageConfig = getNotificationStorageConfigForSource_(source);
+
+  if (!storageConfig) {
+    throw new Error('通知元に対応する保存先がありません: ' + source);
   }
 
+  let sheet = ss.getSheetByName(storageConfig.sheetName);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(storageConfig.sheetName);
+  }
+
+  setupHeader_(sheet);
   return sheet;
 }
 
-function setupHeader_(sheet) {
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(HEADER_ROW);
-  } else {
-    sheet.getRange(1, 1, 1, HEADER_ROW.length).setValues([HEADER_ROW]);
+function ensureNotificationStorage_(ss) {
+  return runWithUserLock_('保存データ処理', () => ensureNotificationStorageLocked_(ss));
+}
+
+function ensureNotificationStorageLocked_(ss) {
+  const spreadsheet = ss || getOrCreateSpreadsheet_();
+  const sheetsBySource = {};
+
+  NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+    sheetsBySource[storageConfig.source] = getOrCreateNotificationSheet_(spreadsheet, storageConfig.source);
+  });
+
+  migrateLegacyNotificationSheet_(spreadsheet, sheetsBySource);
+
+  // Retention/sorting belongs to ingestion. Reads must not rewrite every data row.
+  return sheetsBySource;
+}
+
+function migrateLegacyNotificationSheet_(ss, sheetsBySource) {
+  const legacySheet = ss.getSheetByName(CONFIG.LEGACY_SHEET_NAME);
+
+  if (!legacySheet) {
+    return;
   }
 
-  sheet.setFrozenRows(1);
+  if (legacySheet.getLastRow() >= 2) {
+    const legacyRows = legacySheet.getDataRange().getValues().slice(1);
 
-  const lastColumn = Math.max(sheet.getLastColumn(), HEADER_ROW.length);
+    NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+      const destinationSheet = sheetsBySource[storageConfig.source];
+      const savedMessageIds = getSavedMessageIds_(destinationSheet);
+      const rowsToMigrate = legacyRows
+        .filter(row => String(row[2] || '') === storageConfig.source)
+        .filter(row => {
+          const messageId = String(row[1] || '').trim();
 
-  if (lastColumn > 0) {
-    sheet.autoResizeColumns(1, lastColumn);
+          if (!messageId || savedMessageIds.has(messageId)) {
+            return false;
+          }
+
+          savedMessageIds.add(messageId);
+          return true;
+        })
+        .map(row => normalizeNotificationRowWidth_(row));
+
+      appendNotificationRows_(destinationSheet, rowsToMigrate);
+    });
+  }
+
+  ss.deleteSheet(legacySheet);
+  SpreadsheetApp.flush();
+}
+
+function normalizeNotificationRowWidth_(row) {
+  const normalized = [];
+
+  for (let i = 0; i < HEADER_ROW.length; i++) {
+    normalized.push(row && row[i] !== undefined ? row[i] : '');
+  }
+
+  return normalized;
+}
+
+function appendNotificationRows_(sheet, rows) {
+  if (!sheet || !Array.isArray(rows) || rows.length === 0) {
+    return;
+  }
+
+  const normalizedRows = rows.map(row => normalizeNotificationRowWidth_(row));
+  sheet
+    .getRange(sheet.getLastRow() + 1, 1, normalizedRows.length, HEADER_ROW.length)
+    .setValues(normalizedRows);
+}
+
+function parseNotificationReceivedDate_(value) {
+  if (value === '' || value === null || value === undefined) return null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value;
+  }
+
+  const parsed = new Date(value);
+
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+// Subtract calendar months, clamping month-end dates (e.g. April 30 -> February 28).
+function getNotificationRetentionCutoff_(referenceDate) {
+  const cutoff = new Date(referenceDate);
+  const day = cutoff.getDate();
+  cutoff.setDate(1);
+  cutoff.setMonth(cutoff.getMonth() - CONFIG.NOTIFICATION_RETENTION_MONTHS);
+  const lastDay = new Date(cutoff.getFullYear(), cutoff.getMonth() + 1, 0).getDate();
+  cutoff.setDate(Math.min(day, lastDay));
+  return cutoff;
+}
+
+function normalizeNotificationRowsForStorage_(rows, storageConfig, referenceDate) {
+  const now = referenceDate instanceof Date && !Number.isNaN(referenceDate.getTime())
+    ? new Date(referenceDate)
+    : new Date();
+  const earliest = getNotificationRetentionCutoff_(now);
+  const seenMessageIds = new Set();
+
+  return rows
+    .map(row => normalizeNotificationRowWidth_(row))
+    .filter(row => String(row[2] || '') === storageConfig.source)
+    .filter(row => {
+      const receivedDate = parseNotificationReceivedDate_(row[9]);
+
+      // Keep unknown dates: they are not evidence that a message is old.
+      if (!receivedDate || receivedDate.getTime() > earliest.getTime()) return true;
+      // A dated Classroom announcement must survive storage cleanup until its date.
+      if (storageConfig.source === 'Google Classroom' && getClassroomNotificationType_(row[11]) === 'newAnnouncement') {
+        const expiry = getClassroomNoticeExpiry_(row[11], receivedDate);
+        return expiry !== null && now.getTime() < expiry;
+      }
+      return false;
+    })
+    .sort((left, right) => {
+      const leftDate = parseNotificationReceivedDate_(left[9]);
+      const rightDate = parseNotificationReceivedDate_(right[9]);
+      const receivedDiff = (rightDate ? rightDate.getTime() : 0) - (leftDate ? leftDate.getTime() : 0);
+
+      if (receivedDiff !== 0) {
+        return receivedDiff;
+      }
+
+      return getTimeForSort_(right[0]) - getTimeForSort_(left[0]);
+    })
+    .filter(row => {
+      const messageId = String(row[1] || '').trim();
+
+      if (!messageId || seenMessageIds.has(messageId)) {
+        return false;
+      }
+
+      seenMessageIds.add(messageId);
+      return true;
+    });
+}
+
+function normalizeNotificationSheet_(sheet, storageConfig) {
+  setupHeader_(sheet);
+
+  const currentRows = sheet.getLastRow() >= 2
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, HEADER_ROW.length).getValues()
+    : [];
+  const normalizedRows = normalizeNotificationRowsForStorage_(currentRows, storageConfig);
+
+  // Write retained rows first, then remove the obsolete tail below them.
+  // The header stays in row 1 and the newest received message is in row 2.
+  if (normalizedRows.length > 0) {
+    sheet
+      .getRange(2, 1, normalizedRows.length, HEADER_ROW.length)
+      .setValues(normalizedRows);
+  }
+
+  const removedCount = currentRows.length - normalizedRows.length;
+  if (removedCount > 0) {
+    // Keep at least one unfrozen row even when every data row expires.
+    if (sheet.getMaxRows() - removedCount < 2) {
+      sheet.insertRowsAfter(sheet.getMaxRows(), 1);
+    }
+    sheet.deleteRows(normalizedRows.length + 2, removedCount);
+  }
+
+  SpreadsheetApp.flush();
+}
+
+function setupHeader_(sheet) {
+  const current = sheet.getRange(1, 1, 1, HEADER_ROW.length).getValues()[0];
+  if (HEADER_ROW.some((name, index) => current[index] !== name)) {
+    sheet.getRange(1, 1, 1, HEADER_ROW.length).setValues([HEADER_ROW]);
+    sheet.setFrozenRows(1);
   }
 }
 
@@ -360,10 +538,11 @@ function extractInCampusCourseName_(body) {
 }
 
 function extractInCampusTitle_(subject, body) {
+  if (/^\s*お知らせ内容\s*[:：]/m.test(String(body || ''))) return subject || 'タイトル未抽出';
   const updateLines = getInCampusUpdateLines_(body);
 
   for (const line of updateLines) {
-    const title = extractInCampusAddedItemTitle_(line);
+    const title = extractInCampusUpdateTitle_(line);
 
     if (title) {
       return title;
@@ -384,37 +563,34 @@ function getInCampusUpdateLines_(body) {
   return lines.slice(markerIndex + 1);
 }
 
-function extractInCampusAddedItemTitle_(line) {
-  const text = String(line || '').trim();
-  const patterns = [
-    /[・\s]*(課題|お知らせ|教材|資料)\s*[（(](.+?)[）)]\s*が追加されました/,
-    /[・\s]*(課題|お知らせ|教材|資料)\s*[「『]([^」』]+)[」』]\s*が追加されました/
-  ];
+function getInCampusUpdateKind_(value) {
+  const prefix = String(value || '').trim().replace(/^[・･·\s]+/, '').slice(0, 2);
+  return prefix === '課題' ? 'assignment' : prefix === 'お知' ? 'announcement' : '';
+}
 
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
+function extractInCampusUpdateTitle_(value) {
+  const text = String(value || '').trim().replace(/^[・･·\s]+/, '');
+  const match = text.match(/^(?:課題|お知らせ)\s*[（(](.*)[）)]\s*(?:が|を)/) ||
+    text.match(/^(?:課題|お知らせ)\s*[「『](.*)[」』]\s*(?:が|を)/);
+  return match ? match[1].trim() : '';
+}
 
-    if (!match) {
-      continue;
-    }
-
-    const itemType = String(match[1] || '').trim();
-    const title = String(match[2] || '').trim();
-
-    if (!title) {
-      return '';
-    }
-
-    if (itemType === '課題') {
-      return title;
-    }
-
-    if (TASK_KEYWORDS.some(keyword => title.includes(keyword))) {
-      return title;
-    }
+function getInCampusMailKind_(body) {
+  const fields = extractRequiredInCampusFieldsFromBody_(body);
+  if (fields) return getInCampusUpdateKind_(fields.updateContent);
+  const lines = getCleanLines_(body);
+  if (lines.some(line => /^お知らせ内容\s*[:：]/.test(line))) return 'announcement';
+  const marker = lines.findIndex(line => /^更新内容\s*[:：]/.test(line));
+  if (marker >= 0) {
+    const line = lines[marker].replace(/^更新内容\s*[:：]\s*/, '') || lines[marker + 1] || '';
+    return getInCampusUpdateKind_(line);
   }
-
   return '';
+}
+
+function extractInCampusAddedItemTitle_(line) {
+  if (getInCampusUpdateKind_(line) !== 'assignment' || !/が(?:追加|更新)されました/.test(line)) return '';
+  return extractInCampusUpdateTitle_(line);
 }
 
 function isInCampusTaskRelated_(subject, body) {
@@ -429,28 +605,160 @@ function isInCampusTaskRelated_(subject, body) {
   return lines.some(line => extractInCampusAddedItemTitle_(line) !== '');
 }
 
-function extractInCampusSubmissionRecords_(subject, body) {
+function extractRequiredInCampusFieldsFromBody_(body) {
+  const lines = getCleanLines_(body);
+  let fields = {
+    weekdayPeriod: '',
+    courseName: '',
+    teacherName: '',
+    updateContent: ''
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = String(lines[i] || '').trim();
+    let match = line.match(/^(?:曜日・時限|時限・曜日)\s*[:：]\s*(.+)$/);
+
+    if (match) {
+      fields = {
+        weekdayPeriod: String(match[1] || '').trim(),
+        courseName: '',
+        teacherName: '',
+        updateContent: ''
+      };
+      continue;
+    }
+
+    match = line.match(/^授業名\s*[:：]\s*(.+)$/);
+
+    if (match) {
+      fields.courseName = String(match[1] || '').trim();
+      continue;
+    }
+
+    match = line.match(/^(?:教員名|発信者)\s*[:：]\s*(.+)$/);
+
+    if (match) {
+      fields.teacherName = String(match[1] || '').trim();
+      continue;
+    }
+
+    match = line.match(/^更新内容\s*[:：]\s*(.*)$/);
+
+    if (!match) {
+      continue;
+    }
+
+    const inlineContent = String(match[1] || '').trim();
+    const nextLine = inlineContent || String(lines[i + 1] || '').trim();
+
+    if (
+      !nextLine ||
+      /^(曜日・時限|授業名|教員名|更新内容)\s*[:：]/.test(nextLine) ||
+      /^=+$/.test(nextLine) ||
+      nextLine.startsWith('※※')
+    ) {
+      continue;
+    }
+
+    fields.updateContent = nextLine;
+
+    if (
+      fields.weekdayPeriod &&
+      fields.courseName &&
+      fields.teacherName &&
+      fields.updateContent
+    ) {
+      return fields;
+    }
+  }
+
+  return null;
+}
+
+function extractInCampusMailRecords_(subject, body, receivedDate) {
   const lines = getCleanLines_(`${subject || ''}\n${body || ''}`);
   const records = [];
+  let weekdayPeriod = '';
+  let courseName = '';
+  let teacherName = '';
 
-  lines.forEach((line, index) => {
-    const title = extractInCampusSubmittedItemTitle_(line);
+  lines.forEach(line => {
+    const text = String(line || '').trim();
+    let match = text.match(/^(?:曜日・時限|時限・曜日)\s*[:：]\s*(.+)$/);
 
-    if (!title) {
+    if (match) {
+      weekdayPeriod = String(match[1] || '').trim();
+      courseName = '';
+      teacherName = '';
       return;
     }
 
-    const courseName = findInCampusSubmissionCourseName_(lines, index);
-    const submittedAt = extractDateTimeFromInCampusLine_(line);
+    match = text.match(/^授業名\s*[:：]\s*(.+)$/);
+
+    if (match) {
+      courseName = String(match[1] || '').trim();
+      return;
+    }
+
+    match = text.match(/^(?:教員名|発信者)\s*[:：]\s*(.+)$/);
+
+    if (match) {
+      teacherName = String(match[1] || '').trim();
+      return;
+    }
+
+    const bracketCourseName = extractInCampusCourseNameFromBracketLine_(text);
+
+    if (bracketCourseName) {
+      courseName = bracketCourseName;
+      return;
+    }
+
+    const addedTitle = extractInCampusAddedItemTitle_(text);
+    const submittedTitle = extractInCampusSubmittedItemTitle_(text);
+    const announcementTitle = getInCampusUpdateKind_(text) === 'announcement' ? extractInCampusUpdateTitle_(text) : '';
+
+    if (!addedTitle && !submittedTitle && !announcementTitle) {
+      return;
+    }
+
+    const recordType = submittedTitle ? 'submission' : announcementTitle ? 'announcement' : 'assignment';
+    const title = submittedTitle || addedTitle || announcementTitle;
 
     records.push({
-      courseName,
+      type: recordType,
+      weekdayPeriod,
+      teacherName,
+      courseName: courseName || 'inCampusお知らせ',
       title,
-      submittedAt
+      occurredAt: extractDateTimeFromInCampusLine_(text, receivedDate),
+      body: buildInCampusMailRecordBody_(weekdayPeriod, courseName, teacherName, text)
     });
   });
 
-  return records;
+  return deduplicateInCampusMailRecords_(records);
+}
+
+function buildInCampusMailRecordBody_(weekdayPeriod, courseName, teacherName, updateLine) {
+  return [
+    weekdayPeriod ? `曜日・時限：${weekdayPeriod}` : '',
+    courseName ? `授業名：${courseName}` : '',
+    teacherName ? `教員名：${teacherName}` : '',
+    '更新内容：',
+    updateLine
+  ].filter(Boolean).join('\n');
+}
+
+function extractInCampusSubmissionRecords_(subject, body, receivedDate) {
+  return extractInCampusMailRecords_(subject, body, receivedDate)
+    .filter(record => record.type === 'submission')
+    .map(record => ({
+      courseName: record.courseName,
+      weekdayPeriod: record.weekdayPeriod,
+      title: record.title,
+      submittedAt: record.occurredAt,
+      body: record.body
+    }));
 }
 
 function extractInCampusSubmittedItemTitle_(line) {
@@ -479,32 +787,6 @@ function extractInCampusSubmittedItemTitle_(line) {
   return '';
 }
 
-function findInCampusSubmissionCourseName_(lines, lineIndex) {
-  for (let i = lineIndex - 1; i >= 0; i--) {
-    const line = String(lines[i] || '').trim();
-
-    if (!line) {
-      continue;
-    }
-
-    const courseName = extractInCampusCourseNameFromBracketLine_(line);
-
-    if (courseName) {
-      return courseName;
-    }
-
-    if (/^授業名\s*[:：]/.test(line)) {
-      return line.replace(/^授業名\s*[:：]\s*/, '').trim();
-    }
-
-    if (extractInCampusSubmittedItemTitle_(line)) {
-      break;
-    }
-  }
-
-  return '';
-}
-
 function extractInCampusCourseNameFromBracketLine_(line) {
   const text = String(line || '').trim();
   const match = text.match(/^\[([^\]]+)\]$/);
@@ -520,93 +802,194 @@ function extractInCampusCourseNameFromBracketLine_(line) {
   return courseName;
 }
 
-function extractDateTimeFromInCampusLine_(line) {
+function extractDateTimeFromInCampusLine_(line, receivedDate) {
   const text = String(line || '');
-  const match = text.match(/(\d{4}\/\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2})/);
+  let match = text.match(/(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}:\d{2})/);
+
+  if (match) {
+    return buildDateWithTime_(match[1], match[2], match[3], match[4]);
+  }
+
+  match = text.match(/(?:^|[^\d])(\d{1,2})\/(\d{1,2})\s+(\d{1,2}:\d{2})(?!\d)/);
 
   if (!match) {
     return '';
   }
 
-  const date = new Date(match[1]);
+  const parsedReceivedDate = receivedDate instanceof Date
+    ? receivedDate
+    : new Date(receivedDate);
+  const baseDate = Number.isNaN(parsedReceivedDate.getTime())
+    ? new Date()
+    : parsedReceivedDate;
+  const resolveYear = createMonthDayYearResolver_(baseDate);
+  const year = resolveYear(match[1], match[2]);
 
-  return Number.isNaN(date.getTime()) ? match[1] : date;
+  return buildDateWithTime_(year, match[1], match[2], match[3]);
 }
 
 function applySavedInCampusSubmissionRecords_(sheet) {
-  if (!sheet || sheet.getLastRow() < 2) {
-    return 0;
-  }
+  return runWithUserLock_('保存データ処理', () => applySavedInCampusSubmissionRecordsLocked_(sheet));
+}
 
+function applySavedInCampusSubmissionRecordsLocked_(sheet) {
+  if (!sheet || sheet.getLastRow() < 2) return 0;
   const values = sheet.getDataRange().getValues();
   let completedCount = 0;
-
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
-    const source = String(row[2] || '');
-
-    if (source !== 'inCampus') {
-      continue;
-    }
-
-    const records = extractInCampusSubmissionRecords_(row[7], row[11]);
-
-    records.forEach(record => {
-      if (completeMatchingInCampusMailRow_(sheet, record, row[9])) {
-        completedCount++;
+    if (String(row[2]) !== 'inCampus') continue;
+    const ledger = parseInCampusRawJson_(row[15]);
+    extractInCampusSubmissionRecords_(row[7], row[11], row[9]).forEach(record => {
+      const eventKey = buildInCampusSubmissionEventKey_(record, row[1], row[9]);
+      const existingTargets = ledger[eventKey];
+      const candidates = findMatchingInCampusMailRecords_(values, record, row[9]);
+      const targets = Array.isArray(existingTargets) ? existingTargets : candidates.map(target => target.row[1]);
+      if (!targets.length) return; // Retry an unmatched event after older mail arrives.
+      if (!existingTargets) {
+        ledger[eventKey] = targets;
+        row[15] = JSON.stringify(ledger);
+        // Bind first, so a retry after a partial failure can never choose another task.
+        sheet.getRange(i + 1, 16).setValue(row[15]);
       }
+      targets.forEach(targetId => {
+        const target = findInCampusLogicalRecordById_(values, targetId);
+        if (target && setInCampusLogicalRecordStatus_(sheet, values, target, '完了', record.submittedAt || row[9], eventKey)) completedCount++;
+      });
     });
   }
-
   return completedCount;
 }
 
 function completeMatchingInCampusMailRow_(sheet, record, fallbackCompletedAt) {
-  if (!record || !record.title || !sheet || sheet.getLastRow() < 2) {
-    return false;
-  }
+  return runWithUserLock_('保存データ処理', () => completeMatchingInCampusMailRowLocked_(sheet, record, fallbackCompletedAt));
+}
 
+function completeMatchingInCampusMailRowLocked_(sheet, record, fallbackCompletedAt) {
+  if (!record || !record.title || !sheet || sheet.getLastRow() < 2) return false;
   const values = sheet.getDataRange().getValues();
-  const recordTitle = normalizeInCampusMatchText_(record.title);
-  const recordCourseName = normalizeInCampusCourseNameForMatch_(record.courseName);
+  const eventKey = buildInCampusSubmissionEventKey_(record, '', fallbackCompletedAt);
+  let changed = false;
+  findMatchingInCampusMailRecords_(values, record, fallbackCompletedAt).forEach(target => {
+    if (setInCampusLogicalRecordStatus_(sheet, values, target, '完了', record.submittedAt || fallbackCompletedAt || new Date(), eventKey)) changed = true;
+  });
+  return changed;
+}
 
-  for (let i = 1; i < values.length; i++) {
-    const row = values[i];
-    const source = String(row[2] || '');
-    const dueStatus = String(row[6] || '');
-    const status = String(row[12] || '');
+// The source email remains intact; only independent logical states are stored beside it.
+function inCampusStableKey_(value) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(value), Utilities.Charset.UTF_8)
+    .map(byte => ('0' + ((byte + 256) % 256).toString(16)).slice(-2)).join('').slice(0, 32);
+}
 
-    if (source !== 'inCampus' || dueStatus === '提出記録' || status === '完了') {
-      continue;
-    }
+function inCampusRecordIdentity_(record) {
+  const course = getInCampusCourseIdentity_(record);
+  return [record.type, normalizeInCampusMatchText_(course.name), course.schedule,
+    normalizeInCampusMatchText_(record.title), record.type === 'submission' ? getTimeForSort_(record.occurredAt) : ''].join('|');
+}
 
-    const rowTitle = normalizeInCampusMatchText_(row[4]);
-    const rowCourseName = normalizeInCampusCourseNameForMatch_(row[3]);
-    const titleMatches = rowTitle &&
-      recordTitle &&
-      (rowTitle === recordTitle ||
-      rowTitle.includes(recordTitle) ||
-      recordTitle.includes(rowTitle));
-    const courseMatches = !recordCourseName ||
-      !rowCourseName ||
-      rowCourseName === 'incampusお知らせ' ||
-      rowCourseName === recordCourseName ||
-      rowCourseName.includes(recordCourseName) ||
-      recordCourseName.includes(rowCourseName);
+function deduplicateInCampusMailRecords_(records) {
+  const byIdentity = new Map();
+  records.forEach(record => {
+    const identity = inCampusRecordIdentity_(record);
+    const previous = byIdentity.get(identity);
+    // Added + updated in one email refers to the same logical assignment.
+    if (previous) record.occurredAt = previous.occurredAt || record.occurredAt;
+    byIdentity.set(identity, record);
+  });
+  return Array.from(byIdentity.values());
+}
 
-    if (!titleMatches || !courseMatches) {
-      continue;
-    }
+function getLegacyInCampusRecordIndex_(row, records) {
+  const index = records.findIndex(record => normalizeInCampusMatchText_(record.title) === normalizeInCampusMatchText_(row[4]) &&
+    normalizeInCampusCourseNameForMatch_(record.courseName) === normalizeInCampusCourseNameForMatch_(row[3]));
+  return index >= 0 ? index : 0;
+}
 
-    const sheetRow = i + 1;
-    sheet.getRange(sheetRow, 13).setValue('完了');
-    sheet.getRange(sheetRow, 14).setValue(toSafeSpreadsheetCell_(record.submittedAt || fallbackCompletedAt || new Date()));
-    SpreadsheetApp.flush();
+function expandInCampusNotificationRow_(row) {
+  if (String(row[2]) !== 'inCampus') return [row];
+  const records = extractInCampusMailRecords_(row[7], row[11], row[9]);
+  if (!records.length) return [row];
+  const states = parseInCampusRawJson_(row[14]);
+  const legacyIndex = getLegacyInCampusRecordIndex_(row, records);
+  return records.map((record, index) => {
+    const child = normalizeNotificationRowWidth_(row);
+    const key = inCampusStableKey_(inCampusRecordIdentity_(record));
+    const state = states[key] || {};
+    child[1] = String(row[1]) + ':update:' + key;
+    child.originalMessageIdForState = index === legacyIndex ? String(row[1]) : '';
+    child[3] = record.courseName;
+    child[4] = record.title;
+    child[11] = record.body;
+    // Update timestamps describe delivery events, not submission deadlines.
+    const explicitDeadline = String(record.body).split('\n').filter(line => /^\s*(?:提出期限|期限|締切|締め切り|しめきり)\s*[:：]/.test(line)).join('\n');
+    const due = extractDueDate_(explicitDeadline, row[9]);
+    child[5] = due.dueDate;
+    child[6] = record.type === 'submission' ? '提出記録' : due.dueStatus;
+    child[12] = state.status || (record.type === 'submission' ? '完了記録' : index === legacyIndex ? row[12] : '未確認');
+    child[13] = Object.prototype.hasOwnProperty.call(state, 'completedAt') ? state.completedAt : index === legacyIndex ? row[13] : '';
+    return child;
+  });
+}
 
-    return true;
+function findInCampusLogicalRecordById_(values, messageId) {
+  for (let index = 1; index < values.length; index++) {
+    if (String(values[index][2]) !== 'inCampus') continue;
+    const children = expandInCampusNotificationRow_(values[index]);
+    const row = children.find(child => String(child[1]) === String(messageId));
+    if (row) return {index, row};
   }
+  return null;
+}
 
-  return false;
+function buildInCampusSubmissionEventKey_(record, fallbackId, fallbackTime) {
+  return inCampusStableKey_([normalizeInCampusMatchText_(record.courseName),
+    getInCampusCourseIdentity_(record).schedule, normalizeInCampusMatchText_(record.title),
+    getTimeForSort_(record.submittedAt || fallbackTime) || String(fallbackId || '')].join('|'));
+}
+
+function findMatchingInCampusMailRecords_(values, record, fallbackTime) {
+  const submittedAt = getTimeForSort_(record.submittedAt || fallbackTime);
+  const matches = [];
+  values.slice(1).forEach((raw, offset) => {
+    if (String(raw[2]) !== 'inCampus') return;
+    const records = extractInCampusMailRecords_(raw[7], raw[11], raw[9]);
+    expandInCampusNotificationRow_(raw).forEach((row, recordIndex) => {
+      if (!isTaskRelatedRow_(row)) return;
+      const fields = extractRequiredInCampusFieldsFromBody_(row[11]) || {};
+      if (!isSameInCampusAssignmentForWeb_(record, {title: row[4], courseName: row[3], weekdayPeriod: fields.weekdayPeriod})) return;
+      const occurredAt = getTimeForSort_(records[recordIndex] && records[recordIndex].occurredAt || raw[9]);
+      if (submittedAt && occurredAt && occurredAt > submittedAt) return;
+      matches.push({index: offset + 1, row, occurredAt});
+    });
+  });
+  if (!matches.length) return [];
+  // A reused title must not cause an old submission to complete a newer assignment.
+  const latest = Math.max(...matches.map(match => match.occurredAt));
+  const candidates = matches.filter(match => match.occurredAt === latest);
+  const schedules = new Set(candidates.map(match => getInCampusCourseIdentity_({courseName: match.row[3],
+    weekdayPeriod: (extractRequiredInCampusFieldsFromBody_(match.row[11]) || {}).weekdayPeriod}).schedule));
+  return schedules.size > 1 ? [] : candidates;
+}
+
+function setInCampusLogicalRecordStatus_(sheet, values, target, status, completedAt, eventKey) {
+  const raw = values[target.index];
+  const states = parseInCampusRawJson_(raw[14]);
+  const suffix = String(target.row[1]).split(':update:')[1];
+  const key = suffix || 'legacy';
+  const state = states[key] || {};
+  const events = state.appliedSubmissionEvents || {};
+  if (eventKey && events[eventKey]) return false;
+  if (eventKey) events[eventKey] = true;
+  states[key] = Object.assign({}, state, {status, completedAt: status === '完了' ? completedAt || new Date() : '', appliedSubmissionEvents: events});
+  raw[14] = JSON.stringify(states);
+  sheet.getRange(target.index + 1, 15).setValue(raw[14]);
+  if (!suffix) {
+    raw[12] = status;
+    raw[13] = status === '完了' ? completedAt || new Date() : '';
+    sheet.getRange(target.index + 1, 13, 1, 2).setValues([[raw[12], raw[13]]]);
+  }
+  return true;
 }
 
 function normalizeInCampusMatchText_(value) {
@@ -1121,9 +1504,13 @@ function getDateOfThisWeekday_(baseDate, weekdayText) {
 }
 
 function getNotificationsForWeb() {
+  return runWithUserLock_('保存データ処理', () => getNotificationsForWebLocked_());
+}
+
+function getNotificationsForWebLocked_() {
   const data = mergeNotificationAndInCampusExtractedItemsForWeb_(
     getActiveNotificationItemsForWeb_(),
-    getActiveInCampusExtractedItemsForWeb_()
+    getInCampusSupplementItemsForWeb_()
   );
 
   return data
@@ -1133,15 +1520,13 @@ function getNotificationsForWeb() {
 }
 
 function getActiveNotificationItemsForWeb_() {
+  return runWithUserLock_('保存データ処理', () => getActiveNotificationItemsForWebLocked_());
+}
+
+function getActiveNotificationItemsForWebLocked_() {
   const ss = getOrCreateSpreadsheet_();
-  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
-
-  if (!sheet || sheet.getLastRow() < 2) {
-    return [];
-  }
-
-  const values = sheet.getDataRange().getValues();
-  let rows = values.slice(1);
+  const sheetsBySource = ensureNotificationStorage_(ss);
+  let rows = getNotificationRowsFromSheets_(sheetsBySource);
 
   rows = rows.filter(row => isTaskRelatedRow_(row));
   rows = rows.filter(row => String(row[12] || '') !== '完了');
@@ -1149,6 +1534,23 @@ function getActiveNotificationItemsForWeb_() {
   const data = rows.map(row => rowToNotificationItem_(row));
 
   return data;
+}
+
+function getNotificationRowsFromSheets_(sheetsBySource) {
+  const rows = [];
+
+  NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+    const sheet = sheetsBySource && sheetsBySource[storageConfig.source];
+
+    if (!sheet || sheet.getLastRow() < 2) {
+      return;
+    }
+
+    const retainedRows = normalizeNotificationRowsForStorage_(sheet.getDataRange().getValues().slice(1), storageConfig);
+    retainedRows.forEach(row => rows.push(...expandInCampusNotificationRow_(row)));
+  });
+
+  return rows;
 }
 
 
@@ -1382,105 +1784,6 @@ function getClassroomNotificationType_(body) {
   return 'other';
 }
 
-function getClassroomMainContentText_(body) {
-  const lines = getClassroomMeaningfulLines_(body);
-  const markerIndex = getClassroomNotificationMarkerIndex_(lines);
-
-  const contentLines = markerIndex >= 0
-    ? lines.slice(markerIndex + 1)
-    : lines;
-
-  return contentLines
-    .filter(line => {
-      const text = String(line || '').trim();
-
-      if (text.startsWith('投稿日:')) {
-        return false;
-      }
-
-      if (text.startsWith('投稿者:')) {
-        return false;
-      }
-
-      if (text.includes('投稿者:')) {
-        return false;
-      }
-
-      if (text.includes('先生が')) {
-        return false;
-      }
-
-      return true;
-    })
-    .join('\n');
-}
-
-function hasAnnouncementTaskKeyword_(body) {
-  const mainText = getClassroomMainContentText_(body);
-
-  const hasTaskKeyword = ANNOUNCEMENT_TASK_KEYWORDS.some(keyword => {
-    return mainText.includes(keyword);
-  });
-
-  if (!hasTaskKeyword) {
-    return false;
-  }
-
-  return hasAnnouncementActionInstruction_(body);
-}
-
-function hasAnnouncementActionInstruction_(body) {
-  const mainText = getClassroomMainContentText_(body);
-
-  const actionPatterns = [
-    /宿題は以下/,
-    /課題は以下/,
-    /宿題です/,
-    /課題です/,
-    /宿題があります/,
-    /課題があります/,
-    /提出してください/,
-    /提出して下さい/,
-    /提出すること/,
-    /提出するように/,
-    /提出しておくこと/,
-    /実施してください/,
-    /実施すること/,
-    /行ってください/,
-    /やってください/,
-    /取り組んでください/,
-    /完成させてください/,
-    /書いてください/,
-    /作成してください/,
-    /次回まで/,
-    /来週まで/,
-    /授業までに/,
-    /期限[:：]/,
-    /締切[:：]/,
-    /締め切り[:：]/
-  ];
-
-  return actionPatterns.some(pattern => pattern.test(mainText));
-}
-
-function isClassroomAiWarningAnnouncement_(body) {
-  const mainText = getClassroomMainContentText_(body);
-  const normalizedText = String(mainText || '').replace(/\s+/g, '');
-
-  const aiWarningKeywords = [
-    '生成AI',
-    'AIで宿題',
-    'AIで課題',
-    'AIで解いて',
-    '0点',
-    '疑われる',
-    '対策を始める',
-    '直に提出'
-  ];
-
-  return aiWarningKeywords.some(keyword => normalizedText.includes(keyword));
-}
-
 function isTaskRelatedRow_(row) {
   const source = String(row[2] || '');
   const dueStatus = String(row[6] || '');
@@ -1492,7 +1795,10 @@ function isTaskRelatedRow_(row) {
     return false;
   }
 
-  if (dueStatus === '提出記録' || status === '完了記録') {
+  if (
+    dueStatus === '提出記録' ||
+    status === '完了記録'
+  ) {
     return false;
   }
 
@@ -1503,34 +1809,10 @@ function isTaskRelatedRow_(row) {
   if (source === 'Google Classroom') {
     const notificationType = getClassroomNotificationType_(body);
 
-    if (isClassroomAiWarningAnnouncement_(body)) {
-      return false;
-    }
-
-    if (notificationType === 'newMaterial') {
-      return false;
-    }
-
-    if (notificationType === 'privateComment') {
-      return false;
-    }
-
-    if (notificationType === 'returned') {
-      return false;
-    }
-
-    if (notificationType === 'newAssignment') {
-      return true;
-    }
-
-    if (notificationType === 'newAnnouncement') {
-      return hasAnnouncementTaskKeyword_(body);
-    }
-
-    return false;
+    return notificationType === 'newAssignment';
   }
 
-  return isInCampusTaskRelated_(subject, body);
+  return getInCampusMailKind_(body) === 'assignment';
 }
 
 function isClassroomExtensionSyncRow_(row) {
@@ -1615,7 +1897,7 @@ function normalizeDueInfoForWeb_(dueDateValue, dueStatusValue) {
     const day = dueDateValue.getDate();
     const hour = dueDateValue.getHours();
     const minute = dueDateValue.getMinutes();
-    const hasTime = hour !== 0 || minute !== 0;
+    const hasTime = hour !== 0 || minute !== 0 || /Classroomで時刻補正|拡張機能で抽出|時刻あり/.test(dueStatus);
 
     return buildNormalizedDueInfo_(
       year,
@@ -1671,9 +1953,9 @@ function parseDueDateTextForWeb_(text) {
 }
 
 function buildNormalizedDueInfo_(year, month, day, timeText) {
-  const yearNum = Number(year);
-  const monthNum = Number(month);
-  const dayNum = Number(day);
+  let yearNum = Number(year);
+  let monthNum = Number(month);
+  let dayNum = Number(day);
 
   if (!isValidDateParts_(yearNum, monthNum, dayNum)) {
     return {
@@ -1684,10 +1966,15 @@ function buildNormalizedDueInfo_(year, month, day, timeText) {
     };
   }
 
+  let time = normalizeTimeText_(timeText);
+  if (time === '00:00') {
+    const priorDay = new Date(yearNum, monthNum - 1, dayNum - 1);
+    yearNum = priorDay.getFullYear(); monthNum = priorDay.getMonth() + 1; dayNum = priorDay.getDate();
+    time = '23:59';
+  }
   const y = String(yearNum);
   const m = String(monthNum).padStart(2, '0');
   const d = String(dayNum).padStart(2, '0');
-  const time = normalizeTimeText_(timeText);
 
   return {
     dueDate: time ? `${y}/${m}/${d} ${time}` : `${y}/${m}/${d}`,
@@ -1746,29 +2033,42 @@ function normalizeTimeText_(timeText) {
 }
 
 function refreshAndGetNotificationsForWeb() {
+  return runWithUserLock_('保存データ処理', () => refreshAndGetNotificationsForWebLocked_());
+}
+
+function refreshAndGetNotificationsForWebLocked_() {
   saveClassroomMailsToSheet();
   return getNotificationsForWeb();
 }
 
 function clearNotificationSheetData_() {
+  return runWithUserLock_('保存データ処理', () => clearNotificationSheetDataLocked_());
+}
+
+function clearNotificationSheetDataLocked_() {
   const ss = getOrCreateSpreadsheet_();
-  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+  const sheetsBySource = ensureNotificationStorage_(ss);
 
-  if (!sheet) {
-    return;
-  }
+  NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+    const sheet = sheetsBySource[storageConfig.source];
 
-  const lastRow = sheet.getLastRow();
+    if (!sheet || sheet.getLastRow() <= 1) {
+      return;
+    }
 
-  if (lastRow <= 1) {
-    return;
-  }
+    sheet
+      .getRange(2, 1, sheet.getLastRow() - 1, HEADER_ROW.length)
+      .clearContent();
+  });
 
-  sheet.deleteRows(2, lastRow - 1);
   SpreadsheetApp.flush();
 }
 
 function rebuildAndGetNotificationsForWeb() {
+  return runWithUserLock_('保存データ処理', () => rebuildAndGetNotificationsForWebLocked_());
+}
+
+function rebuildAndGetNotificationsForWebLocked_() {
   clearNotificationSheetData_();
   SpreadsheetApp.flush();
 
@@ -1778,30 +2078,53 @@ function rebuildAndGetNotificationsForWeb() {
   return getNotificationsForWeb();
 }
 
-function setupAutoFetchTrigger() {
-  const targetFunction = 'saveClassroomMailsToSheet';
-  const triggers = ScriptApp.getProjectTriggers();
+function ensureAutoFetchTrigger_() {
+  const matchingTriggers = ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === AUTO_FETCH_HANDLER);
 
-  triggers.forEach(trigger => {
-    if (trigger.getHandlerFunction() === targetFunction) {
-      ScriptApp.deleteTrigger(trigger);
-    }
-  });
+  if (matchingTriggers.length > 0) {
+    matchingTriggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
 
-  ScriptApp.newTrigger(targetFunction)
+    return {
+      created: false,
+      removedDuplicates: Math.max(0, matchingTriggers.length - 1)
+    };
+  }
+
+  ScriptApp.newTrigger(AUTO_FETCH_HANDLER)
     .timeBased()
     .everyMinutes(15)
     .create();
 
-  Logger.log('15分ごとの自動取得トリガーを作成しました。');
+  return {
+    created: true,
+    removedDuplicates: 0
+  };
+}
+
+function setupAutoFetchTrigger() {
+  return runWithUserLock_('保存データ処理', () => setupAutoFetchTriggerLocked_());
+}
+
+function setupAutoFetchTriggerLocked_() {
+  const result = ensureAutoFetchTrigger_();
+
+  Logger.log(result.created
+    ? '15分ごとの自動取得トリガーを作成しました。'
+    : '自動取得トリガーは設定済みです。');
+
+  return result;
 }
 
 function deleteAutoFetchTrigger() {
-  const targetFunction = 'saveClassroomMailsToSheet';
+  return runWithUserLock_('保存データ処理', () => deleteAutoFetchTriggerLocked_());
+}
+
+function deleteAutoFetchTriggerLocked_() {
   const triggers = ScriptApp.getProjectTriggers();
 
   triggers.forEach(trigger => {
-    if (trigger.getHandlerFunction() === targetFunction) {
+    if (trigger.getHandlerFunction() === AUTO_FETCH_HANDLER) {
       ScriptApp.deleteTrigger(trigger);
     }
   });
@@ -1818,6 +2141,10 @@ function markNotificationUndone(messageId) {
 }
 
 function updateNotificationStatus_(messageId, status, responseBuilder) {
+  return runWithUserLock_('保存データ処理', () => updateNotificationStatusLocked_(messageId, status, responseBuilder));
+}
+
+function updateNotificationStatusLocked_(messageId, status, responseBuilder) {
   const targetMessageId = String(messageId || '');
 
   if (!targetMessageId) {
@@ -1830,20 +2157,41 @@ function updateNotificationStatus_(messageId, status, responseBuilder) {
   }
 
   const ss = getOrCreateSpreadsheet_();
-  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+  const sheetsBySource = ensureNotificationStorage_(ss);
+  let updated = false;
 
-  if (!sheet || sheet.getLastRow() < 2) {
-    return responseBuilder();
-  }
+  for (const storageConfig of NOTIFICATION_STORAGE_CONFIGS) {
+    const sheet = sheetsBySource[storageConfig.source];
 
-  const values = sheet.getDataRange().getValues();
+    if (!sheet || sheet.getLastRow() < 2) {
+      continue;
+    }
 
-  for (let i = 1; i < values.length; i++) {
-    const rowMessageId = String(values[i][1] || '');
+    const values = sheet.getDataRange().getValues();
+    const logicalTarget = findInCampusLogicalRecordById_(values, targetMessageId);
+    if (logicalTarget) {
+      setInCampusLogicalRecordStatus_(sheet, values, logicalTarget, status, new Date());
+      updated = true;
+      break;
+    }
 
-    if (rowMessageId === targetMessageId) {
+    for (let i = 1; i < values.length; i++) {
+      const rowMessageId = String(values[i][1] || '');
+
+      if (rowMessageId !== targetMessageId) {
+        continue;
+      }
+
+      if (storageConfig.source === 'inCampus') {
+        const records = extractInCampusMailRecords_(values[i][7], values[i][11], values[i][9]);
+        const child = expandInCampusNotificationRow_(values[i])[getLegacyInCampusRecordIndex_(values[i], records)];
+        if (child) {
+          setInCampusLogicalRecordStatus_(sheet, values, {index: i, row: child}, status, new Date());
+          updated = true;
+          break;
+        }
+      }
       const sheetRow = i + 1;
-
       sheet.getRange(sheetRow, 13).setValue(status);
 
       if (status === '完了') {
@@ -1853,7 +2201,11 @@ function updateNotificationStatus_(messageId, status, responseBuilder) {
       }
 
       SpreadsheetApp.flush();
+      updated = true;
+      break;
+    }
 
+    if (updated) {
       break;
     }
   }
@@ -1974,7 +2326,8 @@ function rowToNotificationItem_(row) {
     messageId: row[1],
     source: row[2],
     courseName: row[3],
-    title: row[4] && row[4] !== 'タイトル未抽出' ? row[4] : row[7],
+    title: source === 'inCampus' ? extractInCampusTitle_(row[7], body) : (row[4] && row[4] !== 'タイトル未抽出' ? row[4] : row[7]),
+    weekdayPeriod: (extractRequiredInCampusFieldsFromBody_(body) || {}).weekdayPeriod || '',
 
     dueDate: dueInfo.dueDate,
     dueDateKey: dueInfo.dueDateKey,
@@ -2004,6 +2357,10 @@ function getCompletedInCampusExtractedItemsForWeb_() {
 }
 
 function getInCampusExtractedItemsForWeb_(viewMode) {
+  return runWithUserLock_('保存データ処理', () => getInCampusExtractedItemsForWebLocked_(viewMode));
+}
+
+function getInCampusExtractedItemsForWebLocked_(viewMode) {
   const sheet = getOrCreateInCampusSheet_();
 
   if (!sheet || sheet.getLastRow() < 2) {
@@ -2019,7 +2376,7 @@ function getInCampusExtractedItemsForWeb_(viewMode) {
   const submissionItems = items.filter(item => isInCampusSubmissionItemForWeb_(item));
   const assignmentItems = items.filter(item => !isInCampusSubmissionItemForWeb_(item));
 
-  applyInCampusSubmissionItemsForWeb_(assignmentItems, submissionItems);
+  // Submission events are persisted once during ingestion; reads must respect manual undo.
   applyNotificationCompletionToInCampusExtractedItemsForWeb_(assignmentItems);
 
   return assignmentItems
@@ -2108,6 +2465,8 @@ function rowToInCampusExtractedItem_(row, headerMap) {
     messageId,
     source,
     rawType,
+    assignmentKey: String(getInCampusCell_(row, headerMap, 'assignmentKey', -1) || raw.assignmentKey || ''),
+    extractedAt: formatDateForWeb_(extractedAt),
     rawUpdateText: updateText,
     rawUpdateAction: updateAction,
     rawUpdateAt: updateAt,
@@ -2181,25 +2540,8 @@ function getInCampusSubmissionRecordFromItemForWeb_(item) {
 }
 
 function findMatchingInCampusAssignmentItem_(assignmentItems, record) {
-  const recordTitle = normalizeInCampusMatchText_(record.title);
-  const recordCourseName = normalizeInCampusCourseNameForMatch_(record.courseName);
-
-  return assignmentItems.find(item => {
-    const itemTitle = normalizeInCampusMatchText_(item.title);
-    const itemCourseName = normalizeInCampusCourseNameForMatch_(item.courseName);
-    const titleMatches = itemTitle &&
-      recordTitle &&
-      (itemTitle === recordTitle ||
-      itemTitle.includes(recordTitle) ||
-      recordTitle.includes(itemTitle));
-    const courseMatches = !recordCourseName ||
-      !itemCourseName ||
-      itemCourseName === recordCourseName ||
-      itemCourseName.includes(recordCourseName) ||
-      recordCourseName.includes(itemCourseName);
-
-    return titleMatches && courseMatches;
-  });
+  const matches = assignmentItems.filter(item => isSameInCampusAssignmentForWeb_(item, record));
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function isPresentValue_(value) {
@@ -2216,7 +2558,8 @@ function parseInCampusRawJson_(value) {
   }
 
   try {
-    return JSON.parse(String(value));
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch (error) {
     return {};
   }
@@ -2232,6 +2575,10 @@ function extractDueAtFromPeriodText_(periodText) {
 }
 
 function updateInCampusExtractedStatus_(messageId, status) {
+  return runWithUserLock_('保存データ処理', () => updateInCampusExtractedStatusLocked_(messageId, status));
+}
+
+function updateInCampusExtractedStatusLocked_(messageId, status) {
   const pageUrl = String(messageId || '').replace(/^incampus:/, '');
 
   if (!pageUrl) {
@@ -2275,9 +2622,13 @@ function updateInCampusExtractedStatus_(messageId, status) {
 }
 
 function getCompletedNotificationsForWeb() {
+  return runWithUserLock_('保存データ処理', () => getCompletedNotificationsForWebLocked_());
+}
+
+function getCompletedNotificationsForWebLocked_() {
   const data = mergeNotificationAndInCampusExtractedItemsForWeb_(
     getCompletedNotificationItemsForWeb_(),
-    getCompletedInCampusExtractedItemsForWeb_()
+    getInCampusSupplementItemsForWeb_()
   );
 
   return data
@@ -2292,18 +2643,70 @@ function getCompletedNotificationsForWeb() {
     });
 }
 
-function mergeNotificationAndInCampusExtractedItemsForWeb_(notificationItems, extractedItems) {
-  enrichInCampusExtractedItemsFromNotificationItemsForWeb_(notificationItems, extractedItems);
+function getInCampusSupplementItemsForWeb_() {
+  return runWithUserLock_('保存データ処理', () => getInCampusSupplementItemsForWebLocked_());
+}
 
-  const filteredNotificationItems = notificationItems.filter(item => {
-    if (String(item.source || '') !== 'inCampus') {
-      return true;
+function getInCampusSupplementItemsForWebLocked_() {
+  const sheet = getOrCreateInCampusSheet_();
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const headerMap = getInCampusHeaderMap_(sheet);
+  return sheet.getDataRange().getValues().slice(1)
+    .map(row => rowToInCampusExtractedItem_(row, headerMap));
+}
+
+function normalizeInCampusExactText_(value) {
+  return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+}
+
+function getInCampusCourseIdentity_(item) {
+  let name = normalizeInCampusExactText_(item && item.courseName).replace(/^[\[［](.*)[\]］]$/, '$1');
+  const prefix = name.match(/^([月火水木金土日])\s*(\d+)\s+/);
+  let schedule = prefix ? prefix[1] + prefix[2] : '';
+  if (prefix) name = name.slice(prefix[0].length);
+  const period = normalizeInCampusExactText_(item && item.weekdayPeriod);
+  const day = period.match(/([月火水木金土日])曜/);
+  const slot = period.match(/(\d+)限/);
+  if (day && slot) schedule = day[1] + slot[1];
+  return {name: name.trim(), schedule};
+}
+
+function isInCampusReportDetailUrl_(value) {
+  return /^https:\/\/ic\.ss\.senshu-u\.ac\.jp\/lms\/course\/report\//.test(String(value || ''));
+}
+
+function mergeNotificationAndInCampusExtractedItemsForWeb_(notificationItems, extractedItems, kind) {
+  const expectedKind = kind || 'assignment';
+  return notificationItems.map(notification => {
+    if (notification.source !== 'inCampus') return notification;
+    const candidates = extractedItems.filter(item => {
+      const itemKind = item.rawUpdateText ? getInCampusUpdateKind_(item.rawUpdateText) : item.rawType;
+      if (itemKind !== expectedKind || item.rawType === 'submissionRecord') return false;
+      if (expectedKind === 'assignment' && !isInCampusReportDetailUrl_(item.classroomUrl)) return false;
+      return isSameInCampusAssignmentForWeb_(notification, item);
+    });
+    // Updates of the same report are one candidate; different reports are ambiguous.
+    const identities = new Set(candidates.map(item => expectedKind === 'assignment'
+      ? item.classroomUrl : item.assignmentKey || item.classroomUrl));
+    if (identities.size !== 1 || !candidates.length) return notification;
+    const supplement = candidates.slice().sort((a,b) => b.receivedAtTime - a.receivedAtTime)[0];
+    const result = Object.assign({}, notification, {
+      supplementKey: supplement.assignmentKey || supplement.classroomUrl,
+      supplementUpdatedAt: supplement.extractedAt || supplement.receivedAt
+    });
+    if (expectedKind === 'assignment') {
+      if (supplement.dueType === 'detected') {
+        ['dueDate','dueDateKey','dueTime','dueType','dueStatus'].forEach(key => result[key] = supplement[key]);
+      }
+      result.classroomUrl = supplement.classroomUrl;
+      if (supplement.body) result.body = [notification.body, '【inCampusからの補足】', supplement.body].filter(Boolean).join('\n\n');
     }
-
-    return !extractedItems.some(extractedItem => isSameInCampusAssignmentForWeb_(item, extractedItem));
+    if (expectedKind === 'announcement' && supplement.rawUpdateText) {
+      result.body = [notification.body, '【inCampusの更新通知】', supplement.rawUpdateText].filter(Boolean).join('\n\n');
+    }
+    // Mail message ID, received date, title, course, status and Gmail link remain authoritative.
+    return result;
   });
-
-  return filteredNotificationItems.concat(extractedItems);
 }
 
 function enrichInCampusExtractedItemsFromNotificationItemsForWeb_(notificationItems, extractedItems) {
@@ -2348,29 +2751,14 @@ function applyNotificationCompletionToInCampusExtractedItemsForWeb_(assignmentIt
 }
 
 function isSameInCampusAssignmentForWeb_(a, b) {
-  const titleA = normalizeInCampusMatchText_(a && a.title);
-  const titleB = normalizeInCampusMatchText_(b && b.title);
-
-  if (!titleA || !titleB) {
-    return false;
-  }
-
-  const titleMatches = titleA === titleB ||
-    titleA.includes(titleB) ||
-    titleB.includes(titleA);
-
-  if (!titleMatches) {
-    return false;
-  }
-
-  const courseA = normalizeInCampusCourseNameForMatch_(a && a.courseName);
-  const courseB = normalizeInCampusCourseNameForMatch_(b && b.courseName);
-
-  return isGenericInCampusCourseNameForMatch_(courseA) ||
-    isGenericInCampusCourseNameForMatch_(courseB) ||
-    courseA === courseB ||
-    courseA.includes(courseB) ||
-    courseB.includes(courseA);
+  const titleA = normalizeInCampusExactText_(a && a.title);
+  const titleB = normalizeInCampusExactText_(b && b.title);
+  const courseA = getInCampusCourseIdentity_(a);
+  const courseB = getInCampusCourseIdentity_(b);
+  if (!titleA || !titleB || !courseA.name || !courseB.name) return false;
+  if (isGenericInCampusCourseNameForMatch_(courseA.name.toLowerCase()) || isGenericInCampusCourseNameForMatch_(courseB.name.toLowerCase())) return false;
+  if (courseA.schedule && courseB.schedule && courseA.schedule !== courseB.schedule) return false;
+  return titleA === titleB && courseA.name === courseB.name;
 }
 
 function isGenericInCampusCourseNameForMatch_(courseName) {
@@ -2382,15 +2770,13 @@ function isGenericInCampusCourseNameForMatch_(courseName) {
 }
 
 function getCompletedNotificationItemsForWeb_() {
+  return runWithUserLock_('保存データ処理', () => getCompletedNotificationItemsForWebLocked_());
+}
+
+function getCompletedNotificationItemsForWebLocked_() {
   const ss = getOrCreateSpreadsheet_();
-  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
-
-  if (!sheet || sheet.getLastRow() < 2) {
-    return [];
-  }
-
-  const values = sheet.getDataRange().getValues();
-  let rows = values.slice(1);
+  const sheetsBySource = ensureNotificationStorage_(ss);
+  let rows = getNotificationRowsFromSheets_(sheetsBySource);
 
   rows = rows.filter(row => isTaskRelatedRow_(row));
   rows = rows.filter(row => String(row[12] || '') === '完了');
@@ -2401,34 +2787,23 @@ function getCompletedNotificationItemsForWeb_() {
 }
 
 function debugNotificationSheet() {
+  return runWithUserLock_('保存データ処理', () => debugNotificationSheetLocked_());
+}
+
+function debugNotificationSheetLocked_() {
   const ss = getOrCreateSpreadsheet_();
-  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+  const sheetsBySource = ensureNotificationStorage_(ss);
 
   Logger.log('スプレッドシートURL: ' + ss.getUrl());
-  Logger.log('シート名: ' + CONFIG.SHEET_NAME);
 
-  if (!sheet) {
-    Logger.log('通知一覧シートが見つかりません');
-    return;
-  }
+  NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+    const sheet = sheetsBySource[storageConfig.source];
+    const dataRowCount = Math.max(0, sheet.getLastRow() - 1);
 
-  Logger.log('実際に読んでいるシート名: ' + sheet.getName());
-  Logger.log('実際に読んでいるシートID: ' + sheet.getSheetId());
-  Logger.log('lastRow: ' + sheet.getLastRow());
-  Logger.log('lastColumn: ' + sheet.getLastColumn());
-
-  if (sheet.getLastRow() >= 2) {
-    const values = sheet.getDataRange().getValues();
-    const rows = values.slice(1);
-
-    Logger.log('データ行数: ' + rows.length);
-    Logger.log('1件目の通知元: ' + rows[0][2]);
-    Logger.log('1件目の授業名: ' + rows[0][3]);
-    Logger.log('1件目のタイトル: ' + rows[0][4]);
-    Logger.log('1件目の期限: ' + rows[0][5]);
-    Logger.log('1件目の期限状態: ' + rows[0][6]);
-    Logger.log('1件目の件名: ' + rows[0][7]);
-  }
+    Logger.log('シート名: ' + sheet.getName());
+    Logger.log('シートID: ' + sheet.getSheetId());
+    Logger.log('データ行数: ' + dataRowCount);
+  });
 }
 
 function debugWebData() {
@@ -2553,16 +2928,8 @@ const INCAMPUS_HEADERS = [
 ];
 
 function doPost(e) {
-  const lock = LockService.getUserLock();
-  let hasLock = false;
-
   try {
-    if (!lock.tryLock(5000)) {
-      throw new Error('処理が混み合っています。少し待ってから再実行してください。');
-    }
-
-    hasLock = true;
-
+    return runWithUserLock_('同期処理', () => {
     const payload = parseJsonBody_(e);
     assertValidApiToken_(payload);
 
@@ -2607,15 +2974,12 @@ function doPost(e) {
     }
 
     throw new Error('未対応のactionです: ' + payload.action);
+    });
   } catch (error) {
     return jsonResponse_({
       ok: false,
       error: String(error && error.message ? error.message : error)
     });
-  } finally {
-    if (hasLock) {
-      lock.releaseLock();
-    }
   }
 }
 
@@ -2797,6 +3161,9 @@ function isAllowedInCampusUrlForStorage_(value) {
 }
 
 function validateAssignment_(assignment) {
+  if ((assignment.type || 'assignment') === 'assignment' && !isInCampusReportDetailUrl_(assignment.pageUrl)) {
+    throw new Error('課題詳細ページ以外は課題として保存できません。拡張機能を更新してください。');
+  }
   if (assignment.source !== 'inCampus') {
     throw new Error('sourceがinCampusではありません。');
   }
@@ -2815,6 +3182,10 @@ function validateAssignment_(assignment) {
 }
 
 function upsertInCampusAssignment_(assignment) {
+  return runWithUserLock_('保存データ処理', () => upsertInCampusAssignmentLocked_(assignment));
+}
+
+function upsertInCampusAssignmentLocked_(assignment) {
   const sheet = getOrCreateInCampusSheet_();
   const submissionRecord = extractInCampusSubmissionRecordFromAssignment_(assignment);
 
@@ -2843,9 +3214,14 @@ function extractInCampusSubmissionRecordFromAssignment_(assignment) {
     assignment.title,
     assignment.body,
     assignment.periodText,
-    assignment.rawText
+    assignment.rawText,
+    assignment.updateText
   ].filter(Boolean).join('\n');
-  const records = extractInCampusSubmissionRecords_('', text);
+  const records = extractInCampusSubmissionRecords_(
+    '',
+    text,
+    assignment.receivedAt || assignment.extractedAt || new Date()
+  );
 
   if (records.length === 0) {
     return null;
@@ -2854,7 +3230,8 @@ function extractInCampusSubmissionRecordFromAssignment_(assignment) {
   const record = records[0];
 
   return {
-    courseName: record.courseName || assignment.courseName || '',
+    courseName: isGenericInCampusCourseNameForMatch_(normalizeInCampusCourseNameForMatch_(record.courseName)) ? assignment.courseName || '' : record.courseName,
+    weekdayPeriod: record.weekdayPeriod || assignment.weekdayPeriod || '',
     title: record.title,
     submittedAt: record.submittedAt || assignment.receivedAt || assignment.extractedAt || '',
     pageUrl: assignment.pageUrl || ''
@@ -2918,148 +3295,108 @@ function buildInCampusSubmissionRecordAssignmentKey_(assignment, record) {
 }
 
 function findExistingInCampusAssignmentRow_(sheet, assignment) {
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow < 2) {
-    return 0;
+  if (sheet.getLastRow() < 2) return 0;
+  const values = sheet.getDataRange().getValues();
+  const type = String(assignment.type || 'assignment');
+  const key = String(assignment.assignmentKey || '').trim();
+  const url = String(assignment.pageUrl || '').trim();
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i], raw = parseInCampusRawJson_(row[13]);
+    if (String(row[1] || raw.type || 'assignment') !== type) continue;
+    const rowKey = String(row[16] || raw.assignmentKey || '').trim();
+    if (key && rowKey === key) return i + 1;
+    if (type === 'assignment' && isInCampusReportDetailUrl_(url) && String(row[10] || '') === url) return i + 1;
+    if (type === 'announcement' && !key && !rowKey &&
+      String(row[10] || '') === url &&
+      normalizeInCampusMatchText_(row[2]) === normalizeInCampusMatchText_(assignment.title) &&
+      normalizeInCampusMatchText_(raw.courseName) === normalizeInCampusMatchText_(assignment.courseName) &&
+      String(raw.updateAt || '') === String(assignment.updateAt || '') &&
+      String(raw.updateText || '') === String(assignment.updateText || '')) return i + 1;
   }
-
-  const headerMap = getInCampusHeaderMap_(sheet);
-  const rowCount = lastRow - 1;
-  const assignmentKey = String(assignment.assignmentKey || '').trim();
-  const pageUrl = String(assignment.pageUrl || '').trim();
-  const findByColumn = (column, expectedValue, transform) => {
-    if (!column || !expectedValue) {
-      return 0;
-    }
-
-    const values = sheet.getRange(2, column, rowCount, 1).getValues();
-    const index = values.findIndex(row => transform(row[0]) === expectedValue);
-
-    return index === -1 ? 0 : index + 2;
-  };
-
-  if (assignmentKey) {
-    const rowByAssignmentKey = findByColumn(
-      headerMap.assignmentKey,
-      assignmentKey,
-      value => String(value || '').trim()
-    );
-
-    if (rowByAssignmentKey) {
-      return rowByAssignmentKey;
-    }
-
-    const rowByRawJsonAssignmentKey = findByColumn(
-      headerMap.rawJson,
-      assignmentKey,
-      value => String(parseInCampusRawJson_(value).assignmentKey || '').trim()
-    );
-
-    if (rowByRawJsonAssignmentKey) {
-      return rowByRawJsonAssignmentKey;
-    }
-  }
-
-  return findByColumn(
-    headerMap.pageUrl,
-    pageUrl,
-    value => String(value || '').trim()
-  );
+  return 0;
 }
 
 function applySavedInCampusExtractedSubmissionRecords_(sheet) {
-  if (!sheet || sheet.getLastRow() < 2) {
-    return 0;
-  }
+  return runWithUserLock_('提出記録処理', () => applySavedInCampusExtractedSubmissionRecordsLocked_(sheet));
+}
 
+function applySavedInCampusExtractedSubmissionRecordsLocked_(sheet) {
+  if (!sheet || sheet.getLastRow() < 2) return 0;
   const values = sheet.getDataRange().getValues();
   let completedCount = 0;
-
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
-    const type = String(row[1] || '');
-    const status = String(row[14] || '');
-
-    if (type !== INCAMPUS_SUBMISSION_RECORD_TYPE && status !== INCAMPUS_SUBMISSION_RECORD_STATUS) {
-      continue;
-    }
-
+    if (row[1] !== INCAMPUS_SUBMISSION_RECORD_TYPE && row[14] !== INCAMPUS_SUBMISSION_RECORD_STATUS) continue;
     const raw = parseInCampusRawJson_(row[13]);
     const record = extractInCampusSubmissionRecordFromAssignment_(raw) || {
-      courseName: raw.courseName || '',
-      title: row[2],
-      submittedAt: row[15] || row[12] || row[11] || '',
-      pageUrl: raw.pageUrl || ''
+      courseName: raw.courseName || '', weekdayPeriod: raw.weekdayPeriod || '', title: row[2],
+      submittedAt: row[15] || row[12] || row[11] || '', pageUrl: raw.pageUrl || ''
     };
-
-    if (completeMatchingInCampusExtractedRow_(sheet, record)) {
-      completedCount++;
+    const eventKey = buildInCampusSubmissionEventKey_(record, row[16], row[12]);
+    const bindings = raw.appliedSubmissionTargets || {};
+    const matches = findMatchingInCampusExtractedRecords_(values, record);
+    const targets = bindings[eventKey] || matches.map(match => match.row[10]);
+    if (!targets.length) continue;
+    if (!bindings[eventKey]) {
+      bindings[eventKey] = targets; raw.appliedSubmissionTargets = bindings;
+      row[13] = JSON.stringify(raw); sheet.getRange(i + 1, 14).setValue(row[13]);
     }
+    targets.forEach(url => {
+      const index = values.findIndex((target, offset) => offset > 0 && target[1] === 'assignment' && String(target[10]) === String(url));
+      if (index > 0 && setInCampusExtractedSubmissionStatus_(sheet, values, index, record, eventKey)) completedCount++;
+    });
   }
-
   return completedCount;
 }
 
 function completeMatchingInCampusExtractedRow_(sheet, record) {
-  if (!record || !record.title || !sheet || sheet.getLastRow() < 2) {
-    return false;
-  }
+  return runWithUserLock_('提出記録処理', () => completeMatchingInCampusExtractedRowLocked_(sheet, record));
+}
 
+function completeMatchingInCampusExtractedRowLocked_(sheet, record) {
+  if (!record || !record.title || !sheet || sheet.getLastRow() < 2) return false;
   const values = sheet.getDataRange().getValues();
-  const recordTitle = normalizeInCampusMatchText_(record.title);
-  const recordCourseName = normalizeInCampusCourseNameForMatch_(record.courseName);
-  const recordPageUrl = String(record.pageUrl || '');
+  const eventKey = buildInCampusSubmissionEventKey_(record, '', record.submittedAt);
+  let changed = false;
+  findMatchingInCampusExtractedRecords_(values, record).forEach(match => {
+    if (setInCampusExtractedSubmissionStatus_(sheet, values, match.index, record, eventKey)) changed = true;
+  });
+  return changed;
+}
 
-  for (let i = 1; i < values.length; i++) {
-    const row = values[i];
-    const type = String(row[1] || '');
-    const status = String(row[14] || '');
-
-    if (type === INCAMPUS_SUBMISSION_RECORD_TYPE || status === '完了') {
-      continue;
-    }
-
+function findMatchingInCampusExtractedRecords_(values, record) {
+  const candidates = [];
+  values.slice(1).forEach((row, offset) => {
+    if (String(row[1] || 'assignment') !== 'assignment') return;
     const raw = parseInCampusRawJson_(row[13]);
-    const rowTitle = normalizeInCampusMatchText_(row[2] || raw.title);
-    const rowCourseName = normalizeInCampusCourseNameForMatch_(raw.courseName);
-    const rowPageUrl = String(row[10] || '');
-    const titleMatches = rowTitle &&
-      recordTitle &&
-      (rowTitle === recordTitle ||
-      rowTitle.includes(recordTitle) ||
-      recordTitle.includes(rowTitle));
-    const courseMatches = !recordCourseName ||
-      !rowCourseName ||
-      rowCourseName === recordCourseName ||
-      rowCourseName.includes(recordCourseName) ||
-      recordCourseName.includes(rowCourseName);
-    const pageUrlMatches = recordPageUrl &&
-      rowPageUrl &&
-      (rowPageUrl === recordPageUrl ||
-      rowPageUrl.startsWith(recordPageUrl) ||
-      recordPageUrl.startsWith(rowPageUrl));
+    const rowUrl = String(row[10] || '');
+    const recordUrl = String(record.pageUrl || '');
+    const exactReport = isInCampusReportDetailUrl_(recordUrl) && rowUrl === recordUrl;
+    if (!exactReport && !isSameInCampusAssignmentForWeb_(record, {
+      title: row[2] || raw.title, courseName: raw.courseName, weekdayPeriod: raw.weekdayPeriod
+    })) return;
+    candidates.push({index: offset + 1, row});
+  });
+  // Distinct report URLs with the same title/course cannot be resolved safely.
+  return new Set(candidates.map(candidate => String(candidate.row[10]))).size > 1 ? [] : candidates;
+}
 
-    if (!titleMatches && !pageUrlMatches) {
-      continue;
-    }
-
-    if (!pageUrlMatches && !courseMatches) {
-      continue;
-    }
-
-    const rowNumber = i + 1;
-    sheet.getRange(rowNumber, 15).setValue('完了');
-    sheet.getRange(rowNumber, 16).setValue(toSafeSpreadsheetCell_(record.submittedAt || new Date()));
-    SpreadsheetApp.flush();
-
-    return true;
-  }
-
-  return false;
+function setInCampusExtractedSubmissionStatus_(sheet, values, index, record, eventKey) {
+  const row = values[index];
+  const raw = parseInCampusRawJson_(row[13]);
+  const events = raw.appliedSubmissionEvents || {};
+  if (events[eventKey]) return false;
+  events[eventKey] = true; raw.appliedSubmissionEvents = events;
+  row[13] = JSON.stringify(raw); row[14] = '完了'; row[15] = record.submittedAt || new Date();
+  sheet.getRange(index + 1, 14, 1, 3).setValues([[row[13], row[14], toSafeSpreadsheetCell_(row[15])]]);
+  return true;
 }
 
 function getOrCreateInCampusSheet_() {
+  return runWithUserLock_('保存データ処理', () => getOrCreateInCampusSheetLocked_());
+}
+
+function getOrCreateInCampusSheetLocked_() {
   const ss = getTargetSpreadsheet_();
   let sheet = ss.getSheetByName(INCAMPUS_SHEET_NAME);
 
@@ -3107,6 +3444,18 @@ function setupInCampusHeader_(sheet) {
 }
 
 function buildAssignmentRow_(assignment, existingRow) {
+  if (existingRow) {
+    const previous = parseInCampusRawJson_(existingRow[13]);
+    const merged = Object.assign({}, previous, assignment);
+    ['courseName', 'weekdayPeriod', 'updateText', 'updateAction', 'updateAt', 'assignmentKey'].forEach(key => {
+      if (!String(assignment[key] || '').trim()) merged[key] = previous[key] || (key === 'assignmentKey' ? existingRow[16] : '') || '';
+    });
+    // A detail-page manual extraction often uses its URL as a temporary key.
+    if (assignment.assignmentKey === assignment.pageUrl && (previous.assignmentKey || existingRow[16])) {
+      merged.assignmentKey = previous.assignmentKey || existingRow[16];
+    }
+    assignment = merged;
+  }
   const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
   const existingStatus = existingRow ? String(existingRow[14] || '') : '';
   const existingCompletedAt = existingRow ? existingRow[15] : '';
@@ -3137,20 +3486,23 @@ function buildAssignmentRow_(assignment, existingRow) {
 }
 
 function completeClassroomAssignments_(records) {
+  return runWithUserLock_('保存データ処理', () => completeClassroomAssignmentsLocked_(records));
+}
+
+function completeClassroomAssignmentsLocked_(records) {
   if (!Array.isArray(records)) {
     throw new Error('recordsが配列ではありません。');
   }
 
   const ss = getOrCreateSpreadsheet_();
-  const sheet = getOrCreateSheet_(ss);
-  setupHeader_(sheet);
+  const sheet = ensureNotificationStorage_(ss)['Google Classroom'];
 
   if (records.length === 0) {
     return {
       foundCount: records.length,
       matchedCount: 0,
       unmatchedCount: records.length,
-      results: records.map(record => buildClassroomCompletionResult_(record, false, '通知一覧に対象行がありません。'))
+      results: records.map(record => buildClassroomCompletionResult_(record, false, 'Classroom通知に対象行がありません。'))
     };
   }
 
@@ -3184,13 +3536,16 @@ function completeClassroomAssignments_(records) {
 }
 
 function updateClassroomDueTimes_(records) {
+  return runWithUserLock_('保存データ処理', () => updateClassroomDueTimesLocked_(records));
+}
+
+function updateClassroomDueTimesLocked_(records) {
   if (!Array.isArray(records)) {
     throw new Error('recordsが配列ではありません。');
   }
 
   const ss = getOrCreateSpreadsheet_();
-  const sheet = getOrCreateSheet_(ss);
-  setupHeader_(sheet);
+  const sheet = ensureNotificationStorage_(ss)['Google Classroom'];
 
   if (records.length === 0) {
     return {
@@ -3198,7 +3553,7 @@ function updateClassroomDueTimes_(records) {
       matchedCount: 0,
       unmatchedCount: records.length,
       dueTimeCount: records.filter(record => record && record.dueTime).length,
-      results: records.map(record => buildClassroomDueTimeResult_(record, false, '通知一覧に対象行がありません。'))
+      results: records.map(record => buildClassroomDueTimeResult_(record, false, 'Classroom通知に対象行がありません。'))
     };
   }
 
@@ -3233,28 +3588,23 @@ function updateClassroomDueTimes_(records) {
 }
 
 function updateMatchingClassroomDueTimeRow_(sheet, values, record) {
-  const match = findMatchingClassroomNotificationRow_(values, record, {
-    allowTextFallback: false
+  const matches = findMatchingClassroomNotificationRows_(values, record, {allowTextFallback: false});
+  if (!matches.length) return buildClassroomDueTimeResult_(record, false, 'Classroom通知に一致するClassroom課題がないため更新しませんでした。');
+  let savedDueValue = '';
+  const updatedRows = [];
+  matches.forEach(match => {
+    const dueValue = buildClassroomDueDateValue_(record, values[match.index][5]);
+    if (!dueValue) return;
+    // Strings without times retain their date-only meaning even after sync.
+    const hasTime = dueValue instanceof Date || /\s\d{1,2}:\d{2}$/.test(String(dueValue));
+    const status = hasTime ? 'Classroomで時刻補正' : 'Classroomで日付補正';
+    sheet.getRange(match.index + 1, 6, 1, 2).setValues([[toSafeSpreadsheetCell_(dueValue), status]]);
+    values[match.index][5] = dueValue; values[match.index][6] = status;
+    savedDueValue = dueValue; updatedRows.push(match.index + 1);
   });
-
-  if (!match) {
-    return buildClassroomDueTimeResult_(record, false, '通知一覧に一致するClassroom課題がないため更新しませんでした。');
-  }
-
-  const rowIndex = match.index;
-  const rowNumber = rowIndex + 1;
-  const dueValue = buildClassroomDueDateValue_(record, values[rowIndex][5]);
-
-  if (!dueValue) {
-    return buildClassroomDueTimeResult_(record, false, '更新できる期限情報がありません。');
-  }
-
-  sheet.getRange(rowNumber, 6).setValue(toSafeSpreadsheetCell_(dueValue));
-  sheet.getRange(rowNumber, 7).setValue('Classroomで時刻補正');
-  values[rowIndex][5] = dueValue;
-  values[rowIndex][6] = 'Classroomで時刻補正';
-
-  return buildClassroomDueTimeResult_(record, true, '', rowNumber, dueValue);
+  const result = buildClassroomDueTimeResult_(record, updatedRows.length > 0, updatedRows.length ? '' : '更新できる期限情報がありません。', updatedRows[0], savedDueValue);
+  result.rows = updatedRows;
+  return result;
 }
 
 function buildClassroomSyntheticMessageId_(record) {
@@ -3277,13 +3627,14 @@ function buildClassroomSyntheticMessageId_(record) {
   ].filter(Boolean).join(':');
 }
 
-function findMatchingClassroomNotificationRow_(values, record, options) {
+function findMatchingClassroomNotificationRows_(values, record, options) {
   const allowTextFallback = !(options && options.allowTextFallback === false);
   const recordUrl = normalizeClassroomUrlForMatch_(record.classroomUrl || record.pageUrl);
   const recordIds = getClassroomRecordIds_(record);
   const recordTitle = normalizeInCampusMatchText_(record.title);
   const recordCourseName = normalizeClassroomCourseNameForMatch_(record.courseName);
   const recordSyntheticMessageId = buildClassroomSyntheticMessageId_(record);
+  const matches = [];
 
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
@@ -3293,7 +3644,7 @@ function findMatchingClassroomNotificationRow_(values, record, options) {
       continue;
     }
 
-    if (isClassroomExtensionSyncRow_(row)) {
+    if (!isTaskRelatedRow_(row)) {
       continue;
     }
 
@@ -3333,14 +3684,14 @@ function findMatchingClassroomNotificationRow_(values, record, options) {
       (allowTextFallback && exactTitleMatches && exactCourseMatches) ||
       (allowTextFallback && titleMatches && relatedCourseMatches)
     ) {
-      return {
-        index: i,
-        row
-      };
+      matches.push({index: i, row});
     }
   }
+  return matches;
+}
 
-  return null;
+function findMatchingClassroomNotificationRow_(values, record, options) {
+  return findMatchingClassroomNotificationRows_(values, record, options)[0] || null;
 }
 
 function normalizeClassroomCourseNameForMatch_(value) {
@@ -3380,33 +3731,39 @@ function extractClassroomIdsFromText_(text) {
 
 function buildClassroomDueDateValue_(record, existingDueValue) {
   const dueTime = normalizeTimeText_(record.dueTime);
-  const existingDueInfo = normalizeDueInfoForWeb_(existingDueValue, '');
-
-  if (existingDueInfo.dueDateKey && dueTime) {
-    const parts = existingDueInfo.dueDateKey.split('-');
-    return buildDateWithTime_(parts[0], parts[1], parts[2], dueTime);
+  const dueAtText = String(record.dueAt || '').trim();
+  const dateOnlyAt = dueAtText.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (dateOnlyAt && isValidDateParts_(Number(dateOnlyAt[1]), Number(dateOnlyAt[2]), Number(dateOnlyAt[3]))) {
+    return dueTime ? buildDateWithTime_(dateOnlyAt[1], dateOnlyAt[2], dateOnlyAt[3], dueTime)
+      : formatDueDate_(dateOnlyAt[1], dateOnlyAt[2], dateOnlyAt[3], '');
   }
-
-  const dueAtDate = parseClassroomDate_(record.dueAt);
-  if (dueAtDate) {
-    return dueAtDate;
-  }
+  const dueAtDate = !dateOnlyAt ? parseClassroomDate_(record.dueAt) : null;
+  if (dueAtDate) return dueAtDate;
 
   const dueDateText = String(record.dueDate || '').trim();
-
-  if (dueDateText && dueTime) {
-    const match = dueDateText.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-
-    if (match) {
-      return buildDateWithTime_(match[1], match[2], match[3], dueTime);
-    }
+  const provided = dueDateText.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (provided && isValidDateParts_(Number(provided[1]), Number(provided[2]), Number(provided[3]))) {
+    return dueTime ? buildDateWithTime_(provided[1], provided[2], provided[3], dueTime)
+      : formatDueDate_(provided[1], provided[2], provided[3], '');
   }
-
+  // Date-only pages omit today's date. Preserve the ORIGINAL date stored in the
+  // sheet here, not the prior-day presentation of a known midnight deadline.
+  const existing = getOriginalDueDateParts_(existingDueValue);
+  if (existing && dueTime) return buildDateWithTime_(existing.year, existing.month, existing.day, dueTime);
   if (record.dueText) {
-    return String(record.dueText);
+    const parsed = parseDueDateTextForWeb_(String(record.dueText).trim());
+    if (parsed && parsed.dueType === 'detected') return String(record.dueText).trim();
   }
-
   return '';
+}
+
+function getOriginalDueDateParts_(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return {year: value.getFullYear(), month: value.getMonth() + 1, day: value.getDate()};
+  }
+  const match = String(value || '').match(/^(\d{4})[\/年-]\s*(\d{1,2})[\/月-]\s*(\d{1,2})(?:日|\s|$)/);
+  if (!match || !isValidDateParts_(Number(match[1]), Number(match[2]), Number(match[3]))) return null;
+  return {year: Number(match[1]), month: Number(match[2]), day: Number(match[3])};
 }
 
 function parseClassroomDate_(value) {
@@ -3418,8 +3775,9 @@ function parseClassroomDate_(value) {
     return null;
   }
 
+  const explicitDate = String(value).match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:T|\s|$)/);
+  if (explicitDate && !isValidDateParts_(Number(explicitDate[1]), Number(explicitDate[2]), Number(explicitDate[3]))) return null;
   const date = new Date(value);
-
   return isNaN(date.getTime()) ? null : date;
 }
 
@@ -3463,20 +3821,18 @@ function formatDateForDebug_(value) {
 }
 
 function completeMatchingClassroomNotificationRow_(sheet, values, record) {
-  const match = findMatchingClassroomNotificationRow_(values, record, {
-    allowTextFallback: false
+  const matches = findMatchingClassroomNotificationRows_(values, record, {allowTextFallback: false});
+  if (!matches.length) return buildClassroomCompletionResult_(record, false, 'Classroom通知に一致するClassroom課題がないため完了にしませんでした。');
+  const providedCompletedAt = parseClassroomDate_(record && record.completedAt);
+  const existingCompletedAt = matches.map(match => parseClassroomDate_(values[match.index][13])).find(Boolean);
+  const completedAt = providedCompletedAt || existingCompletedAt || new Date();
+  matches.forEach(match => {
+    sheet.getRange(match.index + 1, 13, 1, 2).setValues([['完了', completedAt]]);
+    values[match.index][12] = '完了'; values[match.index][13] = completedAt;
   });
-
-  if (!match) {
-    return buildClassroomCompletionResult_(record, false, '通知一覧に一致するClassroom課題がないため完了にしませんでした。');
-  }
-
-  const sheetRow = match.index + 1;
-
-  sheet.getRange(sheetRow, 13).setValue('完了');
-  values[match.index][12] = '完了';
-
-  return buildClassroomCompletionResult_(record, true, '', sheetRow);
+  const result = buildClassroomCompletionResult_(record, true, '', matches[0].index + 1);
+  result.rows = matches.map(match => match.index + 1);
+  return result;
 }
 
 function buildClassroomCompletionResult_(record, matched, reason, row, created) {
