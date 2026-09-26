@@ -261,8 +261,11 @@ async function saveSyncLimit() {
 
 async function savePreviewOnly() {
   await chrome.storage.local.set({
-    previewOnly: previewOnlyInput.checked
+    previewOnly: previewOnlyInput.checked,
+    lastInCampusAutoSyncAt: 0,
+    ...Object.fromEntries(CLASSROOM_AUTO_SYNC_STORAGE_KEYS.map((key) => [key, 0]))
   });
+  updateActionButtons();
 
   setStatus(previewOnlyInput.checked
     ? "プレビューのみをONにしました。Hubへは送信しません。"
@@ -391,7 +394,7 @@ function buildSyncDetailText(status) {
     lines.push(`Classroom期限候補: ${status.foundCount || 0}件 / 時刻あり: ${status.dueTimeCount || 0}件`);
     lines.push(`反映: ${status.matchedCount || 0}件 / 新規: ${status.createdCount || 0}件 / 未一致: ${status.unmatchedCount || 0}件 / 確認: ${status.previewCount || 0}件 / 送信: ${status.sentCount || 0}件`);
   } else {
-    lines.push(`課題: ${status.assignmentCount || 0}件 / 提出: ${status.submissionRecordCount || 0}件`);
+    lines.push(`課題: ${status.assignmentCount || 0}件 / お知らせ: ${status.announcementCount || 0}件 / 提出: ${status.submissionRecordCount || 0}件`);
     lines.push(`新規: ${status.newCount || 0}件 / 更新: ${status.updatedCount || 0}件 / 確認: ${status.previewCount || 0}件 / 送信: ${status.sentCount || 0}件`);
   }
 
@@ -422,7 +425,8 @@ function buildSyncDetailText(status) {
       preview: "確認",
       completed: "完了",
       dueTime: "期限",
-      unmatched: "未一致"
+      unmatched: "未一致",
+      failed: "失敗"
     };
     const formatItemLine = (item, index) => {
       const actionLabel = actionLabels[item.action] || item.action || "不明";
@@ -432,7 +436,7 @@ function buildSyncDetailText(status) {
           ? "Classroom"
           : item.type === "classroomDueTime"
             ? "期限"
-            : "課題";
+            : item.type === "announcement" ? "お知らせ" : "課題";
       const courseName = item.courseName ? `${item.courseName} / ` : "";
       const title = item.title || item.pageUrl || "タイトル未取得";
       const suffix = item.dueText || item.dueTime ? ` (${item.dueText || item.dueTime})` : "";
@@ -610,7 +614,7 @@ async function runSetupCheck() {
   items.push({
     ok: true,
     label: "プレビューのみ",
-    detail: previewOnlyInput.checked ? "ONです。更新一覧から同期してもHubへ送信しません。" : "OFFです。"
+    detail: previewOnlyInput.checked ? "ONです。自動同期・手動同期ともHubへ送信しません。" : "OFFです。"
   });
 
   renderSetupCheck(items);
@@ -618,7 +622,7 @@ async function runSetupCheck() {
 }
 
 function canSend() {
-  return Boolean(latestAssignment && webAppUrlInput.value.trim() && apiTokenInput.value.trim());
+  return Boolean(!previewOnlyInput.checked && latestAssignment && webAppUrlInput.value.trim() && apiTokenInput.value.trim());
 }
 
 function updateActionButtons() {
@@ -688,6 +692,10 @@ copyButton.addEventListener("click", async () => {
 
 sendButton.addEventListener("click", async () => {
   if (!latestAssignment) return;
+  if (previewOnlyInput.checked) {
+    setStatus("プレビューのみがONのため、Hubへは送信しません。");
+    return;
+  }
 
   setStatus("送信中...");
 
@@ -709,6 +717,11 @@ sendButton.addEventListener("click", async () => {
 
     if (!response?.ok) {
       throw new Error(response?.error || "送信に失敗しました。");
+    }
+
+    if (response.result?.dryRun) {
+      setStatus("プレビューのみがONのため、Hubへは送信しません。");
+      return;
     }
 
     setStatus(response.result?.updated ? "Hubへ更新しました。" : "Hubへ送信しました。");
@@ -777,7 +790,7 @@ syncNowButton.addEventListener("click", async () => {
       return;
     }
 
-    setStatus(dryRun
+    setStatus(dryRun || result?.dryRun || result?.previewOnly
       ? `プレビュー完了: ${result?.previewCount || 0}件確認`
       : `同期完了: ${result?.sentCount || 0}件送信`
     );
@@ -848,7 +861,7 @@ classroomSyncButton.addEventListener("click", async () => {
       return;
     }
 
-    setStatus(dryRun
+    setStatus(dryRun || result?.dryRun || result?.previewOnly
       ? `プレビュー完了: ${result?.previewCount || 0}件確認`
       : `Classroom完了同期: ${result?.matchedCount || 0}件完了`
     );
@@ -919,7 +932,7 @@ classroomDueSyncButton.addEventListener("click", async () => {
       return;
     }
 
-    setStatus(dryRun
+    setStatus(dryRun || result?.dryRun || result?.previewOnly
       ? `プレビュー完了: ${result?.previewCount || 0}件確認`
       : `Classroom期限同期: ${result?.matchedCount || 0}件更新`
     );
@@ -972,7 +985,7 @@ incampusDebugButton.addEventListener("click", async () => {
     const hasErrors = Array.isArray(payload?.errors) && payload.errors.length > 0;
 
     setStatus(
-      `送信予定を表示しました。課題${payload?.assignmentCount || 0}件 / 提出${payload?.submissionRecordCount || 0}件`,
+      `送信予定を表示しました。課題${payload?.assignmentCount || 0}件 / お知らせ${payload?.announcementCount || 0}件 / 提出${payload?.submissionRecordCount || 0}件`,
       !payload?.ok || hasErrors
     );
   } catch (error) {
@@ -1086,3 +1099,16 @@ restoreSettings()
   .catch((error) => {
     setStatus(normalizeText(error?.message || error), true);
   });
+
+// Open the notice screen without including the API token in the URL.
+document.getElementById("openUniversityNotices").addEventListener("click", async () => {
+  try {
+    const value = normalizeHubWebAppUrl(webAppUrlInput.value);
+    if (!value) { setStatus("GAS WebアプリURLを入力してください。", true); return; }
+    const url = new URL(value);
+    if (url.hostname !== "script.google.com" || !/\/exec$/.test(url.pathname)) throw new Error("script.google.com の /exec で終わるWebアプリURLを指定してください。");
+    url.search = "";
+    url.searchParams.set("view", "university");
+    await chrome.tabs.create({url: url.href});
+  } catch (error) { setStatus(error.message || String(error), true); }
+});

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "課題通知Hub連携",
-  "version": "2.5.5",
+  "version": "2.5.8",
   "description": "inCampus課題情報とGoogle Classroomの完了状態・期限時刻を課題通知Hubへ送信します。",
   "permissions": ["activeTab", "clipboardWrite", "storage"],
   "host_permissions": [

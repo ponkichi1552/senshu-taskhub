@@ -1,6 +1,7 @@
 const HUB_POST_TIMEOUT_MS = 30000;
 const HUB_DIAGNOSE_TIMEOUT_MS = 12000;
 const HUB_MAX_POST_BODY_LENGTH = 190000;
+const HUB_MAX_POST_RECORDS = 100;
 const HUB_API_TOKEN_MIN_LENGTH = 48;
 const ALLOWED_HUB_WEB_APP_HOSTS = new Set([
   "script.google.com",
@@ -148,13 +149,20 @@ async function parseHubResponse(response) {
 }
 
 async function postJsonToHub(webAppUrl, payload) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), HUB_POST_TIMEOUT_MS);
+  // Check immediately before every request, including later batches and manual posts.
+  const { previewOnly } = await chrome.storage.local.get("previewOnly");
+  if (previewOnly) {
+    return { ok: true, dryRun: true, skipped: true, previewOnly: true };
+  }
+
   const body = JSON.stringify(payload);
 
   if (body.length > HUB_MAX_POST_BODY_LENGTH) {
     throw new Error("送信データが大きすぎます。同期対象件数を減らしてください。");
   }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), HUB_POST_TIMEOUT_MS);
 
   try {
     const response = await fetch(webAppUrl, {
@@ -180,6 +188,10 @@ async function postJsonToHub(webAppUrl, payload) {
 }
 
 async function postAssignmentToHub(assignment) {
+  const { previewOnly } = await chrome.storage.local.get("previewOnly");
+  if (previewOnly) {
+    return { ok: true, dryRun: true, skipped: true, previewOnly: true };
+  }
   const { webAppUrl, apiToken } = await getHubConnectionSettings();
 
   if (!webAppUrl) {
@@ -196,7 +208,34 @@ async function postAssignmentToHub(assignment) {
   }, apiToken));
 }
 
-async function postClassroomCompletionRecordsToHub(records) {
+function buildClassroomRecordOutcome(record, index, extra) {
+  return {
+    title: record?.title || "",
+    courseName: record?.courseName || "",
+    classroomUrl: record?.classroomUrl || record?.pageUrl || "",
+    courseId: record?.courseId || "",
+    streamItemId: record?.streamItemId || "",
+    recordIndex: index,
+    ...extra
+  };
+}
+
+async function postClassroomRecordsToHub(action, records) {
+  if (!Array.isArray(records)) {
+    throw new Error("recordsが配列ではありません。");
+  }
+  const aggregate = {
+    ok: true, foundCount: records.length, sentCount: 0, matchedCount: 0,
+    createdCount: 0, unmatchedCount: 0, failedCount: 0, previewCount: 0,
+    batchCount: 0, results: [], errors: []
+  };
+  const { previewOnly } = await chrome.storage.local.get("previewOnly");
+  if (previewOnly) {
+    return {
+      ...aggregate, dryRun: true, previewOnly: true, previewCount: records.length,
+      results: records.map((record, index) => buildClassroomRecordOutcome(record, index, { preview: true }))
+    };
+  }
   const { webAppUrl, apiToken } = await getHubConnectionSettings();
 
   if (!webAppUrl) {
@@ -207,27 +246,81 @@ async function postClassroomCompletionRecordsToHub(records) {
     };
   }
 
-  return postJsonToHub(webAppUrl, buildAuthenticatedPayload({
-    action: "completeClassroomAssignments",
-    records
-  }, apiToken));
+  const batches = [];
+  let batch = [];
+  const payloadFor = (entries) => buildAuthenticatedPayload({
+    action, records: entries.map((entry) => entry.record)
+  }, apiToken);
+  const failEntries = (entries, error) => {
+    const reason = String(error?.message || error);
+    aggregate.errors.push(reason);
+    aggregate.failedCount += entries.length;
+    entries.forEach(({ record, index }) => aggregate.results.push(
+      buildClassroomRecordOutcome(record, index, { failed: true, matched: false, reason })
+    ));
+  };
+
+  records.forEach((record, index) => {
+    const entry = { record, index };
+    if (JSON.stringify(payloadFor([entry])).length > HUB_MAX_POST_BODY_LENGTH) {
+      failEntries([entry], `${record?.title || `課題${index + 1}`}: 1件の送信データが大きすぎます。`);
+      return;
+    }
+    if (batch.length >= HUB_MAX_POST_RECORDS ||
+        JSON.stringify(payloadFor(batch.concat(entry))).length > HUB_MAX_POST_BODY_LENGTH) {
+      batches.push(batch);
+      batch = [];
+    }
+    batch.push(entry);
+  });
+  if (batch.length) batches.push(batch);
+
+  for (const entries of batches) {
+    try {
+      const result = await postJsonToHub(webAppUrl, payloadFor(entries));
+      if (result.dryRun) {
+        aggregate.previewOnly = true;
+        aggregate.previewCount += entries.length;
+        entries.forEach(({ record, index }) => aggregate.results.push(
+          buildClassroomRecordOutcome(record, index, { preview: true })
+        ));
+        continue;
+      }
+      if (!Array.isArray(result.results) || result.results.length !== entries.length ||
+          result.results.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+        throw new Error("Classroom同期結果の件数が送信件数と一致しません。反映状態を確認してください。");
+      }
+      aggregate.batchCount++;
+      aggregate.sentCount += entries.length;
+      result.results.forEach((item, resultIndex) => {
+        const { record, index } = entries[resultIndex];
+        aggregate.results.push(buildClassroomRecordOutcome(record, index, { ...item, recordIndex: index }));
+        if (item.failed) {
+          aggregate.failedCount++;
+          aggregate.errors.push(item.reason || "課題の同期に失敗しました。");
+        } else if (item.matched) {
+          aggregate.matchedCount++;
+        } else {
+          aggregate.unmatchedCount++;
+        }
+        if (item.created) aggregate.createdCount++;
+      });
+    } catch (error) {
+      failEntries(entries, error);
+    }
+  }
+  aggregate.results.sort((left, right) => left.recordIndex - right.recordIndex);
+  aggregate.ok = aggregate.errors.length === 0;
+  aggregate.dryRun = Boolean(aggregate.previewOnly && aggregate.sentCount === 0);
+  return aggregate;
+}
+
+async function postClassroomCompletionRecordsToHub(records) {
+  return postClassroomRecordsToHub("completeClassroomAssignments", records);
 }
 
 async function postClassroomDueTimeRecordsToHub(records) {
-  const { webAppUrl, apiToken } = await getHubConnectionSettings();
-
-  if (!webAppUrl) {
-    return {
-      ok: false,
-      missingWebAppUrl: true,
-      error: "GAS WebアプリURLが未設定です。"
-    };
-  }
-
-  return postJsonToHub(webAppUrl, buildAuthenticatedPayload({
-    action: "updateClassroomDueTimes",
-    records
-  }, apiToken));
+  return postClassroomRecordsToHub("updateClassroomDueTimes", records);
 }
 
 async function diagnoseHubWebAppUrl(webAppUrl) {
@@ -293,7 +386,7 @@ async function diagnoseHubWebAppUrl(webAppUrl) {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "POST_INCAMPUS_ASSIGNMENT") {
     postAssignmentToHub(message.assignment)
-      .then((result) => sendResponse({ ok: true, result }))
+      .then((result) => sendResponse({ ok: result.ok !== false, result, error: result.error || "" }))
       .catch((error) => sendResponse({
         ok: false,
         error: String(error?.message || error)
@@ -304,7 +397,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type === "POST_CLASSROOM_COMPLETION_RECORDS") {
     postClassroomCompletionRecordsToHub(message.records || [])
-      .then((result) => sendResponse({ ok: true, result }))
+      .then((result) => sendResponse({ ok: result.ok !== false, result, error: result.error || "" }))
       .catch((error) => sendResponse({
         ok: false,
         error: String(error?.message || error)
@@ -315,7 +408,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type === "POST_CLASSROOM_DUE_TIME_RECORDS") {
     postClassroomDueTimeRecordsToHub(message.records || [])
-      .then((result) => sendResponse({ ok: true, result }))
+      .then((result) => sendResponse({ ok: result.ok !== false, result, error: result.error || "" }))
       .catch((error) => sendResponse({
         ok: false,
         error: String(error?.message || error)

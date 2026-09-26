@@ -323,24 +323,17 @@ function extractSubmissionTitle(text) {
   return "";
 }
 
+function getInCampusUpdateKind(text) {
+  const prefix = normalizeText(text).replace(/^[・･·\s]+/, '').slice(0, 2);
+  return prefix === '課題' ? 'assignment' : prefix === 'お知' ? 'announcement' : '';
+}
+
 function extractTitleFromUpdateText(text) {
-  const normalized = normalizeText(text);
-  const patterns = [
-    /課題\s*[（(]([^）)]+)[）)]/,
-    /課題\s*[「『]([^」』]+)[」』]/,
-    /レポート\s*[（(]([^）)]+)[）)]/,
-    /レポート\s*[「『]([^」』]+)[」』]/
-  ];
-
-  for (const pattern of patterns) {
-    const match = normalized.match(pattern);
-
-    if (match?.[1]) {
-      return normalizeText(match[1]);
-    }
-  }
-
-  return "";
+  const normalized = normalizeText(text).replace(/^[・･·\s]+/, '');
+  // Greedy outer capture preserves parentheses inside the actual title.
+  const match = normalized.match(/^(?:課題|お知らせ)\s*[（(](.*)[）)]\s*(?:が|を)/) ||
+    normalized.match(/^(?:課題|お知らせ)\s*[「『](.*)[」』]\s*(?:が|を)/);
+  return match ? normalizeText(match[1]) : '';
 }
 
 function buildUpdateInfoFallbackUrl(updateInfoId, text) {
@@ -358,26 +351,21 @@ function parseReportNotifications(updateInfoHtml) {
     .map((row) => {
       const button = row.querySelector?.("button.updateInfoUrl") || row;
       const rowText = getElementText(row);
-      const module = getInputValue(row, ["module"]);
       const detailUrl = extractButtonUrl(button);
-      const looksLikeReport = module === "report" ||
-        /(?:課題|レポート|提出しました)/.test(rowText) ||
-        /report/i.test(detailUrl);
-
-      if (!looksLikeReport) {
-        return null;
-      }
 
       const spans = Array.from(button?.querySelectorAll?.("span") || [])
         .map((span) => normalizeText(span.textContent))
         .filter(Boolean);
       const courseName = parseCourseNameFromUpdateText(rowText, spans);
       const updateText = normalizeText(spans.length > 1 ? spans.slice(1).join("\n") : rowText);
-      const submissionTitle = extractSubmissionTitle(updateText);
+      const updateKind = getInCampusUpdateKind(updateText);
+      if (!updateKind) return null;
+      const submissionTitle = updateKind === 'assignment' && /を提出しました/.test(updateText)
+        ? extractTitleFromUpdateText(updateText) : '';
       const titleFromUpdate = submissionTitle || extractTitleFromUpdateText(updateText);
-      const kind = submissionTitle ? "submissionRecord" : "assignment";
+      const kind = submissionTitle ? "submissionRecord" : updateKind;
 
-      if (kind === "assignment" && !detailUrl) {
+      if (kind !== "submissionRecord" && !detailUrl) {
         return null;
       }
 
@@ -498,6 +486,8 @@ function extractPageHeadings(doc) {
 }
 
 function extractAssignmentFromDetailHtml(detailHtml, pageUrl, notification) {
+  // A course overview is never a report detail, even if it has a heading.
+  if (!/^https:\/\/ic\.ss\.senshu-u\.ac\.jp\/lms\/course\/report\//.test(pageUrl)) return null;
   const doc = parseHtml(detailHtml);
   const details = parseDetailLabels(doc);
   const pageHeadings = extractPageHeadings(doc);
@@ -509,7 +499,7 @@ function extractAssignmentFromDetailHtml(detailHtml, pageUrl, notification) {
     "";
   const body = findDetailValue(details, ["内容", "課題内容", "説明", "詳細", "本文"]);
 
-  if (!title && !body && !periodText) {
+  if (!title || (!body && !periodText)) {
     return null;
   }
 
@@ -536,6 +526,17 @@ function extractAssignmentFromDetailHtml(detailHtml, pageUrl, notification) {
     extractedAt: new Date().toISOString(),
     rawLabels: details,
     pageHeadings
+  };
+}
+
+function buildInCampusAnnouncement(notification) {
+  if (!notification.titleFromUpdate) return null;
+  return {
+    source: 'inCampus', type: 'announcement', courseName: notification.courseName || '',
+    title: notification.titleFromUpdate, body: '', pageUrl: notification.detailUrl,
+    assignmentKey: notification.assignmentKey, updateText: notification.updateText,
+    updateAction: notification.action || '', updateAt: notification.updateAt || '',
+    extractedAt: new Date().toISOString()
   };
 }
 
@@ -608,15 +609,15 @@ function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function expandClassroomSections(root = document) {
+async function expandClassroomSections(root = document, onExpanded) {
   if (!root?.querySelectorAll) {
     return 0;
   }
 
-  const sectionNamePattern = /期限なし|早期完了|今週|次の週|先週|それ以前/;
-  const candidates = Array.from(root.querySelectorAll("[aria-expanded='false'], button, [role='button']"))
+  const sectionNamePattern = /期限なし|早期完了|今週|次の週|先週|それ以前|それ以降/;
+  const findCandidates = () => Array.from(root.querySelectorAll("[aria-expanded='false'], button, [role='button']"))
     .filter((element) => {
-      if (element.closest("a")) {
+      if (element.closest("a") || element.disabled || element.getAttribute("aria-disabled") === "true") {
         return false;
       }
 
@@ -627,30 +628,82 @@ async function expandClassroomSections(root = document) {
 
       return knownSection && (expanded === "false" || Boolean(element.querySelector("[aria-expanded='false']")));
     });
-  const seen = new Set();
+  const getSectionNames = () => findCandidates().map((element) =>
+    (getElementText(element) + " " + (element.getAttribute("aria-label") || "")).match(sectionNamePattern)?.[0]
+  ).filter(Boolean);
+  let sectionNames = [...new Set(getSectionNames())];
   let clickedCount = 0;
-
-  for (const element of candidates) {
-    if (seen.has(element)) {
-      continue;
+  const expandVisibleCards = async (allowUnready = false) => {
+    // Classroom initially shows only five cards per section, even when expanded.
+    // Wait for the current section before looking for its "show all" control.
+    if (onExpanded) await onExpanded({ allowUnready });
+    const seen = new Set();
+    for (let pass = 0; pass < 20; pass++) {
+      const showAllButtons = Array.from(root.querySelectorAll("button, [role='button']"))
+        .filter((element) => !seen.has(element) && !element.disabled &&
+          element.getAttribute("aria-disabled") !== "true" && !element.closest("a") &&
+          /^(?:すべて表示|すべてを表示|show all)$/i.test(getElementText(element)));
+      if (!showAllButtons.length) break;
+      for (const element of showAllButtons) {
+        seen.add(element);
+        element.click();
+        clickedCount++;
+      }
+      await sleep(500);
+      if (onExpanded) await onExpanded();
     }
-
-    seen.add(element);
-
-    try {
-      element.click();
-      clickedCount++;
-      await sleep(160);
-    } catch (_) {
-      // ClassroomのDOMが変わってクリック不能でも、抽出自体は続行する。
-    }
-  }
-
-  if (clickedCount > 0) {
+  };
+  await expandVisibleCards(sectionNames.length > 0);
+  sectionNames = [...new Set(sectionNames.concat(getSectionNames()))];
+  for (const sectionName of sectionNames) {
+    // Re-resolve after rendering: changing sections can replace the previous DOM.
+    const element = findCandidates().find((candidate) =>
+      (getElementText(candidate) + " " + (candidate.getAttribute("aria-label") || "")).includes(sectionName)
+    );
+    if (!element) continue;
+    element.click();
+    clickedCount++;
     await sleep(500);
+    await expandVisibleCards();
   }
 
   return clickedCount;
+}
+
+async function collectClassroomRecordsFromDocument(mode, root, pageUrl) {
+  const records = new Map();
+  let successfulExtraction = false;
+  let lastError = "Classroomの課題一覧を確認できませんでした。";
+  const collect = async ({ allowUnready = false } = {}) => {
+    const startedAt = Date.now();
+    let extraction;
+    do {
+      extraction = mode === "completion"
+        ? extractClassroomCompletionRecordsFromDocument(root, pageUrl)
+        : extractClassroomDueTimeRecordsFromDocument(root, pageUrl);
+      if (extraction.ok) break;
+      lastError = extraction.error || lastError;
+      // Before the first section is opened there may be no cards yet.
+      if (allowUnready && getClassroomAssignmentAnchors(root).length === 0) return;
+      await sleep(CLASSROOM_FRAME_POLL_INTERVAL_MS);
+    } while (Date.now() - startedAt < CLASSROOM_FRAME_LOAD_TIMEOUT_MS);
+    if (!extraction.ok) {
+      throw new Error(lastError);
+    }
+    successfulExtraction = true;
+    extraction.records.forEach((record) => records.set(record.classroomUrl, record));
+  };
+  let expandedSectionCount = 0;
+  try {
+    expandedSectionCount = await expandClassroomSections(root, collect);
+  } catch (error) {
+    return { ok: false, records: [...records.values()], pageUrl, expandedSectionCount,
+      error: String(error?.message || error) };
+  }
+  return {
+    ok: successfulExtraction, records: [...records.values()], pageUrl,
+    expandedSectionCount, error: successfulExtraction ? "" : lastError
+  };
 }
 
 function getClassroomAssignmentAnchors(root = document) {
@@ -1015,6 +1068,8 @@ function parseClassroomDueText(dueText) {
 }
 
 function extractClassroomCompletionRecordsFromDocument(root = document, pageUrl = location.href) {
+  const readiness = getClassroomDocumentReadiness(root, "completion", pageUrl);
+  if (!readiness.ok) return { ...readiness, records: [], pageUrl };
   const anchors = getClassroomAssignmentAnchors(root);
   const seen = new Set();
   const records = [];
@@ -1079,6 +1134,8 @@ function extractClassroomCompletionRecordsFromPage() {
 }
 
 function extractClassroomDueTimeRecordsFromDocument(root = document, pageUrl = location.href) {
+  const readiness = getClassroomDocumentReadiness(root, "dueTime", pageUrl);
+  if (!readiness.ok) return { ...readiness, records: [], pageUrl };
   const anchors = getClassroomAssignmentAnchors(root);
   const seen = new Set();
   const records = [];
@@ -1188,12 +1245,10 @@ function buildClassroomDebugPayload(mode, extraction, pageUrl) {
 }
 
 async function extractClassroomDebugPayloadForMode(mode, root = document, pageUrl = location.href) {
-  await expandClassroomSections(root);
-
   if (mode === "completion") {
     return buildClassroomDebugPayload(
       mode,
-      extractClassroomCompletionRecordsFromDocument(root, pageUrl),
+      await collectClassroomRecordsFromDocument(mode, root, pageUrl),
       pageUrl
     );
   }
@@ -1201,7 +1256,7 @@ async function extractClassroomDebugPayloadForMode(mode, root = document, pageUr
   if (mode === "dueTime") {
     return buildClassroomDebugPayload(
       mode,
-      extractClassroomDueTimeRecordsFromDocument(root, pageUrl),
+      await collectClassroomRecordsFromDocument(mode, root, pageUrl),
       pageUrl
     );
   }
@@ -1307,6 +1362,7 @@ async function extractInCampusDebugPayload(options = {}) {
     foundCount: 0,
     recordCount: 0,
     assignmentCount: 0,
+    announcementCount: 0,
     submissionRecordCount: 0,
     records: [],
     requestBodyPreview: {
@@ -1335,6 +1391,8 @@ async function extractInCampusDebugPayload(options = {}) {
 
         if (notification.kind === "submissionRecord") {
           assignment = buildSubmissionRecordAssignment(notification);
+        } else if (notification.kind === "announcement") {
+          assignment = buildInCampusAnnouncement(notification);
         } else {
           const detailHtml = await fetchInCampusHtml(notification.detailUrl);
           assignment = extractAssignmentFromDetailHtml(
@@ -1351,6 +1409,8 @@ async function extractInCampusDebugPayload(options = {}) {
 
         if (assignment.type === "submissionRecord") {
           payload.submissionRecordCount++;
+        } else if (assignment.type === "announcement") {
+          payload.announcementCount++;
         } else {
           payload.assignmentCount++;
         }
@@ -1407,6 +1467,11 @@ async function isAutoSyncEnabled() {
 async function isClassroomAutoSyncEnabled() {
   const { classroomAutoSyncEnabled } = await chrome.storage.local.get("classroomAutoSyncEnabled");
   return classroomAutoSyncEnabled !== false;
+}
+
+async function isSyncPreviewOnly(options = {}) {
+  const { previewOnly } = await chrome.storage.local.get("previewOnly");
+  return Boolean(options.dryRun || previewOnly);
 }
 
 async function getStoredSyncLimit() {
@@ -1545,9 +1610,48 @@ function getFrameDocument(frame) {
   }
 }
 
+function isExpectedClassroomUrl(value, mode, allowCourseFilter = false) {
+  try {
+    const url = new URL(value);
+    const path = url.pathname.replace(/^\/u\/\d+(?=\/)/, "").replace(/\/+$/, "");
+    const expectedPath = getClassroomAutoSyncPath(mode);
+    const prefix = expectedPath.replace(/all$/, "");
+    return url.protocol === "https:" && url.hostname === CLASSROOM_HOST &&
+      (path === expectedPath || (allowCourseFilter && path.startsWith(prefix) &&
+        /^[A-Za-z0-9_-]+$/.test(path.slice(prefix.length))));
+  } catch (_) {
+    return false;
+  }
+}
+
+function getClassroomDocumentReadiness(doc, mode, pageUrl) {
+  // Navigation labels alone occur while the app is still loading.
+  const actualUrl = doc?.location?.href || doc?.URL || pageUrl;
+  if (!doc?.body || !isExpectedClassroomUrl(actualUrl, mode, true) ||
+      (doc.readyState && !["interactive", "complete"].includes(doc.readyState))) {
+    return { ok: false, error: "Classroomの対象ページの読み込みを確認できませんでした。" };
+  }
+  const activeLoading = Array.from(doc.querySelectorAll?.('[aria-busy="true"], [role="progressbar"]') || [])
+    .some((element) => !element.hidden &&
+      !element.closest?.('[hidden], [aria-hidden="true"]') &&
+      (!element.getClientRects || element.getClientRects().length > 0));
+  if (activeLoading) {
+    return { ok: false, error: "Classroomの課題一覧を読み込み中です。" };
+  }
+  if (getClassroomAssignmentAnchors(doc).length > 0) {
+    return { ok: true, empty: false };
+  }
+  const bodyText = getElementText(doc.querySelector?.('main, [role="main"]') || doc.body);
+  const explicitEmpty = /ToDo\s*リストには何もありません|(?:提出済み|完了した|未提出|予定されている|割り当てられた)(?:の)?課題(?:は|が)ありません|課題(?:は|が)ありません|すべて(?:の課題が)?完了しました|すべて提出済み|no (?:completed |turned.in |assigned |upcoming )?(?:work|assignments)(?: due(?: soon)?| to do)?|you(?:'|’)re all caught up/i.test(bodyText);
+  return explicitEmpty
+    ? { ok: true, empty: true }
+    : { ok: false, error: "Classroomの課題一覧または課題なしの表示を確認できませんでした。" };
+}
+
 async function waitForHiddenClassroomFrame(frame, mode) {
   const startedAt = Date.now();
-  const expectedPath = getClassroomAutoSyncPath(mode);
+  let readySince = 0;
+  let readyDocument = null;
 
   while (Date.now() - startedAt < CLASSROOM_FRAME_LOAD_TIMEOUT_MS) {
     const doc = getFrameDocument(frame);
@@ -1558,26 +1662,26 @@ async function waitForHiddenClassroomFrame(frame, mode) {
         return "";
       }
     })();
-    const loadedExpectedPage = href.includes(expectedPath);
-    const hasAssignments = doc && getClassroomAssignmentAnchors(doc).length > 0;
-    const bodyText = normalizeText(doc?.body?.textContent || "");
-    const hasKnownClassroomText = /期限なし|今週|それ以前|提出済み|割り当て済み|未提出|完了/.test(bodyText);
-
-    if (doc && loadedExpectedPage && (hasAssignments || hasKnownClassroomText)) {
-      await sleep(CLASSROOM_FRAME_RENDER_WAIT_MS);
-      return doc;
+    if (isExpectedClassroomUrl(href, mode) && doc?.body &&
+        !getClassroomDocumentReadiness(doc, mode, href).ok &&
+        doc.querySelectorAll("[aria-expanded='false']").length > 0) {
+      await expandClassroomSections(doc);
+    }
+    if (isExpectedClassroomUrl(href, mode) && getClassroomDocumentReadiness(doc, mode, href).ok) {
+      if (readyDocument !== doc) {
+        readyDocument = doc;
+        readySince = Date.now();
+      }
+      if (Date.now() - readySince >= CLASSROOM_FRAME_RENDER_WAIT_MS) return doc;
+    } else {
+      readyDocument = null;
+      readySince = 0;
     }
 
     await sleep(CLASSROOM_FRAME_POLL_INTERVAL_MS);
   }
 
-  const doc = getFrameDocument(frame);
-
-  if (doc) {
-    return doc;
-  }
-
-  throw new Error("Classroomページを裏で読み込めませんでした。");
+  throw new Error("Classroomの課題一覧の読み込みが時間内に完了しませんでした。未提出・完了ページを開いて再実行してください。");
 }
 
 async function loadClassroomDocumentInHiddenFrame(mode) {
@@ -1591,7 +1695,7 @@ async function loadClassroomDocumentInHiddenFrame(mode) {
 
     return {
       doc,
-      url,
+      url: frame.contentWindow.location.href,
       cleanup: () => frame.remove()
     };
   } catch (error) {
@@ -1627,10 +1731,10 @@ function mergeClassroomHubResults(items, hubResults) {
     }
   });
 
-  return items.map((item) => {
+  return items.map((item, index) => {
     const url = normalizeUrl(item.pageUrl || item.classroomUrl);
     const idsKey = buildIdsKey(url);
-    const result = resultByUrl.get(url) || resultByIds.get(idsKey);
+    const result = hubResults.find((entry) => entry.recordIndex === index) || resultByUrl.get(url) || resultByIds.get(idsKey);
 
     if (!result) {
       return item;
@@ -1638,7 +1742,7 @@ function mergeClassroomHubResults(items, hubResults) {
 
     return {
       ...item,
-      action: result.created ? "created" : result.matched ? item.action : "unmatched",
+      action: result.failed ? "failed" : result.preview ? "preview" : result.created ? "created" : result.matched ? item.action : "unmatched",
       matched: Boolean(result.matched),
       created: Boolean(result.created),
       row: result.row || "",
@@ -1647,9 +1751,28 @@ function mergeClassroomHubResults(items, hubResults) {
   });
 }
 
+function applyClassroomPostResult(status, response, fallbackError) {
+  const result = response?.result;
+  status.sentCount = Number(result?.sentCount || 0);
+  status.matchedCount = Number(result?.matchedCount || 0);
+  status.createdCount = Number(result?.createdCount || 0);
+  status.unmatchedCount = Number(result?.unmatchedCount || 0);
+  status.failedCount = Number(result?.failedCount || 0);
+  status.previewCount = Number(result?.previewCount || 0);
+  status.previewOnly = Boolean(result?.previewOnly);
+  status.dryRun = Boolean(status.dryRun || result?.dryRun);
+  status.items = mergeClassroomHubResults(status.items, result?.results);
+  if (Array.isArray(result?.errors)) status.errors.push(...result.errors);
+  if (!response?.ok && status.errors.length === 0) {
+    status.error = response?.error || fallbackError;
+    status.errors.push(status.error);
+  }
+  status.ok = Boolean(response?.ok) && status.errors.length === 0;
+}
+
 async function syncInCampusAssignments(options = {}) {
   const force = Boolean(options.force);
-  const dryRun = Boolean(options.dryRun);
+  const dryRun = await isSyncPreviewOnly(options);
   const limit = Object.prototype.hasOwnProperty.call(options, "limit")
     ? normalizeDetailFetchLimit(options.limit)
     : await getStoredSyncLimit();
@@ -1691,6 +1814,7 @@ async function syncInCampusAssignments(options = {}) {
     startedAt: new Date().toISOString(),
     foundCount: 0,
     assignmentCount: 0,
+    announcementCount: 0,
     submissionRecordCount: 0,
     sentCount: 0,
     newCount: 0,
@@ -1728,6 +1852,8 @@ async function syncInCampusAssignments(options = {}) {
 
         if (notification.kind === "submissionRecord") {
           assignment = buildSubmissionRecordAssignment(notification);
+        } else if (notification.kind === "announcement") {
+          assignment = buildInCampusAnnouncement(notification);
         } else {
           const detailHtml = await fetchInCampusHtml(notification.detailUrl);
           assignment = extractAssignmentFromDetailHtml(
@@ -1744,6 +1870,8 @@ async function syncInCampusAssignments(options = {}) {
 
         if (assignment.type === "submissionRecord") {
           status.submissionRecordCount++;
+        } else if (assignment.type === "announcement") {
+          status.announcementCount++;
         } else {
           status.assignmentCount++;
         }
@@ -1765,6 +1893,17 @@ async function syncInCampusAssignments(options = {}) {
 
         if (!result?.ok) {
           status.errors.push(`${assignment.title || assignment.pageUrl}: ${result?.error || "送信失敗"}`);
+          continue;
+        }
+
+        if (result.result?.dryRun) {
+          status.previewOnly = true;
+          status.previewCount++;
+          status.items.push({
+            action: "preview", type: assignment.type || "assignment",
+            title: assignment.title || "", courseName: assignment.courseName || "",
+            pageUrl: assignment.pageUrl || "", assignmentKey: assignment.assignmentKey || ""
+          });
           continue;
         }
 
@@ -1793,7 +1932,7 @@ async function syncInCampusAssignments(options = {}) {
     status.ok = status.errors.length === 0;
     status.finishedAt = new Date().toISOString();
 
-    if (!dryRun) {
+    if (!dryRun && !status.previewOnly && status.ok) {
       await chrome.storage.local.set({
         lastInCampusAutoSyncAt: Date.now()
       });
@@ -1813,7 +1952,7 @@ async function syncInCampusAssignments(options = {}) {
 }
 
 async function syncClassroomCompletionRecords(options = {}) {
-  const dryRun = Boolean(options.dryRun);
+  const dryRun = await isSyncPreviewOnly(options);
   const root = options.root || document;
   const pageUrl = options.pageUrl || location.href;
   const status = {
@@ -1834,10 +1973,8 @@ async function syncClassroomCompletionRecords(options = {}) {
   };
 
   try {
-    status.expandedSectionCount = await expandClassroomSections(root);
-    const extraction = options.root
-      ? extractClassroomCompletionRecordsFromDocument(root, pageUrl)
-      : extractClassroomCompletionRecordsFromPage();
+    const extraction = await collectClassroomRecordsFromDocument("completion", root, pageUrl);
+    status.expandedSectionCount = extraction.expandedSectionCount;
 
     if (!extraction.ok) {
       status.error = extraction.error || "Classroom完了情報の抽出に失敗しました。";
@@ -1878,21 +2015,7 @@ async function syncClassroomCompletionRecords(options = {}) {
     }
 
     const result = await postClassroomCompletionRecords(extraction.records);
-
-    if (!result?.ok) {
-      status.error = result?.error || "Classroom完了情報の送信に失敗しました。";
-      status.errors.push(status.error);
-      status.finishedAt = new Date().toISOString();
-      await saveSyncStatus(status);
-      return status;
-    }
-
-    status.sentCount = extraction.records.length;
-    status.matchedCount = Number(result.result?.matchedCount || 0);
-    status.createdCount = Number(result.result?.createdCount || 0);
-    status.unmatchedCount = Number(result.result?.unmatchedCount || 0);
-    status.items = mergeClassroomHubResults(status.items, result.result?.results);
-    status.ok = status.errors.length === 0;
+    applyClassroomPostResult(status, result, "Classroom完了情報の送信に失敗しました。");
     status.finishedAt = new Date().toISOString();
     await saveSyncStatus(status);
     return status;
@@ -1906,7 +2029,7 @@ async function syncClassroomCompletionRecords(options = {}) {
 }
 
 async function syncClassroomDueTimeRecords(options = {}) {
-  const dryRun = Boolean(options.dryRun);
+  const dryRun = await isSyncPreviewOnly(options);
   const root = options.root || document;
   const pageUrl = options.pageUrl || location.href;
   const status = {
@@ -1928,10 +2051,8 @@ async function syncClassroomDueTimeRecords(options = {}) {
   };
 
   try {
-    status.expandedSectionCount = await expandClassroomSections(root);
-    const extraction = options.root
-      ? extractClassroomDueTimeRecordsFromDocument(root, pageUrl)
-      : extractClassroomDueTimeRecordsFromPage();
+    const extraction = await collectClassroomRecordsFromDocument("dueTime", root, pageUrl);
+    status.expandedSectionCount = extraction.expandedSectionCount;
 
     if (!extraction.ok) {
       status.error = extraction.error || "Classroom期限情報の抽出に失敗しました。";
@@ -1974,21 +2095,7 @@ async function syncClassroomDueTimeRecords(options = {}) {
     }
 
     const result = await postClassroomDueTimeRecords(extraction.records);
-
-    if (!result?.ok) {
-      status.error = result?.error || "Classroom期限情報の送信に失敗しました。";
-      status.errors.push(status.error);
-      status.finishedAt = new Date().toISOString();
-      await saveSyncStatus(status);
-      return status;
-    }
-
-    status.sentCount = extraction.records.length;
-    status.matchedCount = Number(result.result?.matchedCount || 0);
-    status.createdCount = Number(result.result?.createdCount || 0);
-    status.unmatchedCount = Number(result.result?.unmatchedCount || 0);
-    status.items = mergeClassroomHubResults(status.items, result.result?.results);
-    status.ok = status.errors.length === 0;
+    applyClassroomPostResult(status, result, "Classroom期限情報の送信に失敗しました。");
     status.finishedAt = new Date().toISOString();
     await saveSyncStatus(status);
     return status;
@@ -2010,6 +2117,11 @@ function renderAutoSyncResult(result) {
   if (!result?.ok) {
     const errorText = result?.errors?.[0] || result?.error || "同期に失敗しました。";
     showInCampusSyncDebug(errorText, true);
+    return;
+  }
+
+  if (result.dryRun || result.previewOnly) {
+    showInCampusSyncDebug(`プレビュー完了: 確認${result.previewCount || 0}件 / 送信${result.sentCount || 0}件`);
     return;
   }
 
@@ -2035,7 +2147,7 @@ function renderAutoSyncResult(result) {
   }
 
   showInCampusSyncDebug(
-    `自動同期完了: 検出${result.foundCount || 0}件 / 課題${result.assignmentCount || 0}件 / 提出${result.submissionRecordCount || 0}件`
+    `自動同期完了: 検出${result.foundCount || 0}件 / 課題${result.assignmentCount || 0}件 / お知らせ${result.announcementCount || 0}件 / 提出${result.submissionRecordCount || 0}件`
   );
 }
 
@@ -2049,6 +2161,7 @@ function saveFailedAutoSyncStatus(error) {
     finishedAt: new Date().toISOString(),
     foundCount: 0,
     assignmentCount: 0,
+    announcementCount: 0,
     submissionRecordCount: 0,
     sentCount: 0,
     newCount: 0,
@@ -2074,7 +2187,7 @@ async function runClassroomAutoSyncMode(mode, reason, options = {}) {
     showInCampusSyncDebug(root ? "Classroom完了ページを裏で読み込んだため自動同期を開始します。" : "Classroom完了ページを検出したため自動同期を開始します。");
     const result = await syncClassroomCompletionRecords({ reason, root, pageUrl });
 
-    if (result?.ok) {
+    if (result?.ok && !result.dryRun && !result.previewOnly) {
       await markClassroomAutoSyncCompleted(mode);
     }
 
@@ -2085,7 +2198,7 @@ async function runClassroomAutoSyncMode(mode, reason, options = {}) {
     showInCampusSyncDebug(root ? "Classroom未提出ページを裏で読み込んだため期限自動同期を開始します。" : "Classroom未提出ページを検出したため期限自動同期を開始します。");
     const result = await syncClassroomDueTimeRecords({ reason, root, pageUrl });
 
-    if (result?.ok) {
+    if (result?.ok && !result.dryRun && !result.previewOnly) {
       await markClassroomAutoSyncCompleted(mode);
     }
 
@@ -2096,16 +2209,20 @@ async function runClassroomAutoSyncMode(mode, reason, options = {}) {
 }
 
 async function runClassroomAutoSyncModeInHiddenFrame(mode, reason) {
-  const framePage = await loadClassroomDocumentInHiddenFrame(mode);
+  let framePage;
 
   try {
+    framePage = await loadClassroomDocumentInHiddenFrame(mode);
     return await runClassroomAutoSyncMode(mode, reason, {
       force: true,
       root: framePage.doc,
       pageUrl: framePage.url
     });
+  } catch (error) {
+    const message = `${getClassroomAutoSyncModeLabel(mode)}: ${String(error?.message || error)}`;
+    return { ok: false, mode, error: message, errors: [message], items: [] };
   } finally {
-    framePage.cleanup();
+    framePage?.cleanup();
   }
 }
 
@@ -2128,6 +2245,9 @@ function buildClassroomHomeAutoSyncStatus(results, startedAt) {
     unmatchedCount: validResults.reduce((sum, result) => sum + Number(result.unmatchedCount || 0), 0),
     sentCount: validResults.reduce((sum, result) => sum + Number(result.sentCount || 0), 0),
     previewCount: validResults.reduce((sum, result) => sum + Number(result.previewCount || 0), 0),
+    dryRun: validResults.length > 0 && validResults.every((result) => result.dryRun),
+    previewOnly: validResults.some((result) => result.previewOnly || result.dryRun),
+    failedCount: validResults.reduce((sum, result) => sum + Number(result.failedCount || 0), 0),
     items: validResults.flatMap((result) => Array.isArray(result.items) ? result.items : []),
     errors
   };
@@ -2165,7 +2285,9 @@ async function startClassroomHomeAutoSyncSequence(reason) {
   const status = buildClassroomHomeAutoSyncStatus(results, startedAt);
 
   await saveSyncStatus(status);
-  await markClassroomAutoSyncCompleted("home");
+  if (status.ok && !status.dryRun && !status.previewOnly) {
+    await markClassroomAutoSyncCompleted("home");
+  }
 
   return status;
 }
