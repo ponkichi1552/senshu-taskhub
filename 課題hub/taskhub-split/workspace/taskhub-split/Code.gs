@@ -128,7 +128,126 @@ function isWithinLookback_(date, days) {
 }
 
 function saveClassroomMailsToSheet() {
-  return runWithUserLock_('メール保存処理', saveClassroomMailsToSheetLocked_);
+  // Legacy maintenance flows may already hold the lock and rely on an
+  // atomic clear-and-rebuild. Normal syncs collect Gmail data without holding
+  // the sheet lock, then re-check message IDs before committing.
+  if (userStorageLockDepth_ > 0) {
+    return saveClassroomMailsToSheetLocked_();
+  }
+
+  const scanContext = runWithUserLock_('メール取込準備処理', () => {
+    const ss = getOrCreateSpreadsheetLocked_();
+    const sheetsBySource = ensureNotificationStorageLocked_(ss);
+    const savedMessageIdsBySource = {};
+
+    NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+      savedMessageIdsBySource[storageConfig.source] = Array.from(
+        getSavedMessageIds_(sheetsBySource[storageConfig.source])
+      );
+    });
+
+    return {
+      spreadsheetId: ss.getId(),
+      retentionCutoff: getNotificationRetentionCutoff_(new Date()),
+      savedMessageIdsBySource
+    };
+  });
+
+  const newRowsBySource = {};
+  NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+    newRowsBySource[storageConfig.source] = collectNewNotificationRows_(
+      storageConfig,
+      new Set(scanContext.savedMessageIdsBySource[storageConfig.source] || []),
+      scanContext.retentionCutoff
+    );
+  });
+
+  return runWithUserLock_('メール保存処理', () => {
+    const ss = SpreadsheetApp.openById(scanContext.spreadsheetId);
+    const sheetsBySource = ensureNotificationStorageLocked_(ss);
+    const savedCountsBySource = {};
+    let savedCount = 0;
+
+    NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+      const sheet = sheetsBySource[storageConfig.source];
+      const savedMessageIds = getSavedMessageIds_(sheet);
+      const newRows = (newRowsBySource[storageConfig.source] || []).filter(row => {
+        const messageId = String(row[1] || '').trim();
+        if (!messageId || savedMessageIds.has(messageId)) return false;
+        savedMessageIds.add(messageId);
+        return true;
+      });
+
+      appendNotificationRows_(sheet, newRows);
+      normalizeNotificationSheet_(sheet, storageConfig);
+      savedCountsBySource[storageConfig.source] = newRows.length;
+      savedCount += newRows.length;
+    });
+
+    const autoCompletedCount = applySavedInCampusSubmissionRecordsLocked_(sheetsBySource.inCampus);
+    Logger.log('保存件数: ' + savedCount);
+    Logger.log('inCampus提出記録による自動完了件数: ' + autoCompletedCount);
+    Logger.log('スプレッドシートURL: ' + ss.getUrl());
+
+    return {
+      savedCount,
+      classroomSavedCount: savedCountsBySource['Google Classroom'] || 0,
+      inCampusSavedCount: savedCountsBySource.inCampus || 0,
+      autoCompletedCount,
+      spreadsheetId: ss.getId(),
+      spreadsheetUrl: ss.getUrl()
+    };
+  });
+}
+
+function collectNewNotificationRows_(storageConfig, savedMessageIds, retentionCutoff) {
+  const newRows = [];
+
+  for (let offset = 0; ; offset += storageConfig.batchSize) {
+    const threads = GmailApp.search(storageConfig.query, offset, storageConfig.batchSize);
+    threads.forEach(thread => {
+      const messages = thread.getMessages();
+      if (!messages || messages.length === 0) return;
+
+      const gmailLink = thread.getPermalink();
+      messages.forEach(message => {
+        const messageId = String(message.getId() || '');
+        if (!messageId || savedMessageIds.has(messageId)) return;
+
+        const from = message.getFrom();
+        const source = detectSource_(from);
+        if (source !== storageConfig.source) return;
+
+        const receivedDate = message.getDate();
+        if (!receivedDate || receivedDate.getTime() <= retentionCutoff.getTime()) return;
+
+        const subject = message.getSubject();
+        const body = message.getPlainBody() || '';
+        const extracted = extractNotificationInfo_(source, subject, body, receivedDate);
+        newRows.push(toSafeSpreadsheetRow_([
+          new Date(),
+          messageId,
+          source,
+          extracted.courseName,
+          extracted.title,
+          extracted.dueDate,
+          extracted.dueStatus,
+          subject,
+          from,
+          receivedDate,
+          gmailLink,
+          body.slice(0, CONFIG.BODY_LIMIT),
+          '未確認',
+          ''
+        ]));
+        savedMessageIds.add(messageId);
+      });
+    });
+
+    if (threads.length < storageConfig.batchSize) break;
+  }
+
+  return newRows;
 }
 
 // Globals are isolated per Apps Script execution. Nested operations share its lock.
@@ -457,6 +576,19 @@ function normalizeNotificationSheet_(sheet, storageConfig) {
     ? sheet.getRange(2, 1, sheet.getLastRow() - 1, HEADER_ROW.length).getValues()
     : [];
   const normalizedRows = normalizeNotificationRowsForStorage_(currentRows, storageConfig);
+  const rowsChanged = currentRows.length !== normalizedRows.length || normalizedRows.some((row, rowIndex) => {
+    const originalRow = currentRows[rowIndex] || [];
+    return row.some((value, columnIndex) => {
+      const original = originalRow[columnIndex];
+      if (value instanceof Date && original instanceof Date) {
+        return value.getTime() !== original.getTime();
+      }
+      return value !== original;
+    });
+  });
+
+  // A routine sync with no new mail should not rewrite every retained row.
+  if (!rowsChanged) return;
 
   // Write retained rows first, then remove the obsolete tail below them.
   // The header stays in row 1 and the newest received message is in row 2.
@@ -2033,10 +2165,9 @@ function normalizeTimeText_(timeText) {
 }
 
 function refreshAndGetNotificationsForWeb() {
-  return runWithUserLock_('保存データ処理', () => refreshAndGetNotificationsForWebLocked_());
-}
-
-function refreshAndGetNotificationsForWebLocked_() {
+  // Gmail scanning can take much longer than a sheet read. The ingestion
+  // function now locks only its setup/commit phases, so this request must not
+  // wrap the full scan in another user lock.
   saveClassroomMailsToSheet();
   return getNotificationsForWeb();
 }
