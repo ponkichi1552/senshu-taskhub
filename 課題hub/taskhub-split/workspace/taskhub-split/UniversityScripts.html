@@ -1,24 +1,29 @@
 <script>
-const universityState = {items: [], selected: null, filter: 'all', loading: false};
+const universityState = {items: [], selected: null, filter: 'all', loading: false, requestId: 0};
 function showUniversityNotices() {
  currentScreen = 'university'; closeCourseFilterPanel(); setAppView('university'); updateBottomNavState();
  loadUniversityNotices();
 }
-function loadUniversityNotices() {
+function loadUniversityNotices(onSuccess, onFailure) {
  if (universityState.loading) return;
+ const requestId = ++universityState.requestId;
  universityState.loading = true;
  document.getElementById('un-refresh').disabled = true;
  document.getElementById('un-status').textContent = 'お知らせを読み込み中…';
  google.script.run.withSuccessHandler(items => {
+  if (requestId !== universityState.requestId) return;
   universityState.loading = false; document.getElementById('un-refresh').disabled = false;
   universityState.items = Array.isArray(items) ? items : [];
   universityState.selected = null;
   document.getElementById('un-shell').classList.remove('is-reading');
   document.getElementById('un-status').textContent = '未読・保存状態はアカウントごとに保存されます。';
   renderUniversityNotices(); renderUniversityDetail();
+  if (typeof onSuccess === 'function') onSuccess(universityState.items);
  }).withFailureHandler(() => {
+  if (requestId !== universityState.requestId) return;
   universityState.loading = false; document.getElementById('un-refresh').disabled = false;
   document.getElementById('un-status').textContent = '読み込めませんでした。「更新」で再試行してください。';
+  if (typeof onFailure === 'function') onFailure(new Error('大学のお知らせを読み込めませんでした。'));
  }).getUniversityNoticesForWeb();
 }
 function unElement(tag, cls, text) {const el=document.createElement(tag);el.className=cls;if(text!==undefined)el.textContent=text;return el;}

@@ -14,9 +14,10 @@
       <header>
         <span>課題通知Hub</span>
         <div class="header-actions">
+          <button id="header-test-clock-button" class="refresh-button test-clock-header-button" type="button" onclick="openTestClockModal()" hidden>テスト日時</button>
           <button class="refresh-button" onclick="requestBrowserNotificationPermission()">通知許可</button>
           <button class="refresh-button help-button" onclick="openHelpModal()" aria-label="使い方を開く">？</button>
-          <button class="refresh-button" onclick="manualRefreshNotifications()">更新</button>
+          <button id="manual-refresh-button" class="refresh-button" onclick="manualRefreshNotifications()">更新</button>
         </div>
       </header>
 
@@ -52,6 +53,10 @@
       <button class="undo-toast-button" onclick="undoLastDone()">取消</button>
     </div>
 
+    <div id="sync-toast" class="sync-toast" role="status" aria-live="polite">
+      <span id="sync-toast-message" class="sync-toast-message"></span>
+    </div>
+
     <div id="help-modal-backdrop" class="help-modal-backdrop" onclick="closeHelpModal()">
       <section class="help-modal" aria-label="課題通知Hubの使い方" onclick="event.stopPropagation()">
         <div class="help-modal-header">
@@ -74,30 +79,87 @@
     </div>
 
     <div id="security-modal-backdrop" class="security-modal-backdrop" onclick="closeSecurityModal()">
-      <section class="security-modal" aria-label="セキュリティ設定" onclick="event.stopPropagation()">
+      <section class="security-modal" aria-label="設定" onclick="event.stopPropagation()">
         <div class="security-modal-header">
-          <span>セキュリティ設定</span>
+          <span>設定</span>
           <button class="security-modal-close" onclick="closeSecurityModal()">閉じる</button>
         </div>
         <div class="security-modal-body">
-          <div class="security-status-row">
-            <span>外部POST保護</span>
-            <strong id="security-auth-status">確認中</strong>
-          </div>
+          <section class="settings-section" aria-labelledby="security-section-title">
+            <h2 id="security-section-title">セキュリティ設定</h2>
+            <div class="security-status-row">
+              <span>外部POST保護</span>
+              <strong id="security-auth-status">確認中</strong>
+            </div>
 
-          <label class="security-label" for="security-api-token">APIトークン</label>
-          <div class="security-token-row">
-            <input id="security-api-token" class="security-token-input" type="password" readonly value="読み込み中...">
-            <button id="security-token-toggle" class="security-secondary-button" onclick="toggleSecurityTokenVisibility()" disabled>表示</button>
-            <button id="security-token-copy" class="security-secondary-button" onclick="copySecurityToken()" disabled>コピー</button>
-          </div>
+            <label class="security-label" for="security-api-token">APIトークン</label>
+            <div class="security-token-row">
+              <input id="security-api-token" class="security-token-input" type="password" readonly value="読み込み中...">
+              <button id="security-token-toggle" class="security-secondary-button" onclick="toggleSecurityTokenVisibility()" disabled>表示</button>
+              <button id="security-token-copy" class="security-secondary-button" onclick="copySecurityToken()" disabled>コピー</button>
+            </div>
 
-          <div class="security-hint">
-            トークン本体は再発行直後だけ表示できます。拡張機能へ設定する場合は、その場でコピーしてください。
-          </div>
+            <div class="security-hint">
+              トークン本体は再発行直後だけ表示できます。拡張機能へ設定する場合は、その場でコピーしてください。
+            </div>
 
-          <button class="security-danger-button" onclick="rotateSecurityToken()">トークンを再発行</button>
+            <button class="security-danger-button" onclick="rotateSecurityToken()">トークンを再発行</button>
+          </section>
+
+          <section class="settings-section" aria-labelledby="test-mode-section-title">
+            <h2 id="test-mode-section-title">テストケース適用</h2>
+            <div class="test-mode-row">
+              <div>
+                <strong id="test-mode-status">確認中</strong>
+                <div id="test-mode-hint" class="security-hint">テストケース用スプレッドシートを確認しています。</div>
+              </div>
+              <label class="test-mode-switch" aria-label="テストケース適用 ON/OFF">
+                <input id="test-mode-toggle" type="checkbox" onchange="toggleTestCaseMode(this.checked)" disabled>
+                <span class="test-mode-slider" aria-hidden="true"></span>
+              </label>
+            </div>
+          </section>
+          <section class="settings-section" aria-labelledby="test-clock-settings-title">
+            <h2 id="test-clock-settings-title">テスト判定日時</h2>
+            <label class="security-label" for="settings-test-clock-preset">日時を選択</label>
+            <select id="settings-test-clock-preset" class="test-clock-select" onchange="syncTestClockCustomInput('settings')">
+              <option value="current">実際の現在日時を使う</option>
+            </select>
+            <label class="security-label test-clock-custom-label" for="settings-test-clock-custom">または任意の日本時間を指定</label>
+            <input id="settings-test-clock-custom" class="test-clock-input" type="datetime-local" step="60" oninput="selectCustomTestClock('settings')">
+            <div class="test-clock-actions">
+              <button class="security-secondary-button" type="button" onclick="applyTestClockSelection('settings')">日時を適用</button>
+              <button class="security-secondary-button" type="button" onclick="applyCurrentTestClock('settings')">実時間に戻す</button>
+            </div>
+            <div id="settings-test-clock-current" class="security-hint" aria-live="polite">設定中の日時を確認しています。</div>
+            <div id="settings-test-clock-message" class="test-clock-message" role="status" aria-live="polite"></div>
+            <div class="security-hint">選んだ日時はテストケースON時の期限分類に使います。受信日時の記録や本番メール同期時刻は変更しません。</div>
+          </section>
           <div id="security-message" class="security-message" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+    </div>
+
+    <div id="test-clock-modal-backdrop" class="test-clock-modal-backdrop" onclick="closeTestClockModal()">
+      <section class="test-clock-modal" role="dialog" aria-modal="true" aria-labelledby="test-clock-modal-title" onclick="event.stopPropagation()">
+        <div class="test-clock-modal-header">
+          <span id="test-clock-modal-title">テスト判定日時</span>
+          <button class="security-modal-close" type="button" onclick="closeTestClockModal()">閉じる</button>
+        </div>
+        <div class="test-clock-modal-body">
+          <label class="security-label" for="header-test-clock-preset">日時を選択</label>
+          <select id="header-test-clock-preset" class="test-clock-select" onchange="syncTestClockCustomInput('header')">
+            <option value="current">実際の現在日時を使う</option>
+          </select>
+          <label class="security-label test-clock-custom-label" for="header-test-clock-custom">または任意の日本時間を指定</label>
+          <input id="header-test-clock-custom" class="test-clock-input" type="datetime-local" step="60" oninput="selectCustomTestClock('header')">
+          <div class="test-clock-actions">
+            <button class="security-secondary-button" type="button" onclick="applyTestClockSelection('header')">日時を適用</button>
+            <button class="security-secondary-button" type="button" onclick="applyCurrentTestClock('header')">実時間に戻す</button>
+          </div>
+          <div id="header-test-clock-current" class="security-hint" aria-live="polite">設定中の日時を確認しています。</div>
+          <div id="header-test-clock-message" class="test-clock-message" role="status" aria-live="polite"></div>
+          <div class="security-hint">日時を変えるとテスト用の課題を再読込します。メールの同期は行いません。</div>
         </div>
       </section>
     </div>

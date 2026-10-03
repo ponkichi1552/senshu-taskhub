@@ -1,0 +1,14 @@
+{
+  "name": "taskhub-apps-script",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "test": "./local-dev/test.sh",
+    "gas:status": "clasp show-file-status",
+    "gas:push": "clasp push",
+    "gas:deploy:new": "clasp create-deployment"
+  },
+  "devDependencies": {
+    "@google/clasp": "3.4.1"
+  }
+}

@@ -111,3 +111,17 @@ Classroomの読み込み途中やタイムアウトを「0件の同期成功」�
 5. 各自のGoogleアカウントとClassroom・inCampusへログインし、必要な権限を承認して使用します。
 
 詳しい導入手順と対応範囲は[拡張機能README](./課題hub/taskhub-extension-v2.5/README.md)を参照してください。
+
+## ローカル回帰テスト
+
+Apps Scriptの実コードとブラウザー拡張機能の回帰テストは、`課題hub/` で次のコマンドを実行します。
+
+```sh
+cd 課題hub
+pnpm install --frozen-lockfile
+pnpm test
+```
+
+テストは期限区分、土日・週境界、月末・年末、閏日、日付なしや0:00の締切、複数課題を含むメール、重複・誤照合、完了状態、設定切替、非同期更新を確認します。`課題hub/test-fixtures/TaskHub-test-cases.xlsx` とテストメールの値はすべて架空で、リンクには予約済みの `.invalid` ドメインを使います。個人の保存データ、Gmail、Google Drive、本番シートには接続しません。
+
+`pnpm test` はApps Script本体、拡張機能、画面のオフライン回帰テストを実行します。Excelを実際に読み込む追加スモークテストには `@oai/artifact-tool` が必要です。利用できない環境ではExcelスモークのみスキップされます。ブラウザーでローカル画面を試す手順は[ローカル起動ガイド](./課題hub/local-dev/README.md)にあります。

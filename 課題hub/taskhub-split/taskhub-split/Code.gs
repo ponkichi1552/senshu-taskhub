@@ -12,17 +12,23 @@ const NOTIFICATION_STORAGE_CONFIGS = [
     sheetName: CONFIG.CLASSROOM_SHEET_NAME,
     // Search slightly beyond two calendar months; filter each message precisely.
     query: 'from:classroom.google.com newer_than:63d',
+    initialQuery: 'from:classroom.google.com newer_than:20d',
     batchSize: 100
   },
   {
     source: 'inCampus',
     sheetName: CONFIG.INCAMPUS_NOTIFICATION_SHEET_NAME,
     query: 'from:no-reply-incampus@isc.senshu-u.ac.jp newer_than:63d',
+    initialQuery: 'from:no-reply-incampus@isc.senshu-u.ac.jp newer_than:20d',
     batchSize: 100
   }
 ];
 
 const AUTO_FETCH_HANDLER = 'saveClassroomMailsToSheet';
+const AUTO_FETCH_TRIGGER_REVISION = 'short-lock-2026-10-03';
+const AUTO_FETCH_TRIGGER_REVISION_PROPERTY = 'TASKHUB_AUTO_FETCH_TRIGGER_REVISION';
+const NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY = 'TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING';
+const NOTIFICATION_LAST_SUCCESSFUL_SYNC_PROPERTY = 'TASKHUB_NOTIFICATION_LAST_SUCCESSFUL_SYNC_AT';
 
 const HEADER_ROW = [
   '保存日時',
@@ -104,6 +110,9 @@ function ensureUserStorageForWebLocked_() {
 function detectSource_(from) {
   const text = String(from || '').toLowerCase();
 
+  if (text.includes('taskhub-test-classroom@example.invalid')) return 'Google Classroom';
+  if (text.includes('taskhub-test-incampus@example.invalid')) return 'inCampus';
+
   if (text.includes('classroom.google.com')) {
     return 'Google Classroom';
   }
@@ -128,42 +137,101 @@ function isWithinLookback_(date, days) {
 }
 
 function saveClassroomMailsToSheet() {
-  // Legacy maintenance flows may already hold the lock and rely on an
-  // atomic clear-and-rebuild. Normal syncs collect Gmail data without holding
-  // the sheet lock, then re-check message IDs before committing.
+  // Collect Gmail data outside the shared sheet lock, then re-check message
+  // IDs before committing. A long Gmail scan must never hold the user lock.
   if (userStorageLockDepth_ > 0) {
-    return saveClassroomMailsToSheetLocked_();
+    throw new Error('Gmail同期中に保存ロックを保持できません。');
   }
 
+  const scanStartedAt = new Date();
   const scanContext = runWithUserLock_('メール取込準備処理', () => {
     const ss = getOrCreateSpreadsheetLocked_();
     const sheetsBySource = ensureNotificationStorageLocked_(ss);
+    const userProperties = PropertiesService.getUserProperties();
+    const initialBackfillPending = userProperties.getProperty(NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY) === 'true';
     const savedMessageIdsBySource = {};
+    const latestReceivedAtBySource = {};
+    let latestWorkbookReceivedAt = null;
 
     NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
-      savedMessageIdsBySource[storageConfig.source] = Array.from(
-        getSavedMessageIds_(sheetsBySource[storageConfig.source])
-      );
+      const savedState = getSavedNotificationState_(sheetsBySource[storageConfig.source]);
+      savedMessageIdsBySource[storageConfig.source] = Array.from(savedState.messageIds);
+      latestReceivedAtBySource[storageConfig.source] = savedState.latestReceivedAt;
+      if (savedState.latestReceivedAt && (!latestWorkbookReceivedAt || savedState.latestReceivedAt > latestWorkbookReceivedAt)) {
+        latestWorkbookReceivedAt = savedState.latestReceivedAt;
+      }
     });
+
+    const lastSuccessfulSyncAt = parseNotificationReceivedDate_(
+      userProperties.getProperty(NOTIFICATION_LAST_SUCCESSFUL_SYNC_PROPERTY)
+    );
+    const fallbackWatermark = [latestWorkbookReceivedAt, lastSuccessfulSyncAt]
+      .filter(value => value instanceof Date)
+      .reduce((latest, value) => !latest || value > latest ? value : latest, null);
+    if (!initialBackfillPending && !fallbackWatermark) {
+      return {
+        spreadsheetId: ss.getId(),
+        skipped: true,
+        reason: '保存Excelに有効な受信日時がないため、広範囲検索を避けて同期をスキップしました。'
+      };
+    }
 
     return {
       spreadsheetId: ss.getId(),
       retentionCutoff: getNotificationRetentionCutoff_(new Date()),
-      savedMessageIdsBySource
+      savedMessageIdsBySource,
+      latestReceivedAtBySource: Object.fromEntries(NOTIFICATION_STORAGE_CONFIGS.map(storageConfig => [
+        storageConfig.source,
+        [latestReceivedAtBySource[storageConfig.source], fallbackWatermark]
+          .filter(value => value instanceof Date)
+          .reduce((latest, value) => !latest || value > latest ? value : latest, null)
+      ])),
+      initialBackfillPending,
+      scanStartedAt: scanStartedAt.toISOString()
     };
   });
 
+  if (scanContext.skipped) {
+    return {
+      skipped: true,
+      reason: scanContext.reason,
+      savedCount: 0,
+      classroomSavedCount: 0,
+      inCampusSavedCount: 0,
+      autoCompletedCount: 0,
+      spreadsheetId: scanContext.spreadsheetId
+    };
+  }
+
   const newRowsBySource = {};
   NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
+    const searchQuery = getNotificationSearchQuery_(
+      storageConfig,
+      scanContext.latestReceivedAtBySource[storageConfig.source],
+      scanContext.initialBackfillPending
+    );
     newRowsBySource[storageConfig.source] = collectNewNotificationRows_(
       storageConfig,
       new Set(scanContext.savedMessageIdsBySource[storageConfig.source] || []),
-      scanContext.retentionCutoff
+      scanContext.retentionCutoff,
+      searchQuery,
+      scanContext.initialBackfillPending ? null : scanContext.latestReceivedAtBySource[storageConfig.source]
     );
   });
 
   return runWithUserLock_('メール保存処理', () => {
-    const ss = SpreadsheetApp.openById(scanContext.spreadsheetId);
+    const ss = getOrCreateSpreadsheetLocked_();
+    if (ss.getId() !== scanContext.spreadsheetId) {
+      Logger.log('保存先の設定が取込中に切り替わったため、通知の保存を中止しました。');
+      return {
+        skipped: true,
+        reason: '保存先の設定が取込中に切り替わったため、通知の保存を中止しました。',
+        savedCount: 0,
+        classroomSavedCount: 0,
+        inCampusSavedCount: 0,
+        autoCompletedCount: 0
+      };
+    }
     const sheetsBySource = ensureNotificationStorageLocked_(ss);
     const savedCountsBySource = {};
     let savedCount = 0;
@@ -185,6 +253,12 @@ function saveClassroomMailsToSheet() {
     });
 
     const autoCompletedCount = applySavedInCampusSubmissionRecordsLocked_(sheetsBySource.inCampus);
+    SpreadsheetApp.flush();
+    const userProperties = PropertiesService.getUserProperties();
+    userProperties.deleteProperty(NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY);
+    // Use the start time as the next lower bound so mail arriving during this
+    // scan remains eligible on the next run.
+    userProperties.setProperty(NOTIFICATION_LAST_SUCCESSFUL_SYNC_PROPERTY, scanContext.scanStartedAt);
     Logger.log('保存件数: ' + savedCount);
     Logger.log('inCampus提出記録による自動完了件数: ' + autoCompletedCount);
     Logger.log('スプレッドシートURL: ' + ss.getUrl());
@@ -200,11 +274,23 @@ function saveClassroomMailsToSheet() {
   });
 }
 
-function collectNewNotificationRows_(storageConfig, savedMessageIds, retentionCutoff) {
+function getNotificationSearchQuery_(storageConfig, latestReceivedAt, initialBackfillPending) {
+  if (initialBackfillPending) return storageConfig.initialQuery || storageConfig.query;
+  if (!latestReceivedAt) return '';
+
+  // Gmail's after: operator accepts dates rather than timestamps. Include the
+  // latest saved day, then filter exact received times and deduplicate IDs.
+  const afterDate = Utilities.formatDate(latestReceivedAt, Session.getScriptTimeZone(), 'yyyy/MM/dd');
+  return storageConfig.query + ' after:' + afterDate;
+}
+
+function collectNewNotificationRows_(storageConfig, savedMessageIds, retentionCutoff, searchQuery, latestReceivedAt) {
   const newRows = [];
+  const query = searchQuery || storageConfig.query;
+  if (!query) return newRows;
 
   for (let offset = 0; ; offset += storageConfig.batchSize) {
-    const threads = GmailApp.search(storageConfig.query, offset, storageConfig.batchSize);
+    const threads = GmailApp.search(query, offset, storageConfig.batchSize);
     threads.forEach(thread => {
       const messages = thread.getMessages();
       if (!messages || messages.length === 0) return;
@@ -220,6 +306,7 @@ function collectNewNotificationRows_(storageConfig, savedMessageIds, retentionCu
 
         const receivedDate = message.getDate();
         if (!receivedDate || receivedDate.getTime() <= retentionCutoff.getTime()) return;
+        if (latestReceivedAt && receivedDate.getTime() < latestReceivedAt.getTime()) return;
 
         const subject = message.getSubject();
         const body = message.getPlainBody() || '';
@@ -272,97 +359,7 @@ function runWithUserLock_(label, callback) {
 }
 
 function saveClassroomMailsToSheetLocked_() {
-  const ss = getOrCreateSpreadsheet_();
-  const sheetsBySource = ensureNotificationStorage_(ss);
-  const retentionCutoff = getNotificationRetentionCutoff_(new Date());
-  let savedCount = 0;
-  const savedCountsBySource = {};
-
-  NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
-    const sheet = sheetsBySource[storageConfig.source];
-    const savedMessageIds = getSavedMessageIds_(sheet);
-    const newRows = [];
-
-    for (let offset = 0; ; offset += storageConfig.batchSize) {
-      const threads = GmailApp.search(storageConfig.query, offset, storageConfig.batchSize);
-      threads.forEach(thread => {
-        const messages = thread.getMessages();
-
-        if (!messages || messages.length === 0) {
-          return;
-        }
-
-        const gmailLink = thread.getPermalink();
-
-        messages.forEach(message => {
-          const messageId = String(message.getId() || '');
-
-          if (!messageId || savedMessageIds.has(messageId)) {
-            return;
-          }
-
-          const from = message.getFrom();
-          const source = detectSource_(from);
-
-          if (source !== storageConfig.source) {
-            return;
-          }
-
-          const receivedDate = message.getDate();
-
-          if (!receivedDate || receivedDate.getTime() <= retentionCutoff.getTime()) {
-            return;
-          }
-
-          const subject = message.getSubject();
-          const body = message.getPlainBody() || '';
-          const extracted = extractNotificationInfo_(source, subject, body, receivedDate);
-
-          newRows.push(toSafeSpreadsheetRow_([
-            new Date(),
-            messageId,
-            source,
-            extracted.courseName,
-            extracted.title,
-            extracted.dueDate,
-            extracted.dueStatus,
-            subject,
-            from,
-            receivedDate,
-            gmailLink,
-            body.slice(0, CONFIG.BODY_LIMIT),
-            '未確認',
-            ''
-          ]));
-
-          savedMessageIds.add(messageId);
-        });
-      });
-
-      if (threads.length < storageConfig.batchSize) break;
-    }
-
-    appendNotificationRows_(sheet, newRows);
-    normalizeNotificationSheet_(sheet, storageConfig);
-    savedCountsBySource[storageConfig.source] = newRows.length;
-    savedCount += newRows.length;
-  });
-
-  const inCampusSheet = sheetsBySource.inCampus;
-  const autoCompletedCount = applySavedInCampusSubmissionRecords_(inCampusSheet);
-
-  Logger.log('保存件数: ' + savedCount);
-  Logger.log('inCampus提出記録による自動完了件数: ' + autoCompletedCount);
-  Logger.log('スプレッドシートURL: ' + ss.getUrl());
-
-  return {
-    savedCount,
-    classroomSavedCount: savedCountsBySource['Google Classroom'] || 0,
-    inCampusSavedCount: savedCountsBySource.inCampus || 0,
-    autoCompletedCount,
-    spreadsheetId: ss.getId(),
-    spreadsheetUrl: ss.getUrl()
-  };
+  throw new Error('Gmail同期は共有ロックの外側から実行してください。');
 }
 
 function getOrCreateSpreadsheet_() {
@@ -395,8 +392,102 @@ function getOrCreateSpreadsheetLocked_() {
 
   const ss = SpreadsheetApp.create('課題通知Hub_保存データ');
   props.setProperty(USER_SPREADSHEET_ID_PROPERTY, ss.getId());
+  props.setProperty(NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY, 'true');
 
   return ss;
+}
+
+function isTestCaseModeEnabled_() {
+  return PropertiesService.getUserProperties().getProperty(TEST_CASE_MODE_PROPERTY) === 'true';
+}
+
+function openTestCaseSpreadsheet_() {
+  const id = getConfiguredTestSpreadsheetId_();
+  if (!id) throw new Error('テストケース用スプレッドシートが未設定です。管理者に設定を依頼してください。');
+
+  let ss;
+  try {
+    ss = SpreadsheetApp.openById(id);
+  } catch (error) {
+    throw new Error('テストケース用スプレッドシートを開けません。共有設定とIDを確認してください。');
+  }
+
+  const requiredSheets = [
+    {name: 'テストClassroom', headers: TEST_CASE_NOTIFICATION_HEADERS},
+    {name: 'テストinCampus', headers: TEST_CASE_NOTIFICATION_HEADERS},
+    {name: 'テスト抽出', headers: TEST_CASE_EXTRACT_HEADERS}
+  ];
+  requiredSheets.forEach(spec => {
+    const sheet = ss.getSheetByName(spec.name);
+    if (!sheet) throw new Error('テストケース用スプレッドシートの構成が不正です。必要なシート: ' + spec.name);
+    const actual = sheet.getRange(1, 1, 1, spec.headers.length).getValues()[0].map(value => String(value || '').trim());
+    if (actual.join('\u001f') !== spec.headers.join('\u001f')) {
+      throw new Error('テストケース用スプレッドシートの見出しが一致しません: ' + spec.name);
+    }
+  });
+  return ss;
+}
+
+function getConfiguredTestSpreadsheetId_() {
+  const configuredId = PropertiesService.getScriptProperties().getProperty(TEST_SPREADSHEET_ID_PROPERTY);
+  return String(configuredId || DEFAULT_TEST_SPREADSHEET_ID || '').trim();
+}
+
+function getNotificationReadSheets_(testSpreadsheet) {
+  if (isTestCaseModeEnabled_()) {
+    const ss = testSpreadsheet || openTestCaseSpreadsheet_();
+    return {
+      'Google Classroom': ss.getSheetByName('テストClassroom'),
+      inCampus: ss.getSheetByName('テストinCampus')
+    };
+  }
+  return ensureNotificationStorage_(getOrCreateSpreadsheet_());
+}
+
+function getInCampusReadSheet_(testSpreadsheet) {
+  if (isTestCaseModeEnabled_()) return (testSpreadsheet || openTestCaseSpreadsheet_()).getSheetByName('テスト抽出');
+  return getOrCreateInCampusSheet_();
+}
+
+function mapTestCaseNotificationRowForRead_(row, referenceDate) {
+  const mapped = normalizeNotificationRowWidth_(row);
+  if (isPresentValue_(row[16])) mapped[0] = row[16]; // テスト保存日時
+  if (isPresentValue_(row[17])) mapped[9] = row[17]; // テスト受信日時
+  if (isPresentValue_(row[19])) {
+    const testReferenceDate = referenceDate instanceof Date
+      ? referenceDate
+      : isTestCaseModeEnabled_() ? getTestCaseReferenceNow_() : null;
+    mapped[5] = rebaseTestCaseDeadline_(row[19], row[17], testReferenceDate);
+  }
+  return mapped;
+}
+
+function mapTestCaseExtractRowForRead_(row, referenceDate) {
+  const mapped = row.slice();
+  if (isPresentValue_(row[17])) mapped[12] = row[17]; // テスト受信日時
+  if (isPresentValue_(row[19])) {
+    const testReferenceDate = referenceDate instanceof Date
+      ? referenceDate
+      : isTestCaseModeEnabled_() ? getTestCaseReferenceNow_() : null;
+    mapped[5] = rebaseTestCaseDeadline_(row[19], row[17], testReferenceDate);
+  }
+  return mapped;
+}
+
+function rebaseTestCaseDeadline_(deadlineValue, receivedAtValue, referenceDate) {
+  if (!(referenceDate instanceof Date)) return deadlineValue;
+
+  const deadline = deadlineValue instanceof Date ? new Date(deadlineValue) : new Date(deadlineValue);
+  const receivedAt = receivedAtValue instanceof Date ? new Date(receivedAtValue) : new Date(receivedAtValue);
+  if (Number.isNaN(deadline.getTime()) || Number.isNaN(receivedAt.getTime())) return deadlineValue;
+
+  const deadlineDay = Date.UTC(deadline.getFullYear(), deadline.getMonth(), deadline.getDate());
+  const receivedDay = Date.UTC(receivedAt.getFullYear(), receivedAt.getMonth(), receivedAt.getDate());
+  const dayOffset = Math.round((deadlineDay - receivedDay) / (24 * 60 * 60 * 1000));
+  const shifted = new Date(referenceDate);
+  shifted.setDate(shifted.getDate() + dayOffset);
+  shifted.setHours(deadline.getHours(), deadline.getMinutes(), deadline.getSeconds(), deadline.getMilliseconds());
+  return shifted;
 }
 
 function getConfiguredSpreadsheetId_() {
@@ -631,6 +722,26 @@ function getSavedMessageIds_(sheet) {
     .filter(id => id !== '');
 
   return new Set(ids);
+}
+
+function getSavedNotificationState_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return {messageIds: new Set(), latestReceivedAt: null};
+
+  // B:J contains both message IDs and the received timestamp (column J),
+  // avoiding a second sheet read during sync preparation.
+  const values = sheet.getRange(2, 2, lastRow - 1, 9).getValues();
+  const messageIds = new Set();
+  let latestReceivedAt = null;
+  values.forEach(row => {
+    const messageId = String(row[0] || '').trim();
+    if (messageId) messageIds.add(messageId);
+    const receivedAt = parseNotificationReceivedDate_(row[8]);
+    if (receivedAt && (!latestReceivedAt || receivedAt.getTime() > latestReceivedAt.getTime())) {
+      latestReceivedAt = receivedAt;
+    }
+  });
+  return {messageIds, latestReceivedAt};
 }
 
 function extractNotificationInfo_(source, subject, body, receivedDate) {
@@ -1377,7 +1488,11 @@ function isNoiseLine_(line) {
 }
 
 function extractDueDate_(text, receivedDate) {
-  const sourceText = String(text || '');
+  const sourceText = String(text || '')
+    .split(/\r?\n/)
+    .filter(line => !/^\s*(?:投稿日|投稿日時|送信日時|メール受信日時|通知日時)\s*[:：]/.test(line))
+    .join('\n')
+    .replace(/https?:\/\/[^\s<>]+/g, ' ');
   const monthDayYearResolver = createMonthDayYearResolver_(receivedDate);
 
   if (
@@ -1640,25 +1755,32 @@ function getNotificationsForWeb() {
 }
 
 function getNotificationsForWebLocked_() {
+  const testMode = isTestCaseModeEnabled_();
+  const deadlineReferenceNow = testMode ? getTestCaseReferenceNow_() : new Date(Date.now());
+  const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
+  const testStates = testMode ? getTestNotificationStateMap_() : null;
   const data = mergeNotificationAndInCampusExtractedItemsForWeb_(
-    getActiveNotificationItemsForWeb_(),
-    getInCampusSupplementItemsForWeb_()
+    getActiveNotificationItemsForWeb_(testSpreadsheet, testStates),
+    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates),
+    'assignment',
+    testMode
   );
 
   return data
-    .filter(item => !isExpiredNotificationForWeb_(item))
+    .filter(item => !isExpiredNotificationForWeb_(item, deadlineReferenceNow))
     .filter(item => !isStaleUnknownDueNotificationForWeb_(item))
     .sort((a, b) => b.receivedAtTime - a.receivedAtTime);
 }
 
-function getActiveNotificationItemsForWeb_() {
-  return runWithUserLock_('保存データ処理', () => getActiveNotificationItemsForWebLocked_());
+function getActiveNotificationItemsForWeb_(testSpreadsheet, testStates) {
+  return runWithUserLock_('保存データ処理', () => getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates));
 }
 
-function getActiveNotificationItemsForWebLocked_() {
-  const ss = getOrCreateSpreadsheet_();
-  const sheetsBySource = ensureNotificationStorage_(ss);
-  let rows = getNotificationRowsFromSheets_(sheetsBySource);
+function getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates) {
+  const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
+  const sheetsBySource = getNotificationReadSheets_(testSpreadsheet);
+  let rows = getNotificationRowsFromSheets_(sheetsBySource, testMode);
+  applyTestNotificationStatesToRows_(rows, testStates);
 
   rows = rows.filter(row => isTaskRelatedRow_(row));
   rows = rows.filter(row => String(row[12] || '') !== '完了');
@@ -1668,8 +1790,10 @@ function getActiveNotificationItemsForWebLocked_() {
   return data;
 }
 
-function getNotificationRowsFromSheets_(sheetsBySource) {
+function getNotificationRowsFromSheets_(sheetsBySource, testMode) {
   const rows = [];
+  const useTestMode = typeof testMode === 'boolean' ? testMode : isTestCaseModeEnabled_();
+  const testReferenceDate = useTestMode ? getTestCaseReferenceNow_() : null;
 
   NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
     const sheet = sheetsBySource && sheetsBySource[storageConfig.source];
@@ -1678,11 +1802,87 @@ function getNotificationRowsFromSheets_(sheetsBySource) {
       return;
     }
 
-    const retainedRows = normalizeNotificationRowsForStorage_(sheet.getDataRange().getValues().slice(1), storageConfig);
+    const sourceRows = sheet.getDataRange().getValues().slice(1);
+    const rowsForRead = useTestMode
+      ? sourceRows.map(row => mapTestCaseNotificationRowForRead_(row, testReferenceDate))
+      : sourceRows;
+    const retainedRows = normalizeNotificationRowsForStorage_(rowsForRead, storageConfig);
     retainedRows.forEach(row => rows.push(...expandInCampusNotificationRow_(row)));
   });
 
   return rows;
+}
+
+function getTestNotificationStateMap_() {
+  if (!isTestCaseModeEnabled_()) return {};
+  const prefix = TEST_NOTIFICATION_STATE_PROPERTY_PREFIX;
+  const properties = PropertiesService.getUserProperties().getProperties();
+  const states = {};
+  Object.keys(properties).forEach(key => {
+    if (!key.startsWith(prefix)) return;
+    try {
+      const state = JSON.parse(properties[key]);
+      if (state && (state.status === '完了' || state.status === '未確認')) {
+        states[key.slice(prefix.length)] = state;
+      }
+    } catch (_) {
+      // Ignore malformed per-user test state and keep the spreadsheet value.
+    }
+  });
+  return states;
+}
+
+function getTestNotificationState_(messageId, testStates) {
+  if (!isTestCaseModeEnabled_()) return null;
+  if (testStates) return testStates[String(messageId || '')] || null;
+  const raw = PropertiesService.getUserProperties().getProperty(TEST_NOTIFICATION_STATE_PROPERTY_PREFIX + String(messageId || ''));
+  if (!raw) return null;
+  try {
+    const state = JSON.parse(raw);
+    return state && (state.status === '完了' || state.status === '未確認') ? state : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveTestNotificationState_(messageId, status) {
+  const id = String(messageId || '');
+  if (!id || id.length > 450 || (status !== '完了' && status !== '未確認')) return false;
+  const state = {status, completedAt: status === '完了' ? new Date().toISOString() : ''};
+  PropertiesService.getUserProperties().setProperty(TEST_NOTIFICATION_STATE_PROPERTY_PREFIX + id, JSON.stringify(state));
+  return true;
+}
+
+function clearTestNotificationStates_() {
+  const props = PropertiesService.getUserProperties();
+  Object.keys(props.getProperties()).forEach(key => {
+    if (key.indexOf(TEST_NOTIFICATION_STATE_PROPERTY_PREFIX) === 0 || key.indexOf('universityNotice:test:') === 0) {
+      props.deleteProperty(key);
+    }
+  });
+}
+
+function applyTestNotificationStatesToRows_(rows, testStates) {
+  if (testStates !== undefined ? !testStates : !isTestCaseModeEnabled_()) return rows;
+  const states = testStates || getTestNotificationStateMap_();
+  rows.forEach(row => {
+    const state = states[String(row[1] || '')] || null;
+    if (!state) return;
+    row[12] = state.status;
+    row[13] = state.completedAt || '';
+  });
+  return rows;
+}
+
+function applyTestNotificationStateToItem_(item, testStates) {
+  const state = testStates !== undefined
+    ? (testStates && testStates[String(item && item.messageId || '')] || null)
+    : getTestNotificationState_(item && item.messageId);
+  if (!state) return item;
+  item.status = state.status;
+  item.completedAt = state.completedAt || '';
+  item.completedAtTime = getTimeForSort_(state.completedAt);
+  return item;
 }
 
 
@@ -1740,10 +1940,11 @@ function buildDeadlineDateTimeForWeb_(dateKey, dueTime) {
     }
   }
 
-  return new Date(year, month - 1, day, hour, minute, 0, 0);
+  // Deadline inputs have minute precision; treat the full minute as valid.
+  return new Date(year, month - 1, day, hour, minute, 59, 999);
 }
 
-function isExpiredNotificationForWeb_(item) {
+function isExpiredNotificationForWeb_(item, referenceNow) {
   if (item.dueType !== 'detected') {
     return false;
   }
@@ -1758,7 +1959,10 @@ function isExpiredNotificationForWeb_(item) {
     return false;
   }
 
-  return deadline.getTime() < Date.now();
+  const now = referenceNow instanceof Date
+    ? referenceNow
+    : isTestCaseModeEnabled_() ? getTestCaseReferenceNow_() : new Date(Date.now());
+  return deadline.getTime() < now.getTime();
 }
 
 function isStaleUnknownDueNotificationForWeb_(item) {
@@ -2172,11 +2376,31 @@ function refreshAndGetNotificationsForWeb() {
   return getNotificationsForWeb();
 }
 
+function syncAndGetNotificationsForWeb() {
+  // Test mode changes only which sheet is displayed. Gmail mail is still
+  // committed to the signed-in user's original private spreadsheet.
+  const syncResult = saveClassroomMailsToSheet();
+  return {
+    items: getNotificationsForWeb(),
+    testCaseModeEnabled: isTestCaseModeEnabled_(),
+    syncSkipped: Boolean(syncResult.skipped),
+    syncSkipReason: String(syncResult.reason || ''),
+    savedCount: Number(syncResult.savedCount || 0),
+    classroomSavedCount: Number(syncResult.classroomSavedCount || 0),
+    inCampusSavedCount: Number(syncResult.inCampusSavedCount || 0),
+    autoCompletedCount: Number(syncResult.autoCompletedCount || 0),
+    completedAt: new Date().toISOString()
+  };
+}
+
 function clearNotificationSheetData_() {
   return runWithUserLock_('保存データ処理', () => clearNotificationSheetDataLocked_());
 }
 
 function clearNotificationSheetDataLocked_() {
+  if (isTestCaseModeEnabled_()) {
+    throw new Error('テストケース適用中はテストデータを消去できません。設定をOFFにしてから実行してください。');
+  }
   const ss = getOrCreateSpreadsheet_();
   const sheetsBySource = ensureNotificationStorage_(ss);
 
@@ -2196,24 +2420,23 @@ function clearNotificationSheetDataLocked_() {
 }
 
 function rebuildAndGetNotificationsForWeb() {
-  return runWithUserLock_('保存データ処理', () => rebuildAndGetNotificationsForWebLocked_());
+  // Kept as a compatibility endpoint; rebuilding by clearing the workbook
+  // would force an unnecessary wide Gmail scan. Reuse the normal watermark.
+  saveClassroomMailsToSheet();
+  return getNotificationsForWeb();
 }
 
 function rebuildAndGetNotificationsForWebLocked_() {
-  clearNotificationSheetData_();
-  SpreadsheetApp.flush();
-
-  saveClassroomMailsToSheet();
-  SpreadsheetApp.flush();
-
-  return getNotificationsForWeb();
+  throw new Error('増分同期は共有ロックの外側から実行してください。');
 }
 
 function ensureAutoFetchTrigger_() {
   const matchingTriggers = ScriptApp.getProjectTriggers()
     .filter(trigger => trigger.getHandlerFunction() === AUTO_FETCH_HANDLER);
+  const props = PropertiesService.getUserProperties();
+  const configuredRevision = props.getProperty(AUTO_FETCH_TRIGGER_REVISION_PROPERTY);
 
-  if (matchingTriggers.length > 0) {
+  if (matchingTriggers.length > 0 && configuredRevision === AUTO_FETCH_TRIGGER_REVISION) {
     matchingTriggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
 
     return {
@@ -2222,14 +2445,20 @@ function ensureAutoFetchTrigger_() {
     };
   }
 
-  ScriptApp.newTrigger(AUTO_FETCH_HANDLER)
+  // Existing triggers can remain pinned to an older code version. Create the
+  // replacement first so a creation error never leaves the user without sync.
+  const replacement = ScriptApp.newTrigger(AUTO_FETCH_HANDLER)
     .timeBased()
     .everyMinutes(15)
     .create();
+  matchingTriggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  props.setProperty(AUTO_FETCH_TRIGGER_REVISION_PROPERTY, AUTO_FETCH_TRIGGER_REVISION);
 
   return {
     created: true,
-    removedDuplicates: 0
+    replacedExisting: matchingTriggers.length > 0,
+    removedDuplicates: Math.max(0, matchingTriggers.length - 1),
+    replacementId: replacement.getUniqueId ? replacement.getUniqueId() : ''
   };
 }
 
@@ -2279,6 +2508,11 @@ function updateNotificationStatusLocked_(messageId, status, responseBuilder) {
   const targetMessageId = String(messageId || '');
 
   if (!targetMessageId) {
+    return responseBuilder();
+  }
+
+  if (isTestCaseModeEnabled_()) {
+    saveTestNotificationState_(targetMessageId, status);
     return responseBuilder();
   }
 
@@ -2492,7 +2726,10 @@ function getInCampusExtractedItemsForWeb_(viewMode) {
 }
 
 function getInCampusExtractedItemsForWebLocked_(viewMode) {
-  const sheet = getOrCreateInCampusSheet_();
+  const testMode = isTestCaseModeEnabled_();
+  const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
+  const testStates = testMode ? getTestNotificationStateMap_() : null;
+  const sheet = getInCampusReadSheet_(testSpreadsheet);
 
   if (!sheet || sheet.getLastRow() < 2) {
     return [];
@@ -2500,10 +2737,14 @@ function getInCampusExtractedItemsForWebLocked_(viewMode) {
 
   const values = sheet.getDataRange().getValues();
   const headerMap = getInCampusHeaderMap_(sheet);
-  const rows = values.slice(1);
+  const testReferenceDate = testMode ? getTestCaseReferenceNow_() : null;
+  const rows = values.slice(1).map(row => testMode
+    ? mapTestCaseExtractRowForRead_(row, testReferenceDate)
+    : row);
   const items = rows
     .map(row => rowToInCampusExtractedItem_(row, headerMap))
-    .filter(item => item.messageId);
+    .filter(item => item.messageId)
+    .map(item => applyTestNotificationStateToItem_(item, testStates));
   const submissionItems = items.filter(item => isInCampusSubmissionItemForWeb_(item));
   const assignmentItems = items.filter(item => !isInCampusSubmissionItemForWeb_(item));
 
@@ -2757,13 +2998,19 @@ function getCompletedNotificationsForWeb() {
 }
 
 function getCompletedNotificationsForWebLocked_() {
+  const testMode = isTestCaseModeEnabled_();
+  const deadlineReferenceNow = testMode ? getTestCaseReferenceNow_() : new Date(Date.now());
+  const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
+  const testStates = testMode ? getTestNotificationStateMap_() : null;
   const data = mergeNotificationAndInCampusExtractedItemsForWeb_(
-    getCompletedNotificationItemsForWeb_(),
-    getInCampusSupplementItemsForWeb_()
+    getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates),
+    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates),
+    'assignment',
+    testMode
   );
 
   return data
-    .filter(item => !isExpiredNotificationForWeb_(item))
+    .filter(item => !isExpiredNotificationForWeb_(item, deadlineReferenceNow))
     .filter(item => !isStaleUnknownDueNotificationForWeb_(item))
     .sort((a, b) => {
       if (a.completedAtTime !== b.completedAtTime) {
@@ -2774,16 +3021,21 @@ function getCompletedNotificationsForWebLocked_() {
     });
 }
 
-function getInCampusSupplementItemsForWeb_() {
-  return runWithUserLock_('保存データ処理', () => getInCampusSupplementItemsForWebLocked_());
+function getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates) {
+  return runWithUserLock_('保存データ処理', () => getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates));
 }
 
-function getInCampusSupplementItemsForWebLocked_() {
-  const sheet = getOrCreateInCampusSheet_();
+function getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates) {
+  const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
+  const states = testMode ? (testStates || getTestNotificationStateMap_()) : null;
+  const sheet = getInCampusReadSheet_(testSpreadsheet);
   if (!sheet || sheet.getLastRow() < 2) return [];
   const headerMap = getInCampusHeaderMap_(sheet);
+  const testReferenceDate = testMode ? getTestCaseReferenceNow_() : null;
   return sheet.getDataRange().getValues().slice(1)
-    .map(row => rowToInCampusExtractedItem_(row, headerMap));
+    .map(row => testMode ? mapTestCaseExtractRowForRead_(row, testReferenceDate) : row)
+    .map(row => rowToInCampusExtractedItem_(row, headerMap))
+    .map(item => applyTestNotificationStateToItem_(item, states));
 }
 
 function normalizeInCampusExactText_(value) {
@@ -2802,18 +3054,22 @@ function getInCampusCourseIdentity_(item) {
   return {name: name.trim(), schedule};
 }
 
-function isInCampusReportDetailUrl_(value) {
-  return /^https:\/\/ic\.ss\.senshu-u\.ac\.jp\/lms\/course\/report\//.test(String(value || ''));
+function isInCampusReportDetailUrl_(value, testMode) {
+  const url = String(value || '');
+  const useTestMode = typeof testMode === 'boolean' ? testMode : isTestCaseModeEnabled_();
+  return /^https:\/\/ic\.ss\.senshu-u\.ac\.jp\/lms\/course\/report\//.test(url) ||
+    (useTestMode && /^https:\/\/portal\.example\.invalid\/course\/report\/SIM-\d{4}$/.test(url));
 }
 
-function mergeNotificationAndInCampusExtractedItemsForWeb_(notificationItems, extractedItems, kind) {
+function mergeNotificationAndInCampusExtractedItemsForWeb_(notificationItems, extractedItems, kind, testMode) {
   const expectedKind = kind || 'assignment';
+  const useTestMode = typeof testMode === 'boolean' ? testMode : isTestCaseModeEnabled_();
   return notificationItems.map(notification => {
     if (notification.source !== 'inCampus') return notification;
     const candidates = extractedItems.filter(item => {
       const itemKind = item.rawUpdateText ? getInCampusUpdateKind_(item.rawUpdateText) : item.rawType;
       if (itemKind !== expectedKind || item.rawType === 'submissionRecord') return false;
-      if (expectedKind === 'assignment' && !isInCampusReportDetailUrl_(item.classroomUrl)) return false;
+      if (expectedKind === 'assignment' && !isInCampusReportDetailUrl_(item.classroomUrl, useTestMode)) return false;
       return isSameInCampusAssignmentForWeb_(notification, item);
     });
     // Updates of the same report are one candidate; different reports are ambiguous.
@@ -2900,14 +3156,15 @@ function isGenericInCampusCourseNameForMatch_(courseName) {
     text === 'incampusお知らせ';
 }
 
-function getCompletedNotificationItemsForWeb_() {
-  return runWithUserLock_('保存データ処理', () => getCompletedNotificationItemsForWebLocked_());
+function getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates) {
+  return runWithUserLock_('保存データ処理', () => getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates));
 }
 
-function getCompletedNotificationItemsForWebLocked_() {
-  const ss = getOrCreateSpreadsheet_();
-  const sheetsBySource = ensureNotificationStorage_(ss);
-  let rows = getNotificationRowsFromSheets_(sheetsBySource);
+function getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates) {
+  const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
+  const sheetsBySource = getNotificationReadSheets_(testSpreadsheet);
+  let rows = getNotificationRowsFromSheets_(sheetsBySource, testMode);
+  applyTestNotificationStatesToRows_(rows, testStates);
 
   rows = rows.filter(row => isTaskRelatedRow_(row));
   rows = rows.filter(row => String(row[12] || '') === '完了');
@@ -2981,7 +3238,7 @@ function debugDueDateExtraction() {
 function rebuildNotificationsManually() {
   const data = rebuildAndGetNotificationsForWeb();
 
-  Logger.log('再構築が完了しました。表示対象件数: ' + data.length);
+  Logger.log('増分同期が完了しました。表示対象件数: ' + data.length);
 }
 
 const INCAMPUS_SHEET_NAME = 'inCampus抽出';
@@ -2994,6 +3251,23 @@ const INCAMPUS_SUBMISSION_RECORD_STATUS = '完了記録';
 const DEFAULT_SPREADSHEET_ID = '';
 const USER_SPREADSHEET_ID_PROPERTY = 'TASKHUB_SPREADSHEET_ID';
 const LEGACY_SPREADSHEET_ID_PROPERTY = 'SPREADSHEET_ID';
+const TEST_CASE_MODE_PROPERTY = 'TASKHUB_TEST_CASE_MODE';
+const TEST_CASE_CLOCK_PROPERTY = 'TASKHUB_TEST_CASE_CLOCK';
+const TEST_SPREADSHEET_ID_PROPERTY = 'TASKHUB_TEST_SPREADSHEET_ID';
+const DEFAULT_TEST_SPREADSHEET_ID = '1ZVGwBnMrXaOMJ-D1SqeFuL-nVndXqwEIp55Gm5cTtuQ';
+const TEST_NOTIFICATION_STATE_PROPERTY_PREFIX = 'TASKHUB_TEST_NOTIFICATION_STATE:';
+const TEST_CASE_CLOCK_PRESETS = [
+  {id: 'saturday', label: '2026/12/26（土）09:00 — 土曜、日曜期限は明日', dateTime: '2026-12-26T09:00'},
+  {id: 'sunday', label: '2026/12/27（日）23:58 — 日曜から月曜への週境界', dateTime: '2026-12-27T23:58'},
+  {id: 'weekday', label: '2026/12/29（火）10:30 — 平日の4区分', dateTime: '2026-12-29T10:30'},
+  {id: 'year-end', label: '2026/12/31（木）23:58 — 年越し・0:00期限', dateTime: '2026-12-31T23:58'},
+  {id: 'new-year', label: '2027/01/01（金）00:01 — 年越し直後', dateTime: '2027-01-01T00:01'},
+  {id: 'jst-utc-boundary', label: '2027/01/01（金）00:05 — JST/UTC年境界', dateTime: '2027-01-01T00:05'},
+  {id: 'non-leap-year', label: '2027/02/28（日）09:00 — 平年、2/29は無効日付', dateTime: '2027-02-28T09:00'},
+  {id: 'month-end', label: '2027/04/30（金）09:00 — 月末から5月初日', dateTime: '2027-04-30T09:00'},
+  {id: 'leap-eve', label: '2028/02/28（月）09:00 — 閏日の前日', dateTime: '2028-02-28T09:00'},
+  {id: 'leap-day', label: '2028/02/29（火）09:00 — 閏日当日', dateTime: '2028-02-29T09:00'}
+];
 const API_TOKEN_PROPERTY = 'TASKHUB_API_TOKEN';
 const API_TOKEN_MIN_LENGTH = 48;
 const MAX_POST_BODY_LENGTH = 200000;
@@ -3057,6 +3331,13 @@ const INCAMPUS_HEADERS = [
   'completedAt',
   'assignmentKey'
 ];
+
+const TEST_CASE_NOTIFICATION_HEADERS = HEADER_ROW.concat([
+  'テスト保存日時', 'テスト受信日時', 'テスト期限（保存値）', 'テスト期限（アプリ表示）'
+]);
+const TEST_CASE_EXTRACT_HEADERS = INCAMPUS_HEADERS.concat([
+  'テスト受信日時', 'テスト期限（保存値）', 'テスト期限（アプリ表示）'
+]);
 
 function doPost(e) {
   try {
@@ -3135,8 +3416,92 @@ function getSecuritySettingsForWeb() {
   return {
     postAuthRequired: true,
     hasApiToken,
-    tokenPreview: hasApiToken ? maskApiToken_(apiToken) : '未発行'
+    ...getTestCaseSettings_()
   };
+}
+
+function getTestCaseSettings_() {
+  let ready = false;
+  let message = '';
+  try {
+    openTestCaseSpreadsheet_();
+    ready = true;
+  } catch (error) {
+    message = String(error && error.message ? error.message : error);
+  }
+  return {
+    testSpreadsheetConfigured: Boolean(getConfiguredTestSpreadsheetId_()),
+    testSpreadsheetReady: ready,
+    testSpreadsheetMessage: message,
+    ...getTestCaseClockStateForWeb()
+  };
+}
+
+function getTestCaseClockStateForWeb() {
+  return {
+    testCaseModeEnabled: isTestCaseModeEnabled_(),
+    testCaseClockDateTime: getTestCaseClockDateTime_(),
+    testCaseClockPresets: TEST_CASE_CLOCK_PRESETS.map(preset => ({...preset}))
+  };
+}
+
+function setTestCaseClockForWeb(dateTime) {
+  if (typeof dateTime !== 'string') throw new Error('日時は選択肢または日時入力から指定してください。');
+  const value = dateTime.trim();
+  runWithUserLock_('テスト判定日時設定', () => {
+    const props = PropertiesService.getUserProperties();
+    if (!value) {
+      props.deleteProperty(TEST_CASE_CLOCK_PROPERTY);
+      return;
+    }
+    const parsed = parseTestCaseClockDateTime_(value);
+    if (!parsed) throw new Error('日時が正しくありません。日本時間の実在する日付と時刻を指定してください。');
+    props.setProperty(TEST_CASE_CLOCK_PROPERTY, parsed.toISOString());
+  });
+  return getTestCaseClockStateForWeb();
+}
+
+function parseTestCaseClockDateTime_(value) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  if (year < 2000 || year > 2099 || !isValidDateParts_(year, month, day) || hour > 23 || minute > 59) return null;
+  return new Date(Date.UTC(year, month - 1, day, hour - 9, minute));
+}
+
+function getTestCaseClock_() {
+  const saved = PropertiesService.getUserProperties().getProperty(TEST_CASE_CLOCK_PROPERTY);
+  if (!saved) return null;
+  const date = new Date(saved);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function getTestCaseReferenceNow_() {
+  return getTestCaseClock_() || new Date();
+}
+
+function getTestCaseClockDateTime_() {
+  const date = getTestCaseClock_();
+  return date ? Utilities.formatDate(date, 'Asia/Tokyo', "yyyy-MM-dd'T'HH:mm") : '';
+}
+
+function setTestCaseModeForWeb(enabled) {
+  if (typeof enabled !== 'boolean') throw new Error('テストケース設定にはONまたはOFFを指定してください。');
+  runWithUserLock_('テストケース設定', () => {
+    const props = PropertiesService.getUserProperties();
+    if (enabled) {
+      openTestCaseSpreadsheet_();
+      if (!isTestCaseModeEnabled_()) clearTestNotificationStates_();
+      props.setProperty(TEST_CASE_MODE_PROPERTY, 'true');
+    } else {
+      props.deleteProperty(TEST_CASE_MODE_PROPERTY);
+    }
+  });
+  return getSecuritySettingsForWeb();
 }
 
 function rotateApiTokenForWeb() {
@@ -3147,8 +3512,8 @@ function rotateApiTokenForWeb() {
     postAuthRequired: true,
     hasApiToken: true,
     apiToken,
-    tokenPreview: maskApiToken_(apiToken),
-    tokenReturnedOnce: true
+    tokenReturnedOnce: true,
+    ...getTestCaseSettings_()
   };
 }
 
@@ -3190,16 +3555,6 @@ function generateApiToken_() {
 function isValidApiToken_(token) {
   return /^[A-Za-z0-9_-]+$/.test(String(token || '')) &&
     String(token || '').length >= API_TOKEN_MIN_LENGTH;
-}
-
-function maskApiToken_(token) {
-  const text = String(token || '');
-
-  if (text.length <= 12) {
-    return '未設定';
-  }
-
-  return `${text.slice(0, 6)}...${text.slice(-6)}`;
 }
 
 function constantTimeEquals_(left, right) {

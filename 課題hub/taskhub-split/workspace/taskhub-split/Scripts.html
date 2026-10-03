@@ -18,9 +18,15 @@
   let expandedHomeDueGroup = null;
   let groupOpenState = getGroupOpenState();
   let securityTokenVisible = false;
+  let notificationSyncInFlight = false;
+  let notificationSyncToastTimerId = null;
+  let testCaseModeEnabled = false;
+  let testCaseClockDateTime = '';
+  let testCaseClockPresets = [];
 
   updateBottomNavState();
   renderHome();
+  loadTestCaseClockState();
   loadHomeNotifications();
   showHelpOnFirstVisit();
 
@@ -34,9 +40,29 @@
     return error && error.message ? error.message : String(error);
   }
 
+  function loadTestCaseClockState() {
+    google.script.run
+      .withSuccessHandler(applyTestCaseClockState)
+      .withFailureHandler(error => console.error(error))
+      .getTestCaseClockStateForWeb();
+  }
+
+  function applyTestCaseClockState(state) {
+    const value = state || {};
+    testCaseModeEnabled = Boolean(value.testCaseModeEnabled);
+    testCaseClockDateTime = String(value.testCaseClockDateTime || '');
+    testCaseClockPresets = Array.isArray(value.testCaseClockPresets) ? value.testCaseClockPresets.slice() : [];
+    renderTestCaseClockControls();
+    updateTestClockHeaderButton();
+    if (notificationData.active.length || notificationData.completed.length) refreshCurrentView();
+  }
+
   function loadHomeNotifications() {
     requestNotificationData('active', {
-      method: 'refreshAndGetNotificationsForWeb', remember: true, homeSync: true
+      remember: true,
+      homeSync: true,
+      loadingStatusText: '一覧を読み込み中...',
+      syncLabel: '一覧更新'
     });
   }
 
@@ -67,9 +93,10 @@
     if (assignmentView) {
       assignmentView.classList.toggle('is-active', viewName === 'assignment');
     }
+    updateTestClockHeaderButton();
   }
 
-  function updateHomeSyncText() {
+  function updateHomeSyncText(label = '一覧更新') {
     const syncText = document.getElementById('home-sync-text');
 
     if (!syncText) {
@@ -80,7 +107,7 @@
     const hours = String(now.getHours()).padStart(2, '0');
     const minutes = String(now.getMinutes()).padStart(2, '0');
 
-    syncText.textContent = `同期済み ${hours}:${minutes}`;
+    syncText.textContent = `${label} ${hours}:${minutes}`;
   }
 
   function renderHome() {
@@ -240,6 +267,8 @@
     const toggleButton = document.getElementById('security-token-toggle');
     const copyButton = document.getElementById('security-token-copy');
     const status = document.getElementById('security-auth-status');
+    const testModeStatus = document.getElementById('test-mode-status');
+    const testModeToggle = document.getElementById('test-mode-toggle');
 
     if (tokenInput) {
       tokenInput.value = '読み込み中...';
@@ -259,6 +288,8 @@
     if (status) {
       status.textContent = '確認中';
     }
+    if (testModeStatus) testModeStatus.textContent = '確認中';
+    if (testModeToggle) testModeToggle.disabled = true;
 
     setSecurityMessage('');
 
@@ -276,7 +307,7 @@
     const toggleButton = document.getElementById('security-token-toggle');
     const copyButton = document.getElementById('security-token-copy');
     const status = document.getElementById('security-auth-status');
-    const hasFullToken = Boolean(settings && settings.apiToken);
+    const hasFullToken = Boolean(settings && settings.tokenReturnedOnce === true && settings.apiToken);
     const hasApiToken = Boolean(settings && settings.hasApiToken);
 
     securityTokenVisible = false;
@@ -285,7 +316,7 @@
       tokenInput.value = hasFullToken
         ? settings.apiToken
         : hasApiToken
-          ? settings.tokenPreview || '保存済み'
+          ? '発行済み（非表示）'
           : '未発行';
       tokenInput.type = hasFullToken ? 'password' : 'text';
       tokenInput.dataset.hasFullToken = hasFullToken ? 'true' : 'false';
@@ -309,6 +340,230 @@
     } else if (!hasFullToken) {
       setSecurityMessage('APIトークンは未発行です。使い始めるには再発行してください。');
     }
+
+    renderTestCaseModeSettings(settings || {});
+    renderTestCaseClockSettings(settings || {});
+  }
+
+  function renderTestCaseModeSettings(settings) {
+    const status = document.getElementById('test-mode-status');
+    const hint = document.getElementById('test-mode-hint');
+    const toggle = document.getElementById('test-mode-toggle');
+    const enabled = Boolean(settings.testCaseModeEnabled);
+    const ready = Boolean(settings.testSpreadsheetReady);
+    testCaseModeEnabled = enabled;
+
+    if (status) status.textContent = enabled ? 'ON：テストケース用データを表示中' : 'OFF：保存済みデータを表示中';
+    if (hint) {
+      hint.textContent = enabled
+        ? '課題・大学のお知らせは参照専用のテストシートから読み込みます。完了状態は利用者ごとに保持し、メールや拡張機能からの保存先は元の個人Excelのままです。'
+        : ready
+          ? 'ONにすると課題・大学のお知らせの参照元だけが固定テストシートになります。保存先は元の個人Excelのままです。'
+          : settings.testSpreadsheetMessage || 'テストケース用シートを利用できません。管理者に共有設定を確認してください。';
+    }
+    if (toggle) {
+      toggle.checked = enabled;
+      toggle.disabled = !ready && !enabled;
+      toggle.dataset.ready = ready ? 'true' : 'false';
+    }
+    updateTestClockHeaderButton();
+  }
+
+  function renderTestCaseClockSettings(settings) {
+    if (Array.isArray(settings.testCaseClockPresets)) {
+      testCaseClockPresets = settings.testCaseClockPresets.slice();
+    }
+    if (Object.prototype.hasOwnProperty.call(settings, 'testCaseClockDateTime')) {
+      testCaseClockDateTime = String(settings.testCaseClockDateTime || '');
+    }
+    renderTestCaseClockControls();
+  }
+
+  function renderTestCaseClockControls() {
+    const surfaces = [
+      {name: 'settings', selectId: 'settings-test-clock-preset', inputId: 'settings-test-clock-custom', currentId: 'settings-test-clock-current'},
+      {name: 'header', selectId: 'header-test-clock-preset', inputId: 'header-test-clock-custom', currentId: 'header-test-clock-current'}
+    ];
+    const options = [
+      {id: 'current', label: '実際の現在日時を使う', dateTime: ''},
+      ...testCaseClockPresets.map(preset => ({
+        id: String(preset.id || ''), label: String(preset.label || preset.dateTime || ''), dateTime: String(preset.dateTime || '')
+      })),
+      {id: 'custom', label: '任意の日時を入力する', dateTime: null}
+    ];
+
+    surfaces.forEach(surface => {
+      const select = document.getElementById(surface.selectId);
+      const input = document.getElementById(surface.inputId);
+      const current = document.getElementById(surface.currentId);
+      if (select) {
+        select.innerHTML = options.map(option => `<option value="${escapeHtml(option.id)}">${escapeHtml(option.label)}</option>`).join('');
+        const selected = options.find(option => option.dateTime === testCaseClockDateTime && option.dateTime !== null);
+        select.value = selected ? selected.id : testCaseClockDateTime ? 'custom' : 'current';
+      }
+      if (input && document.activeElement !== input) input.value = testCaseClockDateTime;
+      if (current) current.textContent = testCaseClockDateTime
+        ? `設定中：${formatTestCaseClockLabel(testCaseClockDateTime)}（日本時間）`
+        : '設定中：実際の現在日時';
+    });
+  }
+
+  function formatTestCaseClockLabel(value) {
+    const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+    return match ? `${match[1]}/${match[2]}/${match[3]} ${match[4]}:${match[5]}` : String(value || '');
+  }
+
+  function updateTestClockHeaderButton() {
+    const button = document.getElementById('header-test-clock-button');
+    if (!button) return;
+    const inAssignmentView = currentScreen === 'active' || currentScreen === 'completed';
+    button.hidden = !(testCaseModeEnabled && inAssignmentView);
+    button.title = testCaseClockDateTime
+      ? `判定日時：${formatTestCaseClockLabel(testCaseClockDateTime)}（日本時間）`
+      : '期限判定に実際の現在日時を使います';
+  }
+
+  function syncTestClockCustomInput(surfaceName) {
+    const select = document.getElementById(`${surfaceName}-test-clock-preset`);
+    const input = document.getElementById(`${surfaceName}-test-clock-custom`);
+    if (!select || !input) return;
+    const preset = testCaseClockPresets.find(item => String(item.id || '') === String(select.value));
+    if (preset) input.value = String(preset.dateTime || '');
+    else if (select.value === 'current') input.value = '';
+  }
+
+  function selectCustomTestClock(surfaceName) {
+    const select = document.getElementById(`${surfaceName}-test-clock-preset`);
+    if (select) select.value = 'custom';
+  }
+
+  function getSelectedTestClockDateTime(surfaceName) {
+    const select = document.getElementById(`${surfaceName}-test-clock-preset`);
+    const input = document.getElementById(`${surfaceName}-test-clock-custom`);
+    if (!select) return null;
+    if (select.value === 'current') return '';
+    if (select.value === 'custom') return input ? String(input.value || '') : '';
+    const preset = testCaseClockPresets.find(item => String(item.id || '') === String(select.value));
+    return preset ? String(preset.dateTime || '') : null;
+  }
+
+  function openTestClockModal() {
+    if (!testCaseModeEnabled) return;
+    renderTestCaseClockControls();
+    const backdrop = document.getElementById('test-clock-modal-backdrop');
+    if (backdrop) backdrop.classList.add('is-open');
+  }
+
+  function closeTestClockModal() {
+    const backdrop = document.getElementById('test-clock-modal-backdrop');
+    if (backdrop) backdrop.classList.remove('is-open');
+  }
+
+  function applyTestClockSelection(surfaceName) {
+    const value = getSelectedTestClockDateTime(surfaceName);
+    if (value === null || (value && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value))) {
+      setTestClockMessage('日時を選択するか、任意の日時を入力してください。', true);
+      return;
+    }
+    saveTestCaseClock(value, surfaceName);
+  }
+
+  function applyCurrentTestClock(surfaceName) {
+    const select = document.getElementById(`${surfaceName}-test-clock-preset`);
+    const input = document.getElementById(`${surfaceName}-test-clock-custom`);
+    if (select) select.value = 'current';
+    if (input) input.value = '';
+    saveTestCaseClock('', surfaceName);
+  }
+
+  function saveTestCaseClock(value, surfaceName) {
+    setTestClockMessage('日時を保存しています...', false);
+    google.script.run
+      .withSuccessHandler(state => {
+        applyTestCaseClockState(state);
+        setTestClockMessage(testCaseClockDateTime
+          ? `判定日時を${formatTestCaseClockLabel(testCaseClockDateTime)}（日本時間）に設定しました。`
+          : '期限判定を実際の現在日時に戻しました。', false);
+        if (surfaceName === 'header') showSyncToast('テスト日時を適用しました。メール同期はしていません。', 'success');
+        reloadCurrentViewForTestClock();
+      })
+      .withFailureHandler(error => {
+        console.error(error);
+        setTestClockMessage('日時を保存できませんでした：' + getErrorMessage(error), true);
+      })
+      .setTestCaseClockForWeb(String(value || ''));
+  }
+
+  function setTestClockMessage(message, isError) {
+    ['settings-test-clock-message', 'header-test-clock-message'].forEach(id => {
+      const element = document.getElementById(id);
+      if (!element) return;
+      element.textContent = message || '';
+      element.classList.toggle('is-error', Boolean(isError));
+    });
+  }
+
+  function reloadCurrentViewForTestClock() {
+    if (!testCaseModeEnabled || currentScreen === 'university') {
+      refreshCurrentView();
+      return;
+    }
+    const viewMode = currentScreen === 'completed' ? 'completed' : 'active';
+    requestNotificationData(viewMode, {
+      loadingText: 'テスト日時の期限区分を更新中...',
+      remember: false
+    });
+  }
+
+  function toggleTestCaseMode(enabled) {
+    const toggle = document.getElementById('test-mode-toggle');
+    const status = document.getElementById('test-mode-status');
+    const prior = !enabled;
+    if (!toggle || (enabled && toggle.dataset.ready !== 'true')) {
+      if (toggle) toggle.checked = false;
+      setSecurityMessage('テストケース用シートを利用できないため、切り替えられません。', true);
+      return;
+    }
+
+    toggle.disabled = true;
+    if (status) status.textContent = enabled ? 'テストケースへ切替中...' : '保存済みデータへ切替中...';
+    setSecurityMessage('テストデータの参照元を切り替えています...');
+    google.script.run
+      .withSuccessHandler(settings => {
+        renderSecuritySettings(settings);
+        notificationRequestIds.active++;
+        notificationRequestIds.completed++;
+        const reportReadFailure = error => {
+          setSecurityMessage(`${enabled ? 'ON' : 'OFF'}設定は保存済みですが、切替後のデータ読込に失敗しました。更新を再試行してください：${getErrorMessage(error)}`, true);
+        };
+        const reportReadSuccess = count => {
+          const label = enabled ? 'テストケース用データ' : '保存済みデータ';
+          setSecurityMessage(`${label}へ切り替えました（${count}件を読み込み）。メール同期は実行していません。`);
+        };
+        if (currentScreen === 'university') {
+          universityState.loading = false;
+          loadUniversityNotices(items => reportReadSuccess(items.length), reportReadFailure);
+          return;
+        }
+        const viewMode = currentScreen === 'completed' ? 'completed' : 'active';
+        if (currentScreen === 'home') {
+          const syncText = document.getElementById('home-sync-text');
+          if (syncText) syncText.textContent = '切替後データを読み込み中...';
+        }
+        requestNotificationData(viewMode, {
+          loadingText: enabled ? 'テストケース用データを読み込み中...' : '保存済みデータへ戻しています...',
+          onSuccess: data => reportReadSuccess(Array.isArray(data) ? data.length : 0),
+          onFailure: reportReadFailure
+        });
+      })
+      .withFailureHandler(error => {
+        console.error(error);
+        toggle.checked = prior;
+        toggle.disabled = false;
+        setSecurityMessage('切替に失敗しました：' + getErrorMessage(error), true);
+        loadSecuritySettings();
+      })
+      .setTestCaseModeForWeb(Boolean(enabled));
   }
 
   function toggleSecurityTokenVisibility() {
@@ -421,24 +676,40 @@
       list.textContent = options.loadingText;
     }
     if (options.homeSync && syncText) {
-      syncText.textContent = '同期中...';
+      syncText.textContent = options.loadingStatusText || '一覧を読み込み中...';
     }
 
     const runner = google.script.run
       .withSuccessHandler(data => {
-        if (!isCurrentRequest()) return;
-        setNotificationData(data, viewMode);
-        if (options.remember) rememberExistingNotifications(data);
+        if (!isCurrentRequest()) {
+          if (typeof options.onStale === 'function') options.onStale(data, false);
+          return;
+        }
+        const items = options.structuredResult
+          ? (data && Array.isArray(data.items) ? data.items : [])
+          : data;
+        setNotificationData(items, viewMode);
+        if (options.remember) rememberExistingNotifications(items);
         if (options.notify) notifyNewNotifications(notificationData[viewMode]);
-        if (viewMode === 'active') updateHomeSyncText();
+        if (viewMode === 'active') {
+          const syncLabel = typeof options.syncLabelForResult === 'function'
+            ? options.syncLabelForResult(data)
+            : options.syncLabel || '一覧更新';
+          updateHomeSyncText(syncLabel);
+        }
+        if (typeof options.onSuccess === 'function') options.onSuccess(data, items);
       })
       .withFailureHandler(error => {
-        if (!isCurrentRequest()) return;
+        if (!isCurrentRequest()) {
+          if (typeof options.onStale === 'function') options.onStale(error, true);
+          return;
+        }
         console.error(error);
         if (options.loadingText && currentScreen === viewMode) {
           list.textContent = 'エラーが発生しました：' + getErrorMessage(error);
         }
         if (viewMode === 'active' && syncText) syncText.textContent = '同期失敗';
+        if (typeof options.onFailure === 'function') options.onFailure(error);
       });
     const method = options.method || (viewMode === 'completed'
       ? 'getCompletedNotificationsForWeb' : 'getNotificationsForWeb');
@@ -455,6 +726,7 @@
   function loadNotifications() {
     closeCourseFilterPanel();
     showAssignmentView('active');
+    if (notificationSyncInFlight) return;
     requestNotificationData('active', {loadingText: '読み込み中...', remember: true});
   }
 
@@ -465,7 +737,10 @@
   }
 
   function refreshNotifications() {
-    requestNotificationData('active', {method: 'refreshAndGetNotificationsForWeb', notify: true});
+    // The 15-minute server trigger owns Gmail ingestion. Open tabs only reread
+    // the saved sheet so each tab does not launch another full Gmail scan.
+    if (notificationSyncInFlight) return;
+    requestNotificationData('active', {notify: true});
   }
 
   function requestBrowserNotificationPermission() {
@@ -489,9 +764,89 @@
       return;
     }
 
+    if (notificationSyncInFlight) {
+      showSyncToast('メール同期を実行中です。完了すると一覧が更新されます。', 'loading');
+      return;
+    }
+
+    notificationSyncInFlight = true;
+    setManualSyncButtonBusy(true);
+    showSyncToast('メールを同期しています。画面はそのまま操作できます。', 'loading');
     requestNotificationData('active', {
-      method: 'refreshAndGetNotificationsForWeb', loadingText: '更新中...', notify: true
+      method: 'syncAndGetNotificationsForWeb',
+      structuredResult: true,
+      notify: true,
+      homeSync: true,
+      loadingStatusText: 'メールを同期中...',
+      syncLabelForResult: result => result && result.testCaseModeEnabled
+        ? '個人用Excel同期済み'
+        : 'メール同期済み',
+      onSuccess: result => {
+        finishManualSync();
+        if (result && result.syncSkipped) {
+          const reason = String(result.syncSkipReason || '保存Excelの基準日時が確認できません。');
+          showSyncToast(`更新を見送りました：${reason}`, 'error');
+          return;
+        }
+        const savedCount = Number(result && result.savedCount || 0);
+        const summary = result && result.testCaseModeEnabled
+          ? `テスト表示を更新しました。個人用Excelに新着メール${savedCount}件を保存しました。`
+          : savedCount > 0
+            ? `更新完了：新着メール${savedCount}件を取り込みました。`
+            : '更新完了：新着メールはありません。';
+        showSyncToast(summary, 'success');
+      },
+      onFailure: error => {
+        finishManualSync();
+        showSyncToast(`更新に失敗しました：${getErrorMessage(error)}`, 'error');
+      },
+      onStale: (result, failed) => {
+        finishManualSync();
+        if (failed) {
+          showSyncToast(`更新に失敗しました：${getErrorMessage(result)}`, 'error');
+        } else {
+          showSyncToast('メール同期は完了しました。切替後の一覧を表示しています。', 'success');
+          if (currentScreen !== 'university') {
+            const viewMode = currentScreen === 'completed' ? 'completed' : 'active';
+            requestNotificationData(viewMode, {remember: viewMode === 'active'});
+          }
+        }
+      }
     });
+  }
+
+  function setManualSyncButtonBusy(isBusy) {
+    const button = document.getElementById('manual-refresh-button');
+    if (!button) return;
+    button.disabled = Boolean(isBusy);
+    button.textContent = isBusy ? '同期中...' : '更新';
+  }
+
+  function finishManualSync() {
+    notificationSyncInFlight = false;
+    setManualSyncButtonBusy(false);
+  }
+
+  function showSyncToast(message, state = 'success') {
+    const toast = document.getElementById('sync-toast');
+    const text = document.getElementById('sync-toast-message');
+    if (!toast || !text) return;
+
+    if (notificationSyncToastTimerId) {
+      clearTimeout(notificationSyncToastTimerId);
+      notificationSyncToastTimerId = null;
+    }
+    text.textContent = message;
+    toast.classList.toggle('is-loading', state === 'loading');
+    toast.classList.toggle('is-error', state === 'error');
+    toast.classList.add('is-visible');
+
+    if (state !== 'loading') {
+      notificationSyncToastTimerId = setTimeout(() => {
+        toast.classList.remove('is-visible');
+        notificationSyncToastTimerId = null;
+      }, 7000);
+    }
   }
 
   function notifyNewNotifications(data) {
@@ -1072,7 +1427,7 @@ function toggleGroup(viewMode, groupKey) {
       return 'unknown';
     }
 
-    const now = new Date();
+    const now = getDeadlineReferenceNow();
 
     if (deadline < now) {
       return 'expired';
@@ -1128,8 +1483,22 @@ function toggleGroup(viewMode, groupKey) {
       }
     }
 
-    date.setHours(hour, minute, 0, 0);
+    // Mail and due-time inputs have minute precision. Keep that minute open
+    // through its final millisecond (for example, 23:59 means until midnight).
+    date.setHours(hour, minute, 59, 999);
 
+    return date;
+  }
+
+  function getDeadlineReferenceNow() {
+    if (!testCaseModeEnabled || !testCaseClockDateTime) return new Date();
+    const match = String(testCaseClockDateTime).match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+    if (!match) return new Date();
+    const date = parseDateKey(`${match[1]}-${match[2]}-${match[3]}`);
+    const hour = Number(match[4]);
+    const minute = Number(match[5]);
+    if (!date || hour > 23 || minute > 59) return new Date();
+    date.setHours(hour, minute, 0, 0);
     return date;
   }
 
@@ -1172,7 +1541,7 @@ function toggleGroup(viewMode, groupKey) {
   }
 
   function getStartOfToday() {
-    const today = new Date();
+    const today = getDeadlineReferenceNow();
     today.setHours(0, 0, 0, 0);
     return today;
   }

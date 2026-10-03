@@ -1,0 +1,9 @@
+.clasp.json
+.clasprc.json
+**/.clasp.json
+**/.clasprc.json
+node_modules/
+**/node_modules/
+local-dev/.data/
+.DS_Store
+**/.DS_Store

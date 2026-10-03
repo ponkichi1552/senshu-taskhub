@@ -5,8 +5,7 @@ function getUniversityNoticesForWeb() {
 function getUniversityNoticesForWebLocked_() {
   const now = new Date();
   const states = PropertiesService.getUserProperties().getProperties();
-  const ss = getOrCreateSpreadsheet_();
-  const sheetsBySource = ensureNotificationStorage_(ss);
+  const sheetsBySource = getNotificationReadSheets_();
 
   const notices = getNotificationRowsFromSheets_(sheetsBySource)
     .filter(row => isUniversityNoticeRow_(row))
@@ -14,8 +13,9 @@ function getUniversityNoticesForWebLocked_() {
     .map(row => {
       const notice = rowToUniversityNotice_(row);
       let state = {};
-      const storedState = states['universityNotice:' + notice.messageId] ||
-        (row.originalMessageIdForState ? states['universityNotice:' + row.originalMessageIdForState] : '') || '{}';
+      const statePrefix = getUniversityNoticeStatePrefix_();
+      const storedState = states[statePrefix + notice.messageId] ||
+        (row.originalMessageIdForState ? states[statePrefix + row.originalMessageIdForState] : '') || '{}';
       try { state = JSON.parse(storedState); } catch (_) {}
       return Object.assign(notice, {read: Boolean(state.read), saved: Boolean(state.saved)});
     })
@@ -66,8 +66,12 @@ function setUniversityNoticeState(messageId, state) {
 
 function setUniversityNoticeStateLocked_(messageId, state) {
   if (typeof messageId !== 'string' || !messageId || messageId.length > 200 || !state || typeof state.read !== 'boolean' || typeof state.saved !== 'boolean') throw new Error('Invalid notice state');
-  PropertiesService.getUserProperties().setProperty('universityNotice:' + messageId, JSON.stringify({read: state.read, saved: state.saved}));
+  PropertiesService.getUserProperties().setProperty(getUniversityNoticeStatePrefix_() + messageId, JSON.stringify({read: state.read, saved: state.saved}));
   return true;
+}
+
+function getUniversityNoticeStatePrefix_() {
+  return isTestCaseModeEnabled_() ? 'universityNotice:test:' : 'universityNotice:';
 }
 
 // All visibility boundaries use Japan time, independent of the script timezone.
