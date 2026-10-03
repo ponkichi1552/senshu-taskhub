@@ -1,0 +1,227 @@
+<script>
+  function getErrorMessage(error) {
+    return error && error.message ? error.message : String(error);
+  }
+
+  function loadTestCaseClockState() {
+    google.script.run
+      .withSuccessHandler(applyTestCaseClockState)
+      .withFailureHandler(error => console.error(error))
+      .getTestCaseClockStateForWeb();
+  }
+
+  function applyTestCaseClockState(state) {
+    const value = state || {};
+    testCaseModeEnabled = Boolean(value.testCaseModeEnabled);
+    testCaseClockDateTime = String(value.testCaseClockDateTime || '');
+    testCaseClockPresets = Array.isArray(value.testCaseClockPresets) ? value.testCaseClockPresets.slice() : [];
+    renderTestCaseClockControls();
+    updateTestClockHeaderButton();
+    if (notificationData.active.length || notificationData.completed.length) refreshCurrentView();
+  }
+
+  function loadHomeNotifications() {
+    requestNotificationData('active', {
+      remember: true,
+      homeSync: true,
+      loadingStatusText: '一覧を読み込み中...',
+      syncLabel: '一覧更新'
+    });
+  }
+
+  function showHomeView() {
+    currentScreen = 'home';
+    currentViewMode = 'active';
+    closeCourseFilterPanel();
+    setAppView('home');
+    refreshCurrentView();
+  }
+
+  function showAssignmentView(viewMode = 'active') {
+    currentScreen = viewMode === 'completed' ? 'completed' : 'active';
+    currentViewMode = currentScreen;
+    setAppView('assignment');
+    refreshCurrentView();
+  }
+
+  function setAppView(viewName) {
+    document.getElementById('university-view').classList.toggle('is-active', viewName === 'university');
+    const homeView = document.getElementById('home-view');
+    const assignmentView = document.getElementById('assignment-view');
+
+    if (homeView) {
+      homeView.classList.toggle('is-active', viewName === 'home');
+    }
+
+    if (assignmentView) {
+      assignmentView.classList.toggle('is-active', viewName === 'assignment');
+    }
+    updateTestClockHeaderButton();
+  }
+
+  function updateHomeSyncText(label = '一覧更新') {
+    const syncText = document.getElementById('home-sync-text');
+
+    if (!syncText) {
+      return;
+    }
+
+    const now = new Date();
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+
+    syncText.textContent = `${label} ${hours}:${minutes}`;
+  }
+
+  function renderHome() {
+    renderHomeDueCard();
+  }
+
+  function renderHomeDueCard() {
+    const container = document.getElementById('home-due-card');
+
+    if (!container) {
+      return;
+    }
+
+    const activeData = homeRawData;
+    const groups = groupNotificationsByDue(activeData);
+    const homeGroups = [
+      getHomeDueGroup(groups, 'today', '今日まで'),
+      getHomeDueGroup(groups, 'tomorrow', '明日まで'),
+      getHomeDueGroup(groups, 'thisWeek', '今週中')
+    ];
+
+    container.innerHTML = homeGroups.map(group => getHomeDueGroupHtml(group)).join('');
+  }
+
+  function getHomeDueGroup(groups, key, label) {
+    const group = groups.find(item => item.key === key);
+
+    return {
+      key,
+      label,
+      items: group ? group.items : []
+    };
+  }
+
+  function getHomeDueGroupHtml(group) {
+    const count = group.items.length;
+    const isExpanded = expandedHomeDueGroup === group.key && count > 0;
+    const rowClasses = [
+      'home-due-row',
+      count === 0 ? 'is-empty' : '',
+      group.key === 'today' && count > 0 ? 'is-urgent' : ''
+    ].filter(Boolean).join(' ');
+    const ariaExpanded = count > 0 ? String(isExpanded) : 'false';
+    const onclick = count > 0 ? ` onclick="toggleHomeDueGroup('${group.key}')"` : '';
+    const arrow = count > 0 ? (isExpanded ? '⌃' : '⌄') : '';
+
+    return `
+      <button class="${rowClasses}" type="button" aria-expanded="${ariaExpanded}"${onclick}>
+        <span>${escapeHtml(group.label)}</span>
+        <span class="home-due-count">${count}件</span>
+        <span class="home-due-arrow">${arrow}</span>
+      </button>
+      <div class="home-due-items${isExpanded ? ' is-open' : ''}">
+        ${getHomeDueItemsHtml(group.items)}
+      </div>
+    `;
+  }
+
+  function getHomeDueItemsHtml(items) {
+    if (!items || items.length === 0) {
+      return '';
+    }
+
+    const courseCounts = new Map();
+
+    items.forEach(item => {
+      const courseName = getCourseName(item);
+      courseCounts.set(courseName, (courseCounts.get(courseName) || 0) + 1);
+    });
+
+    return Array.from(courseCounts.entries()).map(([courseName, count]) => {
+      return `
+        <div class="home-due-item">
+          <span class="home-due-course">${escapeHtml(courseName)}</span>
+          <span>${count}件</span>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function toggleHomeDueGroup(groupKey) {
+    expandedHomeDueGroup = expandedHomeDueGroup === groupKey ? null : groupKey;
+    renderHomeDueCard();
+  }
+
+  function openUnknownDueAssignments() {
+    loadNotifications();
+  }
+
+  function showHelpOnFirstVisit() {
+    if (localStorage.getItem(HELP_SEEN_KEY) === 'true') {
+      return;
+    }
+
+    openHelpModal();
+  }
+
+  function openHelpModal() {
+    const backdrop = document.getElementById('help-modal-backdrop');
+
+    if (backdrop) {
+      backdrop.classList.add('is-open');
+    }
+  }
+
+  function closeHelpModal() {
+    const backdrop = document.getElementById('help-modal-backdrop');
+
+    if (backdrop) {
+      backdrop.classList.remove('is-open');
+    }
+
+    localStorage.setItem(HELP_SEEN_KEY, 'true');
+  }
+
+  function openSecurityModal() {
+    const backdrop = document.getElementById('security-modal-backdrop');
+
+    if (backdrop) {
+      backdrop.classList.add('is-open');
+    }
+
+    loadSecuritySettings();
+  }
+
+  function closeSecurityModal() {
+    const backdrop = document.getElementById('security-modal-backdrop');
+    const tokenInput = document.getElementById('security-api-token');
+    const toggleButton = document.getElementById('security-token-toggle');
+    const copyButton = document.getElementById('security-token-copy');
+
+    if (backdrop) {
+      backdrop.classList.remove('is-open');
+    }
+
+    if (tokenInput) {
+      tokenInput.value = '';
+      tokenInput.type = 'password';
+      tokenInput.dataset.hasFullToken = 'false';
+    }
+
+    if (toggleButton) {
+      toggleButton.disabled = true;
+      toggleButton.textContent = '表示';
+    }
+
+    if (copyButton) {
+      copyButton.disabled = true;
+    }
+
+    securityTokenVisible = false;
+    setSecurityMessage('');
+  }
+</script>

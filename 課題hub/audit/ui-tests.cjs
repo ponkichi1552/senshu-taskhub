@@ -53,7 +53,12 @@ function fixture(fixedNow, {holdBoot = false} = {}) {
     google: {script}, console: {error() {}}, alert: message => alerts.push(message),
     setInterval() {}, setTimeout(callback) {timers.push(callback); return timers.length;}, clearTimeout() {}
   });
-  for (const file of ['UniversityScripts.html', 'Scripts.html']) {
+  const scriptFiles = [
+    'UniversityScripts.html', 'Scripts.html', 'ScriptsHome.html', 'ScriptsSettings.html',
+    'ScriptsSync.html', 'ScriptsCourseFilter.html', 'ScriptsRendering.html',
+    'ScriptsActions.html', 'ScriptsBoot.html'
+  ];
+  for (const file of scriptFiles) {
     vm.runInContext(fs.readFileSync(path.join(sourceDir, file), 'utf8').replace(/<\/?script>/g, ''), context, {filename: file});
   }
   if (!holdBoot) {

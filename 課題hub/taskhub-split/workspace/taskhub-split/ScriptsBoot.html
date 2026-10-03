@@ -1,0 +1,15 @@
+<script>
+  groupOpenState = getGroupOpenState();
+
+  updateBottomNavState();
+  renderHome();
+  loadTestCaseClockState();
+  loadHomeNotifications();
+  showHelpOnFirstVisit();
+
+  setInterval(() => {
+    if (currentScreen === 'active' || currentScreen === 'home') {
+      refreshNotifications();
+    }
+  }, AUTO_REFRESH_INTERVAL);
+</script>

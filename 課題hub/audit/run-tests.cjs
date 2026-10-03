@@ -28,6 +28,13 @@ for (const name of fs.readdirSync(canonical)) {
   assert.deepEqual(fs.readFileSync(path.join(canonical, name)), fs.readFileSync(path.join(mirror, name)), `Mirror mismatch: ${name}`);
 }
 console.log(`PASS syntax (${scripts} scripts) and canonical/mirror equality`);
+const indexTemplate = fs.readFileSync(path.join(canonical, 'Index.html'), 'utf8');
+const includedTemplates = [...indexTemplate.matchAll(/include\(['"]([^'"]+)['"]\)/g)].map(match => match[1]);
+for (const name of includedTemplates) assert.ok(fs.existsSync(path.join(canonical, name + '.html')), `Missing HTML include: ${name}`);
+for (const name of ['Scripts', 'ScriptsHome', 'ScriptsSettings', 'ScriptsSync', 'ScriptsCourseFilter', 'ScriptsRendering', 'ScriptsActions', 'ScriptsBoot', 'Styles', 'StylesDialogs', 'StylesHome']) {
+  assert.ok(includedTemplates.includes(name), `Index.html does not include module: ${name}`);
+}
+console.log('PASS all split style and script modules are included by Index.html');
 const appsscriptManifest = JSON.parse(fs.readFileSync(path.join(canonical, 'appsscript.json'), 'utf8'));
 assert.equal(appsscriptManifest.webapp.executeAs, 'USER_ACCESSING');
 assert.equal(appsscriptManifest.webapp.access, 'DOMAIN');

@@ -7,7 +7,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const assert = require('node:assert/strict');
 const base = path.resolve(__dirname, '..');
-const source = ['Code.gs', 'UniversityNotices.gs'].map(name => fs.readFileSync(path.join(base, 'taskhub-split/taskhub-split', name), 'utf8')).join('\n');
+const gasSourceDir = path.join(base, 'taskhub-split/taskhub-split');
+const gasFiles = fs.readdirSync(gasSourceDir).filter(name => name.endsWith('.gs'))
+  .sort((a, b) => a === 'Code.gs' ? -1 : b === 'Code.gs' ? 1 : a.localeCompare(b));
+const source = gasFiles.map(name => fs.readFileSync(path.join(gasSourceDir, name), 'utf8')).join('\n');
 const results = [];
 const clone = value => value instanceof Date ? new Date(value) : Array.isArray(value) ? value.map(clone) : value;
 function check(name, fn) {try {fn(); results.push({name, passed: true});} catch (error) {results.push({name, passed: false, error: error.stack});}}

@@ -1,0 +1,292 @@
+<script>
+  function requestNotificationData(viewMode, options = {}) {
+    const requestId = ++notificationRequestIds[viewMode];
+    const statusGeneration = notificationStatusGeneration;
+    const list = document.getElementById('list');
+    const syncText = document.getElementById('home-sync-text');
+    const isCurrentRequest = () => requestId === notificationRequestIds[viewMode]
+      && statusGeneration === notificationStatusGeneration;
+
+    if (options.loadingText && currentScreen === viewMode) {
+      list.textContent = options.loadingText;
+    }
+    if (options.homeSync && syncText) {
+      syncText.textContent = options.loadingStatusText || '一覧を読み込み中...';
+    }
+
+    const runner = google.script.run
+      .withSuccessHandler(data => {
+        if (!isCurrentRequest()) {
+          if (typeof options.onStale === 'function') options.onStale(data, false);
+          return;
+        }
+        const items = options.structuredResult
+          ? (data && Array.isArray(data.items) ? data.items : [])
+          : data;
+        setNotificationData(items, viewMode);
+        if (options.remember) rememberExistingNotifications(items);
+        if (options.notify) notifyNewNotifications(notificationData[viewMode]);
+        if (viewMode === 'active') {
+          const syncLabel = typeof options.syncLabelForResult === 'function'
+            ? options.syncLabelForResult(data)
+            : options.syncLabel || '一覧更新';
+          updateHomeSyncText(syncLabel);
+        }
+        if (typeof options.onSuccess === 'function') options.onSuccess(data, items);
+      })
+      .withFailureHandler(error => {
+        if (!isCurrentRequest()) {
+          if (typeof options.onStale === 'function') options.onStale(error, true);
+          return;
+        }
+        console.error(error);
+        if (options.loadingText && currentScreen === viewMode) {
+          list.textContent = 'エラーが発生しました：' + getErrorMessage(error);
+        }
+        if (viewMode === 'active' && syncText) syncText.textContent = '同期失敗';
+        if (typeof options.onFailure === 'function') options.onFailure(error);
+      });
+    const method = options.method || (viewMode === 'completed'
+      ? 'getCompletedNotificationsForWeb' : 'getNotificationsForWeb');
+    runner[method]();
+  }
+
+  function rebuildNotifications() {
+    requestNotificationData('active', {
+      method: 'rebuildAndGetNotificationsForWeb',
+      loadingText: '通知一覧を再構築中...', remember: true
+    });
+  }
+
+  function loadNotifications() {
+    closeCourseFilterPanel();
+    showAssignmentView('active');
+    if (notificationSyncInFlight) return;
+    requestNotificationData('active', {loadingText: '読み込み中...', remember: true});
+  }
+
+  function loadCompletedNotifications() {
+    closeCourseFilterPanel();
+    showAssignmentView('completed');
+    requestNotificationData('completed', {loadingText: '完了済み一覧を読み込み中...'});
+  }
+
+  function refreshNotifications() {
+    // The 15-minute server trigger owns Gmail ingestion. Open tabs only reread
+    // the saved sheet so each tab does not launch another full Gmail scan.
+    if (notificationSyncInFlight) return;
+    requestNotificationData('active', {notify: true});
+  }
+
+  function requestBrowserNotificationPermission() {
+    if (!('Notification' in window)) {
+      alert('このブラウザは通知に対応していません。');
+      return;
+    }
+
+    Notification.requestPermission().then(permission => {
+      if (permission === 'granted') {
+        alert('ブラウザ通知を許可しました。');
+      } else {
+        alert('ブラウザ通知が許可されませんでした。');
+      }
+    });
+  }
+
+  function manualRefreshNotifications() {
+    if (currentScreen === 'completed') {
+      requestNotificationData('completed', {loadingText: '完了済み一覧を更新中...'});
+      return;
+    }
+
+    if (notificationSyncInFlight) {
+      showSyncToast('メール同期を実行中です。完了すると一覧が更新されます。', 'loading');
+      return;
+    }
+
+    notificationSyncInFlight = true;
+    setManualSyncButtonBusy(true);
+    showSyncToast('メールを同期しています。画面はそのまま操作できます。', 'loading');
+    requestNotificationData('active', {
+      method: 'syncAndGetNotificationsForWeb',
+      structuredResult: true,
+      notify: true,
+      homeSync: true,
+      loadingStatusText: 'メールを同期中...',
+      syncLabelForResult: result => result && result.testCaseModeEnabled
+        ? '個人用Excel同期済み'
+        : 'メール同期済み',
+      onSuccess: result => {
+        finishManualSync();
+        if (result && result.syncSkipped) {
+          const reason = String(result.syncSkipReason || '保存Excelの基準日時が確認できません。');
+          showSyncToast(`更新を見送りました：${reason}`, 'error');
+          return;
+        }
+        const savedCount = Number(result && result.savedCount || 0);
+        const summary = result && result.testCaseModeEnabled
+          ? `テスト表示を更新しました。個人用Excelに新着メール${savedCount}件を保存しました。`
+          : savedCount > 0
+            ? `更新完了：新着メール${savedCount}件を取り込みました。`
+            : '更新完了：新着メールはありません。';
+        showSyncToast(summary, 'success');
+      },
+      onFailure: error => {
+        finishManualSync();
+        showSyncToast(`更新に失敗しました：${getErrorMessage(error)}`, 'error');
+      },
+      onStale: (result, failed) => {
+        finishManualSync();
+        if (failed) {
+          showSyncToast(`更新に失敗しました：${getErrorMessage(result)}`, 'error');
+        } else {
+          showSyncToast('メール同期は完了しました。切替後の一覧を表示しています。', 'success');
+          if (currentScreen !== 'university') {
+            const viewMode = currentScreen === 'completed' ? 'completed' : 'active';
+            requestNotificationData(viewMode, {remember: viewMode === 'active'});
+          }
+        }
+      }
+    });
+  }
+
+  function setManualSyncButtonBusy(isBusy) {
+    const button = document.getElementById('manual-refresh-button');
+    if (!button) return;
+    button.disabled = Boolean(isBusy);
+    button.textContent = isBusy ? '同期中...' : '更新';
+  }
+
+  function finishManualSync() {
+    notificationSyncInFlight = false;
+    setManualSyncButtonBusy(false);
+  }
+
+  function showSyncToast(message, state = 'success') {
+    const toast = document.getElementById('sync-toast');
+    const text = document.getElementById('sync-toast-message');
+    if (!toast || !text) return;
+
+    if (notificationSyncToastTimerId) {
+      clearTimeout(notificationSyncToastTimerId);
+      notificationSyncToastTimerId = null;
+    }
+    text.textContent = message;
+    toast.classList.toggle('is-loading', state === 'loading');
+    toast.classList.toggle('is-error', state === 'error');
+    toast.classList.add('is-visible');
+
+    if (state !== 'loading') {
+      notificationSyncToastTimerId = setTimeout(() => {
+        toast.classList.remove('is-visible');
+        notificationSyncToastTimerId = null;
+      }, 7000);
+    }
+  }
+
+  function notifyNewNotifications(data) {
+    if (!('Notification' in window)) {
+      return;
+    }
+
+    if (Notification.permission !== 'granted') {
+      return;
+    }
+
+    const notifiedIds = getNotifiedIds();
+    const notifications = Array.isArray(data) ? data : [];
+
+    const newNotifications = notifications.filter(item => {
+      const messageId = String(item.messageId || '');
+
+      return isNotifiableNotification(item)
+        && messageId
+        && !notifiedIds.has(messageId);
+    });
+
+    newNotifications.forEach(item => {
+      const messageId = String(item.messageId || '');
+
+      new Notification('新しい課題通知', {
+        body: `${item.courseName || '授業名未抽出'}\n${item.title || 'タイトル未抽出'}\n期限：${item.dueDate || '未検出'}`
+      });
+
+      notifiedIds.add(messageId);
+    });
+
+    saveNotifiedIds(notifiedIds);
+  }
+
+  function rememberExistingNotifications(data) {
+    const notifiedIds = getNotifiedIds();
+    const notifications = Array.isArray(data) ? data : [];
+
+    notifications.forEach(item => {
+      const messageId = String(item.messageId || '');
+
+      if (isNotifiableNotification(item) && messageId) {
+        notifiedIds.add(messageId);
+      }
+    });
+
+    saveNotifiedIds(notifiedIds);
+  }
+
+  function isNotifiableNotification(item) {
+    if (!item || !item.messageId || item.status === '完了') {
+      return false;
+    }
+
+    return item.source === 'Google Classroom' || item.source === 'inCampus';
+  }
+
+  function getNotifiedIds() {
+    const saved = localStorage.getItem(NOTIFIED_IDS_KEY);
+
+    if (!saved) {
+      return new Set();
+    }
+
+    try {
+      return new Set(JSON.parse(saved));
+    } catch (e) {
+      return new Set();
+    }
+  }
+
+  function saveNotifiedIds(ids) {
+    const array = Array.from(ids).slice(-500);
+    localStorage.setItem(NOTIFIED_IDS_KEY, JSON.stringify(array));
+  }
+
+  function refreshCurrentView() {
+    homeRawData = notificationData.active;
+    if (currentScreen === 'home') {
+      currentViewMode = 'active';
+      currentRawData = notificationData.active;
+      renderHome();
+    } else if (currentScreen === 'active' || currentScreen === 'completed') {
+      currentViewMode = currentScreen;
+      currentRawData = notificationData[currentScreen];
+      if (!hasCourseName(currentRawData, selectedCourseName)) selectedCourseName = 'すべて';
+      renderCourseFilterList();
+      renderFilteredNotifications();
+      updateActiveFilterBar();
+    }
+
+    updateBottomNavState();
+  }
+
+  function setNotificationData(data, viewMode = 'active') {
+    notificationData[viewMode] = Array.isArray(data) ? data.slice() : [];
+    // Reads may finish while a status change is still in flight. Preserve the
+    // latest local intent until the serialized writes finish and we read again.
+    notificationStatusChanges.forEach((change, messageId) => {
+      applyNotificationStatusToCache(messageId, change.desiredDone, change.item);
+    });
+    homeRawData = notificationData.active;
+    if (currentScreen === viewMode || (viewMode === 'active' && currentScreen === 'home')) {
+      refreshCurrentView();
+    }
+  }
+</script>

@@ -102,6 +102,8 @@ Classroomの読み込み途中やタイムアウトを「0件の同期成功」�
 - [拡張機能の導入・設定方法](./課題hub/taskhub-extension-v2.5/README.md)
 - [開発・改修履歴](./CHANGELOG.md)
 
+Apps Scriptサーバーは `Code.gs` に共有設定と入口を置き、メール同期・通知解析・一覧処理・拡張機能連携を機能別の `.gs` ファイルに分けています。画面側も `Scripts*.html` と `Styles*.html` に分け、`Index.html` が読み込み順を管理します。
+
 ## セットアップ概要
 
 1. Apps Script Webアプリ本体のファイルをApps Scriptプロジェクトへ反映し、Webアプリとしてデプロイします。

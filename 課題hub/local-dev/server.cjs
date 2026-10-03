@@ -568,7 +568,9 @@ function createContext() {
       createHtmlOutputFromFile(name) { return {getContent: () => fs.readFileSync(path.join(GAS_DIR, name + '.html'), 'utf8')}; }
     }
   });
-  const code = ['Code.gs', 'UniversityNotices.gs'].map(name => fs.readFileSync(path.join(GAS_DIR, name), 'utf8')).join('\n');
+  const gasFiles = fs.readdirSync(GAS_DIR).filter(name => name.endsWith('.gs'))
+    .sort((a, b) => a === 'Code.gs' ? -1 : b === 'Code.gs' ? 1 : a.localeCompare(b));
+  const code = gasFiles.map(name => fs.readFileSync(path.join(GAS_DIR, name), 'utf8')).join('\n');
   vm.runInContext(code, context, {filename: 'taskhub-gas-local.vm.js'});
   return context;
 }
@@ -615,9 +617,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/__local') return send(res, 200, dashboard(), 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/__local/data') return send(res, 200, JSON.stringify(encode(state), null, 2), 'application/json; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/__local/copy') {
-      const filename = ({c: 'Code.gs', s: 'Scripts.html', u: 'UniversityScripts.html'})[url.searchParams.get('id')];
-      if (!filename) return send(res, 404, 'Not found', 'text/plain; charset=utf-8');
-      const escaped = fs.readFileSync(path.join(GAS_DIR, filename), 'utf8')
+      const sourceFiles = ({
+        c: ['Code.gs', ...fs.readdirSync(GAS_DIR).filter(name => name.endsWith('.gs') && name !== 'Code.gs')],
+        s: ['Scripts.html', 'ScriptsHome.html', 'ScriptsSettings.html', 'ScriptsSync.html', 'ScriptsCourseFilter.html', 'ScriptsRendering.html', 'ScriptsActions.html', 'ScriptsBoot.html'],
+        u: ['UniversityScripts.html']
+      })[url.searchParams.get('id')];
+      if (!sourceFiles) return send(res, 404, 'Not found', 'text/plain; charset=utf-8');
+      const escaped = sourceFiles.map(filename => fs.readFileSync(path.join(GAS_DIR, filename), 'utf8')).join('\n')
         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       const page = `<!doctype html><meta charset="utf-8"><title>ローカルソースのコピー</title><textarea autofocus readonly style="width:98vw;height:96vh;white-space:pre;font:12px monospace">${escaped}</textarea>`;
       return send(res, 200, page, 'text/html; charset=utf-8');
