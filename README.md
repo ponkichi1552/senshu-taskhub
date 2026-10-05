@@ -1,6 +1,12 @@
 # 課題通知Hub
 
-Google Classroomの授業・課題・本人の提出状況をClassroom APIから取得し、Gmail通知とinCampusのお知らせをまとめて確認するWebアプリです。Classroom APIの課題情報を基準にし、Gmailを短い間隔で取り込んで通知内容やAPIにない情報を補います。inCampus通知と拡張機能の抽出結果は厳密に照合して表示します。データは利用者ごとのGoogleスプレッドシートに保存します。
+Google Classroom API、Gmail、Chrome拡張機能を組み合わせ、Google Classroomと専修大学inCampusの課題・通知を一元管理するWebアプリです。
+
+Classroomの授業・課題・本人の提出状態はGoogle Classroom APIから取得し、Gmailを15分ごとに同期して新着課題やAPIにない通知を補完します。inCampusはメール通知とChrome拡張機能から取得した情報を照合し、締切順にまとめて表示します。
+
+同じ課題を複数の経路から取得した場合は、ID・URL・授業名・課題名などを使って照合し、一意に一致した場合だけ一つの課題として統合します。曖昧な一致では締切や完了状態を変更しません。
+
+データは利用者ごとのGoogleスプレッドシートに保存します。
 
 個人開発を主体としたプロジェクトで、一部のUI・ホーム画面のデザインは共同で検討・制作しています。専修大学、Googleの公式サービスではありません。inCampus連携は専修大学の環境を対象としています。
 
