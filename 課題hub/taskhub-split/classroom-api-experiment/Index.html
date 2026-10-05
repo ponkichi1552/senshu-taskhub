@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <base target="_top">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <?!= include('Styles'); ?>
+    <?!= include('StylesDialogs'); ?>
+    <?!= include('StylesHome'); ?>
+  </head>
+
+  <body>
+    <?!= include('Home'); ?>
+
+    <section id="assignment-view" class="app-view assignment-view" aria-label="課題通知一覧">
+      <header>
+        <span>課題通知Hub</span>
+        <div class="header-actions">
+          <button id="header-test-clock-button" class="refresh-button test-clock-header-button" type="button" onclick="openTestClockModal()" hidden>テスト日時</button>
+          <button class="refresh-button" onclick="requestBrowserNotificationPermission()">通知許可</button>
+          <button class="refresh-button help-button" onclick="openHelpModal()" aria-label="使い方を開く">？</button>
+          <button id="manual-refresh-button" class="refresh-button" onclick="manualRefreshNotifications()">更新</button>
+        </div>
+      </header>
+
+      <main>
+        <div id="active-filter-bar" class="active-filter-bar">
+          <span id="active-filter-text" class="active-filter-text"></span>
+          <button class="active-filter-clear" onclick="clearCourseFilter()">解除</button>
+        </div>
+
+        <div id="list" class="loading">読み込み中...</div>
+      </main>
+    </section>
+
+    <div id="course-filter-backdrop" class="course-filter-backdrop" onclick="closeCourseFilterPanel()"></div>
+
+    <section id="course-filter-panel" class="course-filter-panel" aria-label="授業フィルター">
+      <div class="course-filter-header">
+        <span>授業フィルター</span>
+        <button class="course-filter-close" onclick="closeCourseFilterPanel()">閉じる</button>
+      </div>
+      <div id="course-filter-list" class="course-filter-list"></div>
+    </section>
+
+    <nav class="bottom-nav" aria-label="画面切り替え">
+      <button id="bottom-home-button" class="bottom-nav-button" onclick="loadNotifications()">課題通知</button>
+      <button id="bottom-active-button" class="bottom-nav-button" type="button" onclick="showUniversityNotices()">大学からのお知らせ</button>
+      <button id="bottom-completed-button" class="bottom-nav-button" type="button" disabled>大学情報まとめ</button>
+      <button id="bottom-course-button" class="bottom-nav-button" type="button" disabled>過去問データベース</button>
+    </nav>
+
+    <div id="undo-toast" class="undo-toast" role="status" aria-live="polite">
+      <span id="undo-toast-message" class="undo-toast-message">完了済みに移動しました。</span>
+      <button class="undo-toast-button" onclick="undoLastDone()">取消</button>
+    </div>
+
+    <div id="sync-toast" class="sync-toast" role="status" aria-live="polite">
+      <span id="sync-toast-message" class="sync-toast-message"></span>
+    </div>
+
+    <div id="help-modal-backdrop" class="help-modal-backdrop" onclick="closeHelpModal()">
+      <section class="help-modal" aria-label="課題通知Hubの使い方" onclick="event.stopPropagation()">
+        <div class="help-modal-header">
+          <span>課題通知Hubの使い方</span>
+          <button class="help-modal-close" onclick="closeHelpModal()">閉じる</button>
+        </div>
+        <div class="help-modal-body">
+          <ul>
+            <li>ClassroomやinCampusの通知を、期限ごとに整理して表示します。</li>
+            <li>「課題を開く」から、Classroomの該当ページへ移動できます。</li>
+            <li>「詳細」を押すと、保存された通知本文を確認できます。</li>
+            <li>授業ごとに絞りたい時は、画面下の「フィルター」を使ってください。</li>
+            <li>通知許可を押すと、新しい課題通知をブラウザ通知で受け取れます。</li>
+          </ul>
+          <div class="help-modal-note">
+            「完了」はこのアプリ内だけの管理状態です。Classroomへの提出完了ではありません。
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div id="security-modal-backdrop" class="security-modal-backdrop" onclick="closeSecurityModal()">
+      <section class="security-modal" aria-label="設定" onclick="event.stopPropagation()">
+        <div class="security-modal-header">
+          <span>設定</span>
+          <button class="security-modal-close" onclick="closeSecurityModal()">閉じる</button>
+        </div>
+        <div class="security-modal-body">
+          <section class="settings-section" aria-labelledby="security-section-title">
+            <h2 id="security-section-title">セキュリティ設定</h2>
+            <div class="security-status-row">
+              <span>外部POST保護</span>
+              <strong id="security-auth-status">確認中</strong>
+            </div>
+
+            <label class="security-label" for="security-api-token">APIトークン</label>
+            <div class="security-token-row">
+              <input id="security-api-token" class="security-token-input" type="password" readonly value="読み込み中...">
+              <button id="security-token-toggle" class="security-secondary-button" onclick="toggleSecurityTokenVisibility()" disabled>表示</button>
+              <button id="security-token-copy" class="security-secondary-button" onclick="copySecurityToken()" disabled>コピー</button>
+            </div>
+
+            <div class="security-hint">
+              トークン本体は再発行直後だけ表示できます。拡張機能へ設定する場合は、その場でコピーしてください。
+            </div>
+
+            <button class="security-danger-button" onclick="rotateSecurityToken()">トークンを再発行</button>
+          </section>
+
+          <section class="settings-section" aria-labelledby="test-mode-section-title">
+            <h2 id="test-mode-section-title">テストケース適用</h2>
+            <div class="test-mode-row">
+              <div>
+                <strong id="test-mode-status">確認中</strong>
+                <div id="test-mode-hint" class="security-hint">テストケース用スプレッドシートを確認しています。</div>
+              </div>
+              <label class="test-mode-switch" aria-label="テストケース適用 ON/OFF">
+                <input id="test-mode-toggle" type="checkbox" onchange="toggleTestCaseMode(this.checked)" disabled>
+                <span class="test-mode-slider" aria-hidden="true"></span>
+              </label>
+            </div>
+          </section>
+          <section class="settings-section" aria-labelledby="test-clock-settings-title">
+            <h2 id="test-clock-settings-title">テスト判定日時</h2>
+            <label class="security-label" for="settings-test-clock-preset">日時を選択</label>
+            <select id="settings-test-clock-preset" class="test-clock-select" onchange="syncTestClockCustomInput('settings')">
+              <option value="current">実際の現在日時を使う</option>
+            </select>
+            <label class="security-label test-clock-custom-label" for="settings-test-clock-custom">または任意の日本時間を指定</label>
+            <input id="settings-test-clock-custom" class="test-clock-input" type="datetime-local" step="60" oninput="selectCustomTestClock('settings')">
+            <div class="test-clock-actions">
+              <button class="security-secondary-button" type="button" onclick="applyTestClockSelection('settings')">日時を適用</button>
+              <button class="security-secondary-button" type="button" onclick="applyCurrentTestClock('settings')">実時間に戻す</button>
+            </div>
+            <div id="settings-test-clock-current" class="security-hint" aria-live="polite">設定中の日時を確認しています。</div>
+            <div id="settings-test-clock-message" class="test-clock-message" role="status" aria-live="polite"></div>
+            <div class="security-hint">選んだ日時はテストケースON時の期限分類に使います。受信日時の記録や本番メール同期時刻は変更しません。</div>
+          </section>
+          <div id="security-message" class="security-message" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+    </div>
+
+    <div id="test-clock-modal-backdrop" class="test-clock-modal-backdrop" onclick="closeTestClockModal()">
+      <section class="test-clock-modal" role="dialog" aria-modal="true" aria-labelledby="test-clock-modal-title" onclick="event.stopPropagation()">
+        <div class="test-clock-modal-header">
+          <span id="test-clock-modal-title">テスト判定日時</span>
+          <button class="security-modal-close" type="button" onclick="closeTestClockModal()">閉じる</button>
+        </div>
+        <div class="test-clock-modal-body">
+          <label class="security-label" for="header-test-clock-preset">日時を選択</label>
+          <select id="header-test-clock-preset" class="test-clock-select" onchange="syncTestClockCustomInput('header')">
+            <option value="current">実際の現在日時を使う</option>
+          </select>
+          <label class="security-label test-clock-custom-label" for="header-test-clock-custom">または任意の日本時間を指定</label>
+          <input id="header-test-clock-custom" class="test-clock-input" type="datetime-local" step="60" oninput="selectCustomTestClock('header')">
+          <div class="test-clock-actions">
+            <button class="security-secondary-button" type="button" onclick="applyTestClockSelection('header')">日時を適用</button>
+            <button class="security-secondary-button" type="button" onclick="applyCurrentTestClock('header')">実時間に戻す</button>
+          </div>
+          <div id="header-test-clock-current" class="security-hint" aria-live="polite">設定中の日時を確認しています。</div>
+          <div id="header-test-clock-message" class="test-clock-message" role="status" aria-live="polite"></div>
+          <div class="security-hint">日時を変えるとテスト用の課題を再読込します。メールの同期は行いません。</div>
+        </div>
+      </section>
+    </div>
+
+    <?!= include('UniversityView'); ?>
+    <?!= include('UniversityScripts'); ?>
+    <?!= include('Scripts'); ?>
+    <?!= include('ScriptsHome'); ?>
+    <?!= include('ScriptsSettings'); ?>
+    <?!= include('ScriptsSync'); ?>
+    <?!= include('ScriptsCourseFilter'); ?>
+    <?!= include('ScriptsRendering'); ?>
+    <?!= include('ScriptsActions'); ?>
+    <?!= include('ScriptsBoot'); ?>
+  </body>
+</html>

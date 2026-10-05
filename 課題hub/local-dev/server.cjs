@@ -21,7 +21,7 @@ const EXCEL_EPOCH_UTC = Date.UTC(1899, 11, 30);
 const TEST_DUE_POSITIONS = new Set(['期限切れ', '今日まで', '明日まで', '今週中', '来週以降']);
 const WEB_METHODS = new Set([
   'getNotificationsForWeb', 'getCompletedNotificationsForWeb',
-  'refreshAndGetNotificationsForWeb', 'markNotificationDone',
+  'refreshAndGetNotificationsForWeb', 'syncAndGetNotificationsForWeb', 'markNotificationDone',
   'markNotificationUndone', 'getUniversityNoticesForWeb',
   'setUniversityNoticeState', 'getSecuritySettingsForWeb', 'rotateApiTokenForWeb',
   'setTestCaseModeForWeb', 'getTestCaseClockStateForWeb', 'setTestCaseClockForWeb'
@@ -176,9 +176,7 @@ async function importTestWorkbookData() {
   let settings;
   try { settings = workbook.worksheets.getItem('テスト設定'); }
   catch { throw new Error('テストケースExcelに「テスト設定」シートがありません。'); }
-  const [workbookStartValue, positionValue, baseValue] = settings.getRange('B2:B4').values.map(row => row[0]);
-  const workbookStartAt = toWorkbookDate(workbookStartValue);
-  if (!workbookStartAt) throw new Error('「テスト設定」B2の開始日時を読み取れません。');
+  const [positionValue, baseValue] = settings.getRange('B3:B4').values.map(row => row[0]);
   const position = String(positionValue || '来週以降');
   if (!TEST_DUE_POSITIONS.has(position)) throw new Error('「テスト設定」B3は期限切れ、今日まで、明日まで、今週中、来週以降のいずれかにしてください。');
   const baseDate = toWorkbookDate(baseValue);
@@ -186,7 +184,6 @@ async function importTestWorkbookData() {
   const configuredTestClock = toWorkbookDate(settings.getRange('B18').values[0][0]);
 
   const startedAt = new Date();
-  const helperDateShift = getCalendarDayNumber(startedAt) - getCalendarDayNumber(workbookStartAt);
   const testClock = configuredTestClock || new Date(startedAt);
   const targetDeadline = getTestTargetDeadline(testClock, position);
   const shiftDays = getCalendarDayNumber(targetDeadline) - getCalendarDayNumber(baseDate);
@@ -197,31 +194,18 @@ async function importTestWorkbookData() {
     const expectedWidth = name === 'inCampus抽出' ? 17 : name === 'テストメール' ? 8 : 16;
     return sheet.getUsedRange().values.map(row => row.slice(0, expectedWidth));
   };
-  const readPreparedTestRows = (name, extracted = false) => {
+  const readFixedTestRows = (name, extracted = false) => {
     let sheet;
     try { sheet = workbook.worksheets.getItem(name); }
     catch { throw new Error(`テストケースExcelに「${name}」シートがありません。`); }
-    const rows = sheet.getUsedRange().values.map(row => row.slice(0, 20));
-    const dateColumns = extracted ? [4, 5, 11, 12, 15, 17, 18, 19] : [0, 5, 9, 13, 16, 17, 18, 19];
+    const width = extracted ? 17 : 16;
+    const rows = sheet.getUsedRange().values.map(row => row.slice(0, width));
+    const dateColumns = extracted ? [4, 5, 11, 12, 15] : [0, 5, 9, 13];
     rows.slice(1).forEach(row => {
       dateColumns.forEach(column => {
         const date = toWorkbookDate(row[column]);
         if (date) row[column] = date;
       });
-      if (extracted) {
-        row[17] = new Date(startedAt);
-        [18, 19].forEach(column => {
-          const date = toWorkbookDate(row[column]);
-          if (date) row[column] = addCalendarDays(date, helperDateShift);
-        });
-      } else {
-        row[16] = new Date(startedAt);
-        row[17] = new Date(startedAt);
-        [18, 19].forEach(column => {
-          const date = toWorkbookDate(row[column]);
-          if (date) row[column] = addCalendarDays(date, helperDateShift);
-        });
-      }
     });
     return rows;
   };
@@ -243,9 +227,12 @@ async function importTestWorkbookData() {
   const classroomRows = readRows('Classroom通知');
   const inCampusRows = readRows('inCampus通知');
   const extractedRows = readRows('inCampus抽出');
-  const testClassroomRows = readPreparedTestRows('テストClassroom');
-  const testInCampusRows = readPreparedTestRows('テストinCampus');
-  const testExtractedRows = readPreparedTestRows('テスト抽出', true);
+  const testClassroomRows = readFixedTestRows('テストClassroom');
+  const testInCampusRows = readFixedTestRows('テストinCampus');
+  const testExtractedRows = readFixedTestRows('テスト抽出', true);
+  const testSettingsRows = settings.getUsedRange().values.map(row => row.slice());
+  if (testSettingsRows[3]) testSettingsRows[3][1] = baseDate;
+  if (testSettingsRows[17]) testSettingsRows[17][1] = testClock;
   const notificationAnchors = updateNotificationRows(classroomRows).concat(updateNotificationRows(inCampusRows));
   const extractedAnchors = [];
   for (let i = 1; i < extractedRows.length; i++) {
@@ -260,6 +247,23 @@ async function importTestWorkbookData() {
     if (completedAt) row[15] = completedAt;
     if (isAnchor) extractedAnchors.push({due: row[5], dueStatus: '拡張機能で抽出'});
   }
+
+  const unifiedHeaders = vm.runInContext('INCAMPUS_UNIFIED_HEADERS', gas);
+  const recordTypeColumn = vm.runInContext('INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN', gas);
+  const extractStartColumn = vm.runInContext('INCAMPUS_UNIFIED_EXTRACT_START_COLUMN', gas);
+  const unifiedInCampusRows = [unifiedHeaders.slice()];
+  inCampusRows.slice(1).forEach(sourceRow => {
+    const row = Array(unifiedHeaders.length).fill('');
+    sourceRow.forEach((value, index) => { row[index] = value; });
+    row[recordTypeColumn] = 'gmail';
+    unifiedInCampusRows.push(row);
+  });
+  extractedRows.slice(1).forEach(sourceRow => {
+    const row = Array(unifiedHeaders.length).fill('');
+    row[recordTypeColumn] = 'extract';
+    sourceRow.forEach((value, index) => { row[extractStartColumn + index] = value; });
+    unifiedInCampusRows.push(row);
+  });
 
   const mailRows = readRows('テストメール').slice(1);
   const testMails = mailRows.map(row => expandTestMailTemplate(row, startedAt, testClock)).filter(Boolean);
@@ -279,17 +283,19 @@ async function importTestWorkbookData() {
   state.testSpreadsheetId = 'local-test-case-workbook';
   state.testClock = testClock.toISOString();
   state.properties.TASKHUB_TEST_CASE_CLOCK = testClock.toISOString();
+  state.properties.TASKHUB_TEST_CASE_SESSION_STARTED_AT = startedAt.toISOString();
   state.gmail = testMails;
   state.sheets = {
-    'Classroom通知': classroomRows,
-    'inCampus通知': inCampusRows,
-    'inCampus抽出': extractedRows
+    '補足通知': classroomRows,
+    'inCampus通知': unifiedInCampusRows
   };
   state.testSheets = {
+    'テスト設定': testSettingsRows,
     'テストClassroom': testClassroomRows,
     'テストinCampus': testInCampusRows,
     'テスト抽出': testExtractedRows
   };
+  const testFixtureBeforeRead = JSON.stringify(encode(state.testSheets));
   gas = createContext();
   const ingestion = gas.saveClassroomMailsToSheet();
   saveState();
@@ -313,8 +319,9 @@ async function importTestWorkbookData() {
     };
   });
   const multiMailItems = notifications.filter(item => item.messageId.startsWith('TEST-INCA-MULTI:'));
-  const submissionAssignmentRow = inCampusRows.find(row => row[1] === 'TEST-INCA-SUBMIT-ASSIGN');
-  const submissionEventRow = inCampusRows.find(row => row[1] === 'TEST-INCA-SUBMIT-EVENT');
+  const storedInCampusRows = state.sheets['inCampus通知'];
+  const submissionAssignmentRow = storedInCampusRows.find(row => row[1] === 'TEST-INCA-SUBMIT-ASSIGN');
+  const submissionEventRow = storedInCampusRows.find(row => row[1] === 'TEST-INCA-SUBMIT-EVENT');
   const submissionAssignment = submissionAssignmentRow
     ? gas.expandInCampusNotificationRow_(submissionAssignmentRow).find(row => row[4] === '同名照合課題' && row[3] === '仮想提出照合')
     : null;
@@ -348,6 +355,7 @@ async function importTestWorkbookData() {
     inCampusSameEmailSplitsDistinctTasks: multiMailItems.length === 2,
     duplicateGmailIdSavedOnce: duplicateInputCount === 1 && classroomRows.filter(row => row[1] === 'TEST-TODAY').length === 1,
     receivedTimestampsSyncedToActualStart: receivedTimestampsSynced,
+    testFixtureDatesRemainFixed: JSON.stringify(encode(state.testSheets)) === testFixtureBeforeRead,
     inCampusSubmissionAppliedToMatchingTask: Boolean(submissionAssignment && submissionAssignment[12] === '完了' && submissionTargets.length === 1 && submissionTargets[0] === submissionAssignment[1]),
     announcementKeptOutOfTaskList: !notifications.some(item => item.messageId === 'TEST-ANNOUNCEMENT') && noticeItems.some(item => item.messageId === 'TEST-ANNOUNCEMENT')
   };
@@ -479,7 +487,9 @@ const testSpreadsheet = createLocalSpreadsheet(() => state.testSpreadsheetId, ()
 function gasFormatDate(value, _zone, pattern) {
   const d = new Date(value);
   const pad = n => String(n).padStart(2, '0');
+  const isoDate = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   const full = `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  if (pattern === 'yyyy-MM-dd') return isoDate;
   if (pattern === 'yyyy/MM/dd HH:mm:ss') return full;
   if (pattern === 'yyyy/MM/dd HH:mm') return full.slice(0, 16);
   if (pattern === 'yyyy/MM/dd') return full.slice(0, 10);
@@ -518,9 +528,20 @@ function createContext() {
     getProperties() { return {...state.properties}; }
   };
   const triggerApi = {
-    getHandlerFunction: () => 'saveClassroomMailsToSheet'
+    handler: '',
+    getHandlerFunction() { return this.handler; }
   };
-  const triggerBuilder = {timeBased() { return this; }, everyMinutes() { return this; }, create() { state.triggers.push('saveClassroomMailsToSheet'); saveState(); return triggerApi; }};
+  const triggerBuilder = handler => {
+    const record = {handler, cadence: '', interval: 0};
+    const trigger = {
+      getHandlerFunction: () => record.handler,
+      timeBased() { return this; },
+      everyMinutes(minutes) { record.cadence = 'minutes'; record.interval = minutes; return this; },
+      everyHours(hours) { record.cadence = 'hours'; record.interval = hours; return this; },
+      create() { state.triggers.push(record); saveState(); return trigger; }
+    };
+    return trigger;
+  };
   const gmailApp = {
     search(_query, offset, limit) {
       const records = state.gmail.slice().sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -557,11 +578,19 @@ function createContext() {
       getUuid: () => crypto.randomUUID(), formatDate: gasFormatDate
     },
     ScriptApp: {
-      getProjectTriggers: () => state.triggers.map(() => triggerApi),
-      newTrigger: () => triggerBuilder,
-      deleteTrigger(trigger) { const i = state.triggers.indexOf(trigger.getHandlerFunction()); if (i >= 0) state.triggers.splice(i, 1); }
+      getProjectTriggers: () => state.triggers.map(record => ({
+        getHandlerFunction: () => typeof record === 'string' ? record : record.handler
+      })),
+      newTrigger: handler => triggerBuilder(handler),
+      deleteTrigger(trigger) {
+        const handler = trigger.getHandlerFunction();
+        const index = state.triggers.findIndex(record => (typeof record === 'string' ? record : record.handler) === handler);
+        if (index >= 0) state.triggers.splice(index, 1);
+        saveState();
+      }
     },
     GmailApp: gmailApp,
+    Classroom: {Courses: {list: () => ({courses: []})}},
     ContentService: {MimeType: {JSON: 'application/json'}, createTextOutput(value) { return {value, setMimeType() {return this;}}; }},
     HtmlService: {
       createTemplateFromFile() { return {evaluate() { return {getContent: buildHtml, setTitle() {return this;}}; }}; },
@@ -664,8 +693,18 @@ if (process.argv.includes('--smoke') || process.argv.includes('--smoke-workbook'
       if (!page.ok || !html.includes('id="home-view"') || !html.includes('font-family: system-ui') || html.includes('<?!=')) throw new Error('local app template did not render its includes/styles');
       const health = await fetch(origin + '/health').then(r => r.json());
       if (!health.ok || health.mode !== 'local-mock') throw new Error('local health failed');
-      const result = await fetch(origin + '/__local/import', {method: 'POST'}).then(r => r.json());
-      if (!result.ok || result.result.inCampusSavedCount < 2) throw new Error('synthetic Gmail import failed');
+      const emptyList = await fetch(origin + '/__local/rpc', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({method:'getNotificationsForWeb', args:[]})}).then(r => r.json());
+      if (emptyList.error || !Array.isArray(emptyList.value) || emptyList.value.length) throw new Error('first-run workbook did not begin with an empty list');
+      const newWorkbookId = state.properties.TASKHUB_SPREADSHEET_ID;
+      if (!newWorkbookId || state.properties.TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING !== 'true' ||
+          state.sheets['補足通知']?.length !== 1 || state.sheets['inCampus通知']?.length !== 1 ||
+          state.sheets['授業']?.length !== 1 || state.sheets['Classroom課題']?.length !== 1 ||
+          state.sheets['提出状況']?.length !== 1) throw new Error('first page read did not create a new workbook with initialized headers');
+      const result = await fetch(origin + '/__local/rpc', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({method:'syncAndGetNotificationsForWeb', args:[]})}).then(r => r.json());
+      if (result.error || !result.value?.apiSuccess || result.value?.classroomSavedCount < 1 || result.value?.inCampusSavedCount < 2 || result.value?.items?.length < 3) throw new Error(`first-run API + Gmail sync did not save and return tasks: ${JSON.stringify(result)}`);
+      if (state.properties.TASKHUB_SPREADSHEET_ID !== newWorkbookId || state.properties.TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING) throw new Error('first-run sync did not reuse the new workbook or clear its pending flag');
+      if (state.sheets['補足通知']?.length !== 2 || state.sheets['inCampus通知']?.length !== 3) throw new Error('first-run Gmail rows were not persisted in the new workbook');
+      process.stdout.write('PASS first-run creates a personal workbook, saves initial mail rows, and returns tasks for display\n');
       const notifications = await fetch(origin + '/__local/rpc', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({method:'getNotificationsForWeb', args:[]})}).then(r => r.json());
       if (notifications.error || !Array.isArray(notifications.value) || notifications.value.length < 3) throw new Error('local GAS RPC failed');
       const target = notifications.value.find(item => item.title === 'ローカル確認レポート1');
@@ -686,13 +725,19 @@ if (process.argv.includes('--smoke') || process.argv.includes('--smoke-workbook'
         if (!requiredDeadlineGroups.every(group => imported.result.categorySummary?.[group] > 0)) throw new Error(`expected deadline groups are missing for selected weekday: ${JSON.stringify({requiredDeadlineGroups, summary: imported.result.categorySummary})}`);
         const current = Date.now();
         const dateIsRecent = value => value instanceof Date && Math.abs(value.getTime() - current) < 10000;
-        if (!state.sheets['Classroom通知'].slice(1).every(row => dateIsRecent(row[0]) && dateIsRecent(row[9])) ||
-            !state.sheets['inCampus通知'].slice(1).every(row => dateIsRecent(row[0]) && dateIsRecent(row[9])) ||
-            !state.sheets['inCampus抽出'].slice(1).every(row => dateIsRecent(row[12]))) throw new Error('spreadsheet test mail timestamps were not synchronized to test start');
-        const fixtureBeforeMode = JSON.stringify(encode(state.testSheets));
+        const recordTypeColumn = vm.runInContext('INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN', gas);
+        const extractStartColumn = vm.runInContext('INCAMPUS_UNIFIED_EXTRACT_START_COLUMN', gas);
+        const unifiedRows = state.sheets['inCampus通知'].slice(1);
+        const storedInCampusMailRows = unifiedRows.filter(row => row[recordTypeColumn] === 'gmail');
+        const storedInCampusExtractRows = unifiedRows.filter(row => row[recordTypeColumn] === 'extract');
+        if (!state.sheets['補足通知'].slice(1).every(row => dateIsRecent(row[0]) && dateIsRecent(row[9])) ||
+            !storedInCampusMailRows.every(row => dateIsRecent(row[0]) && dateIsRecent(row[9])) ||
+            !storedInCampusExtractRows.every(row => dateIsRecent(row[extractStartColumn + 12]))) throw new Error('spreadsheet test mail timestamps were not synchronized to test start');
         const originalSheetId = state.spreadsheetId;
         const readiness = gas.getSecuritySettingsForWeb();
         if (!readiness.testSpreadsheetReady) throw new Error(`fixed local test spreadsheet was not ready: ${readiness.testSpreadsheetMessage}`);
+        state.testSheets['テスト設定'][2][1] = '明日まで';
+        const fixtureBeforeMode = JSON.stringify(encode(state.testSheets));
         gas.setTestCaseModeForWeb(true);
         if (gas.getOrCreateSpreadsheet_().getId() !== originalSheetId) throw new Error('test mode changed the personal workbook destination');
         const testNotificationSources = gas.getNotificationReadSheets_();
@@ -701,23 +746,26 @@ if (process.argv.includes('--smoke') || process.argv.includes('--smoke-workbook'
         if (gas.getInCampusReadSheet_().rows() !== state.testSheets['テスト抽出']) throw new Error('test mode did not select the prepared extraction tab');
         const visibleFixtureItems = gas.getNotificationsForWeb();
         const fixtureItem = visibleFixtureItems.find(item => item.source === 'inCampus');
-        if (!fixtureItem) throw new Error('test mode did not read virtual notifications from the fixture workbook');
+        if (!fixtureItem) throw new Error(`test mode did not read virtual notifications from the fixture workbook (${visibleFixtureItems.length} cards visible)`);
+        if (fixtureItem.dueDate !== '2026/12/31 23:59' || fixtureItem.dueTime !== '23:59') throw new Error(`test mode did not shift the fixed inCampus deadline after reading: ${JSON.stringify({dueDate:fixtureItem.dueDate,dueTime:fixtureItem.dueTime})}`);
         const personalWorkbookSync = gas.saveClassroomMailsToSheet();
         if (personalWorkbookSync.skipped || personalWorkbookSync.spreadsheetId !== originalSheetId) throw new Error('test mode did not keep Gmail sync directed to the personal workbook');
         if (JSON.stringify(encode(state.testSheets)) !== fixtureBeforeMode) throw new Error('Gmail sync changed the read-only test fixture workbook');
         gas.updateNotificationStatus_(fixtureItem.messageId, '完了', () => []);
         if (JSON.stringify(encode(state.testSheets)) !== fixtureBeforeMode) throw new Error('test completion wrote into the read-only fixture workbook');
         const apiToken = gas.rotateApiTokenForWeb().apiToken;
-        const beforeExtensionPost = state.sheets['inCampus抽出'].length;
+        const beforeExtensionPost = storedInCampusExtractRows.length;
         const postResponse = gas.doPost({postData:{contents:JSON.stringify({apiToken,action:'upsertInCampusAssignment',assignment:{
           source:'inCampus',type:'assignment',title:'仮想保存先確認',courseName:'仮想保存先',pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/local-test-destination'
         }})}});
         if (!JSON.parse(postResponse.value).ok) throw new Error('extension POST failed while test mode was ON');
-        if (state.sheets['inCampus抽出'].length !== beforeExtensionPost + 1 ||
-            !state.sheets['inCampus抽出'].some(row => row[2] === '仮想保存先確認')) throw new Error('extension POST did not save into the original personal workbook');
+        const extractedAfterPost = state.sheets['inCampus通知'].slice(1).filter(row => row[recordTypeColumn] === 'extract');
+        if (extractedAfterPost.length !== beforeExtensionPost + 1 ||
+            !extractedAfterPost.some(row => row[extractStartColumn + 2] === '仮想保存先確認')) throw new Error('extension POST did not save into the original personal workbook');
         if (JSON.stringify(encode(state.testSheets)) !== fixtureBeforeMode) throw new Error('extension POST changed the read-only fixture workbook');
         gas.setTestCaseModeForWeb(false);
-        if (gas.getInCampusReadSheet_().rows() !== state.sheets['inCampus抽出']) throw new Error('OFF did not restore reads from the personal workbook');
+        const liveExtractAdapter = gas.getInCampusReadSheet_();
+        if (!liveExtractAdapter.__inCampusExtractAdapter || liveExtractAdapter.getLastRow() !== extractedAfterPost.length + 1) throw new Error('OFF did not restore reads from the personal workbook');
         if (JSON.stringify(encode(state.testSheets)) !== fixtureBeforeMode) throw new Error('test fixture workbook changed during the personal-save check');
         process.stdout.write(`PASS workbook import: ${imported.result.classroomRows} saved Classroom, ${imported.result.inCampusRows} saved inCampus, ${imported.result.extractedRows} extracted rows; ${imported.result.uniqueAdversarialEmails} adversarial emails passed actual GAS ingestion; categories ${JSON.stringify(imported.result.categorySummary)}; received timestamps synchronized; virtual UI date ${imported.result.virtualDisplayAt}\n`);
         process.stdout.write('PASS test mode reads the separate fixture, keeps completion state per-user, syncs synthetic Gmail only to the personal workbook, and writes extension POSTs there\n');

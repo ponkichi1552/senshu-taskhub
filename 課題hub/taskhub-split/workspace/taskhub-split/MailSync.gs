@@ -34,7 +34,7 @@ function saveClassroomMailsToSheet() {
       return {
         spreadsheetId: ss.getId(),
         skipped: true,
-        reason: '保存Excelに有効な受信日時がないため、広範囲検索を避けて同期をスキップしました。'
+        reason: '既存の保存Excelに有効な受信日時と前回同期日時がなく、初回20日照合フラグもありません。広範囲検索はせず同期を見送りました。'
       };
     }
 
@@ -269,7 +269,7 @@ function openTestCaseSpreadsheet_() {
   try {
     ss = SpreadsheetApp.openById(id);
   } catch (error) {
-    throw new Error('テストケース用スプレッドシートを開けません。共有設定とIDを確認してください。');
+    throw new Error('テストケース用スプレッドシートをこのGoogleアカウントで開けません。共有設定とログイン中のアカウントを確認してください。');
   }
 
   const requiredSheets = [
@@ -277,6 +277,9 @@ function openTestCaseSpreadsheet_() {
     {name: 'テストinCampus', headers: TEST_CASE_NOTIFICATION_HEADERS},
     {name: 'テスト抽出', headers: TEST_CASE_EXTRACT_HEADERS}
   ];
+  if (!ss.getSheetByName(TEST_CASE_SETTINGS_SHEET_NAME)) {
+    throw new Error('テストケース用スプレッドシートに「テスト設定」シートがありません。');
+  }
   requiredSheets.forEach(spec => {
     const sheet = ss.getSheetByName(spec.name);
     if (!sheet) throw new Error('テストケース用スプレッドシートの構成が不正です。必要なシート: ' + spec.name);
@@ -310,44 +313,94 @@ function getInCampusReadSheet_(testSpreadsheet) {
 }
 
 function mapTestCaseNotificationRowForRead_(row, referenceDate) {
+  const dateContext = getTestCaseDateContextForRead_(referenceDate);
   const mapped = normalizeNotificationRowWidth_(row);
-  if (isPresentValue_(row[16])) mapped[0] = row[16]; // テスト保存日時
-  if (isPresentValue_(row[17])) mapped[9] = row[17]; // テスト受信日時
-  if (isPresentValue_(row[19])) {
-    const testReferenceDate = referenceDate instanceof Date
-      ? referenceDate
-      : isTestCaseModeEnabled_() ? getTestCaseReferenceNow_() : null;
-    mapped[5] = rebaseTestCaseDeadline_(row[19], row[17], testReferenceDate);
-  }
+  mapped[0] = new Date(dateContext.readAt);
+  mapped[9] = new Date(dateContext.readAt);
+  mapped[5] = shiftTestCaseDeadlineForRead_(row[5], dateContext);
   return mapped;
 }
 
 function mapTestCaseExtractRowForRead_(row, referenceDate) {
+  const dateContext = getTestCaseDateContextForRead_(referenceDate);
   const mapped = row.slice();
-  if (isPresentValue_(row[17])) mapped[12] = row[17]; // テスト受信日時
-  if (isPresentValue_(row[19])) {
-    const testReferenceDate = referenceDate instanceof Date
-      ? referenceDate
-      : isTestCaseModeEnabled_() ? getTestCaseReferenceNow_() : null;
-    mapped[5] = rebaseTestCaseDeadline_(row[19], row[17], testReferenceDate);
-  }
+  mapped[5] = shiftTestCaseDeadlineForRead_(row[5], dateContext);
+  mapped[12] = new Date(dateContext.readAt);
   return mapped;
 }
 
-function rebaseTestCaseDeadline_(deadlineValue, receivedAtValue, referenceDate) {
-  if (!(referenceDate instanceof Date)) return deadlineValue;
+function getTestCaseDateContextForRead_(referenceDate) {
+  if (referenceDate && typeof referenceDate === 'object' && Number.isInteger(referenceDate.deadlineDayOffset)) {
+    return referenceDate;
+  }
+  return getTestCaseDateContext_(null, referenceDate instanceof Date ? referenceDate : null);
+}
 
-  const deadline = deadlineValue instanceof Date ? new Date(deadlineValue) : new Date(deadlineValue);
-  const receivedAt = receivedAtValue instanceof Date ? new Date(receivedAtValue) : new Date(receivedAtValue);
-  if (Number.isNaN(deadline.getTime()) || Number.isNaN(receivedAt.getTime())) return deadlineValue;
+function getTestCaseDateContext_(testSpreadsheet, referenceDate, readAt) {
+  const ss = testSpreadsheet || openTestCaseSpreadsheet_();
+  const settings = ss.getSheetByName(TEST_CASE_SETTINGS_SHEET_NAME);
+  if (!settings) throw new Error('テストケース用スプレッドシートに「テスト設定」シートがありません。');
 
-  const deadlineDay = Date.UTC(deadline.getFullYear(), deadline.getMonth(), deadline.getDate());
-  const receivedDay = Date.UTC(receivedAt.getFullYear(), receivedAt.getMonth(), receivedAt.getDate());
-  const dayOffset = Math.round((deadlineDay - receivedDay) / (24 * 60 * 60 * 1000));
-  const shifted = new Date(referenceDate);
-  shifted.setDate(shifted.getDate() + dayOffset);
-  shifted.setHours(deadline.getHours(), deadline.getMinutes(), deadline.getSeconds(), deadline.getMilliseconds());
-  return shifted;
+  const settingValues = settings.getRange(3, 2, 2, 1).getValues();
+  const position = String(settingValues[0][0] || '').trim();
+  const baseDate = toTestCaseDateValue_(settingValues[1][0]);
+  if (!['期限切れ', '今日まで', '明日まで', '今週中', '来週以降'].includes(position)) {
+    throw new Error('テスト設定のB3は期限切れ、今日まで、明日まで、今週中、来週以降のいずれかにしてください。');
+  }
+  if (!baseDate) throw new Error('テスト設定のB4に有効な基準期限を入力してください。');
+
+  const testReferenceDate = referenceDate instanceof Date && !Number.isNaN(referenceDate.getTime())
+    ? new Date(referenceDate)
+    : getTestCaseReferenceNow_();
+  const savedStart = new Date(PropertiesService.getUserProperties().getProperty(TEST_CASE_SESSION_STARTED_AT_PROPERTY) || '');
+  const sessionStartedAt = !Number.isNaN(savedStart.getTime()) ? savedStart : new Date();
+  const todayDayNumber = getTestCaseCalendarDayNumber_(testReferenceDate);
+  const baseDayNumber = getTestCaseCalendarDayNumber_(baseDate);
+  const utcToday = new Date(todayDayNumber * 86400000);
+  const daysUntilSunday = (7 - utcToday.getUTCDay()) % 7;
+  let targetDayNumber = todayDayNumber;
+  if (position === '期限切れ') targetDayNumber--;
+  else if (position === '明日まで') targetDayNumber++;
+  else if (position === '今週中') targetDayNumber += daysUntilSunday;
+  else if (position === '来週以降') targetDayNumber += daysUntilSunday + 7;
+
+  return {
+    referenceDate: testReferenceDate,
+    readAt: readAt instanceof Date && !Number.isNaN(readAt.getTime()) ? new Date(readAt) : sessionStartedAt,
+    position,
+    deadlineDayOffset: targetDayNumber - baseDayNumber
+  };
+}
+
+function toTestCaseDateValue_(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return new Date(value);
+  if (typeof value === 'number' && Number.isFinite(value) && value > 20000 && value < 100000) {
+    // Google/Excel serials represent wall-clock time in the sheet timezone.
+    // The test workbook is pinned to Japan Standard Time (UTC+9).
+    return new Date(Date.UTC(1899, 11, 30) + Math.round(value * 86400000) - 9 * 60 * 60 * 1000);
+  }
+  if (typeof value === 'string') {
+    const match = value.trim().match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+    if (!match) return null;
+    const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+    const hour = Number(match[4] || 0), minute = Number(match[5] || 0), second = Number(match[6] || 0);
+    if (!isValidDateParts_(year, month, day) || hour > 23 || minute > 59 || second > 59) return null;
+    return new Date(Date.UTC(year, month - 1, day, hour - 9, minute, second));
+  }
+  return null;
+}
+
+function getTestCaseCalendarDayNumber_(value) {
+  const date = toTestCaseDateValue_(value);
+  if (!date) return NaN;
+  const [year, month, day] = Utilities.formatDate(date, 'Asia/Tokyo', 'yyyy-MM-dd').split('-').map(Number);
+  return Math.floor(Date.UTC(year, month - 1, day) / 86400000);
+}
+
+function shiftTestCaseDeadlineForRead_(value, dateContext) {
+  const date = toTestCaseDateValue_(value);
+  if (!date || !dateContext || !Number.isInteger(dateContext.deadlineDayOffset)) return value;
+  return new Date(date.getTime() + dateContext.deadlineDayOffset * 86400000);
 }
 
 function getConfiguredSpreadsheetId_() {
@@ -375,7 +428,11 @@ function getOrCreateNotificationSheet_(ss, source) {
     sheet = ss.insertSheet(storageConfig.sheetName);
   }
 
-  setupHeader_(sheet);
+  if (source === 'inCampus') {
+    sheet = getOrCreateInCampusUnifiedSheetLocked_(ss);
+  } else {
+    setupHeader_(sheet);
+  }
   return sheet;
 }
 
@@ -385,6 +442,7 @@ function ensureNotificationStorage_(ss) {
 
 function ensureNotificationStorageLocked_(ss) {
   const spreadsheet = ss || getOrCreateSpreadsheet_();
+  ensureClassroomStructuredStorageLocked_(spreadsheet);
   const sheetsBySource = {};
 
   NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
@@ -392,15 +450,21 @@ function ensureNotificationStorageLocked_(ss) {
   });
 
   migrateLegacyNotificationSheet_(spreadsheet, sheetsBySource);
+  migrateLegacyClassroomNotificationRowsLocked_(spreadsheet, sheetsBySource['Google Classroom']);
+  removeEmptyDefaultSheetsLocked_(spreadsheet);
 
   // Retention/sorting belongs to ingestion. Reads must not rewrite every data row.
   return sheetsBySource;
 }
 
 function migrateLegacyNotificationSheet_(ss, sheetsBySource) {
+  const props = PropertiesService.getUserProperties();
+  const marker = String(ss.getId ? ss.getId() : 'default');
+  if (props.getProperty(LEGACY_NOTIFICATION_MIGRATION_PROPERTY) === marker) return;
   const legacySheet = ss.getSheetByName(CONFIG.LEGACY_SHEET_NAME);
 
   if (!legacySheet) {
+    props.setProperty(LEGACY_NOTIFICATION_MIGRATION_PROPERTY, marker);
     return;
   }
 
@@ -413,6 +477,7 @@ function migrateLegacyNotificationSheet_(ss, sheetsBySource) {
       const rowsToMigrate = legacyRows
         .filter(row => String(row[2] || '') === storageConfig.source)
         .filter(row => {
+          if (isClassroomApiManagedRow_(row)) return false;
           const messageId = String(row[1] || '').trim();
 
           if (!messageId || savedMessageIds.has(messageId)) {
@@ -428,8 +493,8 @@ function migrateLegacyNotificationSheet_(ss, sheetsBySource) {
     });
   }
 
-  ss.deleteSheet(legacySheet);
-  SpreadsheetApp.flush();
+  // Keep the legacy tab as a recoverable archive after its rows are copied.
+  props.setProperty(LEGACY_NOTIFICATION_MIGRATION_PROPERTY, marker);
 }
 
 function normalizeNotificationRowWidth_(row) {
@@ -447,9 +512,17 @@ function appendNotificationRows_(sheet, rows) {
     return;
   }
 
-  const normalizedRows = rows.map(row => normalizeNotificationRowWidth_(row));
+  const isUnifiedInCampus = sheet.getName && sheet.getName() === INCAMPUS_SHEET_NAME;
+  const width = isUnifiedInCampus ? Math.max(sheet.getLastColumn(), INCAMPUS_UNIFIED_HEADERS.length) : HEADER_ROW.length;
+  const normalizedRows = rows.map(row => {
+    if (!isUnifiedInCampus) return normalizeNotificationRowWidth_(row);
+    const unified = Array(width).fill('');
+    normalizeNotificationRowWidth_(row).forEach((value, index) => { unified[index] = value; });
+    unified[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] = INCAMPUS_GMAIL_RECORD_TYPE;
+    return unified;
+  });
   sheet
-    .getRange(sheet.getLastRow() + 1, 1, normalizedRows.length, HEADER_ROW.length)
+    .getRange(sheet.getLastRow() + 1, 1, normalizedRows.length, normalizedRows[0].length)
     .setValues(normalizedRows);
 }
 
@@ -486,6 +559,7 @@ function normalizeNotificationRowsForStorage_(rows, storageConfig, referenceDate
     .map(row => normalizeNotificationRowWidth_(row))
     .filter(row => String(row[2] || '') === storageConfig.source)
     .filter(row => {
+      if (isClassroomApiManagedRow_(row)) return true;
       const receivedDate = parseNotificationReceivedDate_(row[9]);
 
       // Keep unknown dates: they are not evidence that a message is old.
@@ -522,6 +596,11 @@ function normalizeNotificationRowsForStorage_(rows, storageConfig, referenceDate
 
 function normalizeNotificationSheet_(sheet, storageConfig) {
   setupHeader_(sheet);
+
+  if (storageConfig.source === 'inCampus') {
+    normalizeUnifiedInCampusNotificationSheet_(sheet, storageConfig);
+    return;
+  }
 
   const currentRows = sheet.getLastRow() >= 2
     ? sheet.getRange(2, 1, sheet.getLastRow() - 1, HEADER_ROW.length).getValues()
@@ -561,6 +640,59 @@ function normalizeNotificationSheet_(sheet, storageConfig) {
   SpreadsheetApp.flush();
 }
 
+function normalizeUnifiedInCampusNotificationSheet_(sheet, storageConfig) {
+  setupInCampusUnifiedHeader_(sheet);
+  const width = Math.max(sheet.getLastColumn(), INCAMPUS_UNIFIED_HEADERS.length);
+  const allRows = sheet.getLastRow() >= 2
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues()
+    : [];
+  const gmailRows = [];
+  const extractRows = [];
+  const unclassifiedRows = [];
+  allRows.forEach(row => {
+    const recordType = String(row[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] || '');
+    if (recordType === INCAMPUS_EXTRACT_RECORD_TYPE) {
+      extractRows.push(row);
+    } else if (recordType === INCAMPUS_GMAIL_RECORD_TYPE ||
+        (!recordType && String(row[2] || '') === 'inCampus')) {
+      gmailRows.push(normalizeNotificationRowWidth_(row));
+    } else if (row.some(value => value !== '' && value !== null && value !== undefined)) {
+      // A future or malformed record type must never be removed by Gmail retention.
+      unclassifiedRows.push(row);
+    }
+  });
+
+  const retainedGmailRows = normalizeNotificationRowsForStorage_(gmailRows, storageConfig);
+  const combined = retainedGmailRows.map(row => {
+    const unified = Array(width).fill('');
+    row.forEach((value, index) => { unified[index] = value; });
+    unified[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] = INCAMPUS_GMAIL_RECORD_TYPE;
+    return unified;
+  }).concat(extractRows.map(row => {
+    const unified = Array(width).fill('');
+    row.forEach((value, index) => { unified[index] = value; });
+    unified[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] = INCAMPUS_EXTRACT_RECORD_TYPE;
+    return unified;
+  })).concat(unclassifiedRows.map(row => {
+    const unified = Array(width).fill('');
+    row.forEach((value, index) => { unified[index] = value; });
+    return unified;
+  }));
+  const sameCell = (left, right) => left instanceof Date && right instanceof Date
+    ? left.getTime() === right.getTime()
+    : left === right;
+  const changed = allRows.length !== combined.length || combined.some((row, rowIndex) =>
+    row.some((value, columnIndex) => !sameCell(value, (allRows[rowIndex] || [])[columnIndex]))
+  );
+  if (!changed) return;
+
+  if (combined.length) sheet.getRange(2, 1, combined.length, width).setValues(combined);
+  if (allRows.length > combined.length) {
+    sheet.getRange(combined.length + 2, 1, allRows.length - combined.length, width).clearContent();
+  }
+  SpreadsheetApp.flush();
+}
+
 function setupHeader_(sheet) {
   const current = sheet.getRange(1, 1, 1, HEADER_ROW.length).getValues()[0];
   if (HEADER_ROW.some((name, index) => current[index] !== name)) {
@@ -596,6 +728,7 @@ function getSavedNotificationState_(sheet) {
   values.forEach(row => {
     const messageId = String(row[0] || '').trim();
     if (messageId) messageIds.add(messageId);
+    if (messageId.startsWith('classroom-api:')) return;
     const receivedAt = parseNotificationReceivedDate_(row[8]);
     if (receivedAt && (!latestReceivedAt || receivedAt.getTime() > latestReceivedAt.getTime())) {
       latestReceivedAt = receivedAt;

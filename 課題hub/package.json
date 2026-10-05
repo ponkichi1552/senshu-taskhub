@@ -6,7 +6,12 @@
     "test": "./local-dev/test.sh",
     "gas:status": "clasp show-file-status",
     "gas:push": "clasp push",
-    "gas:deploy:new": "clasp create-deployment"
+    "gas:deploy:new": "clasp create-deployment",
+    "gas:experiment:status": "./local-dev/clasp-experiment.sh show-file-status",
+    "gas:experiment:push": "./local-dev/clasp-experiment.sh push",
+    "gas:experiment:deployments": "./local-dev/clasp-experiment.sh deployments",
+    "gas:experiment:version": "./local-dev/clasp-experiment.sh create-version",
+    "gas:experiment:redeploy": "./local-dev/clasp-experiment.sh update-deployment"
   },
   "devDependencies": {
     "@google/clasp": "3.4.1"

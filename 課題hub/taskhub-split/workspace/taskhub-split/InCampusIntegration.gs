@@ -236,14 +236,8 @@ function getOrCreateInCampusSheet_() {
 
 function getOrCreateInCampusSheetLocked_() {
   const ss = getTargetSpreadsheet_();
-  let sheet = ss.getSheetByName(INCAMPUS_SHEET_NAME);
-
-  if (!sheet) {
-    sheet = ss.insertSheet(INCAMPUS_SHEET_NAME);
-  }
-
-  setupInCampusHeader_(sheet);
-  return sheet;
+  const unifiedSheet = getOrCreateInCampusUnifiedSheetLocked_(ss);
+  return createInCampusExtractSheetAdapter_(unifiedSheet);
 }
 
 function getTargetSpreadsheet_() {
@@ -251,6 +245,7 @@ function getTargetSpreadsheet_() {
 }
 
 function setupInCampusHeader_(sheet) {
+  if (sheet && sheet.__inCampusExtractAdapter) return;
   const lastColumn = Math.max(sheet.getLastColumn(), INCAMPUS_HEADERS.length);
   const range = sheet.getRange(1, 1, 1, lastColumn);
   const current = range.getValues()[0];

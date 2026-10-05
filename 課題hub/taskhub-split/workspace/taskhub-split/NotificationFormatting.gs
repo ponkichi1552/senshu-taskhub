@@ -189,19 +189,74 @@ function refreshAndGetNotificationsForWeb() {
 }
 
 function syncAndGetNotificationsForWeb() {
-  // Test mode changes only which sheet is displayed. Gmail mail is still
-  // committed to the signed-in user's original private spreadsheet.
-  const syncResult = saveClassroomMailsToSheet();
+  const sync = syncClassroomApiThenGmail_();
   return {
     items: getNotificationsForWeb(),
     testCaseModeEnabled: isTestCaseModeEnabled_(),
-    syncSkipped: Boolean(syncResult.skipped),
-    syncSkipReason: String(syncResult.reason || ''),
-    savedCount: Number(syncResult.savedCount || 0),
-    classroomSavedCount: Number(syncResult.classroomSavedCount || 0),
-    inCampusSavedCount: Number(syncResult.inCampusSavedCount || 0),
-    autoCompletedCount: Number(syncResult.autoCompletedCount || 0),
+    apiSuccess: sync.apiSuccess,
+    apiCourseworkCount: Number(sync.apiResult && sync.apiResult.courseworkCount || 0),
+    apiCourseCount: Number(sync.apiResult && sync.apiResult.courseCount || 0),
+    apiError: sync.apiError,
+    gmailSuccess: sync.gmailSuccess,
+    syncSkipped: Boolean(sync.gmailResult && sync.gmailResult.skipped),
+    syncSkipReason: String(sync.gmailResult && sync.gmailResult.reason || ''),
+    savedCount: Number(sync.gmailResult && sync.gmailResult.savedCount || 0),
+    classroomSavedCount: Number(sync.gmailResult && sync.gmailResult.classroomSavedCount || 0),
+    inCampusSavedCount: Number(sync.gmailResult && sync.gmailResult.inCampusSavedCount || 0),
+    autoCompletedCount: Number(sync.gmailResult && sync.gmailResult.autoCompletedCount || 0),
+    gmailError: sync.gmailError,
     completedAt: new Date().toISOString()
+  };
+}
+
+function syncAndGetCompletedNotificationsForWeb() {
+  const sync = syncClassroomApiThenGmail_();
+  return {
+    items: getCompletedNotificationsForWeb(),
+    testCaseModeEnabled: isTestCaseModeEnabled_(),
+    apiSuccess: sync.apiSuccess,
+    apiCourseworkCount: Number(sync.apiResult && sync.apiResult.courseworkCount || 0),
+    apiCourseCount: Number(sync.apiResult && sync.apiResult.courseCount || 0),
+    apiError: sync.apiError,
+    gmailSuccess: sync.gmailSuccess,
+    syncSkipped: Boolean(sync.gmailResult && sync.gmailResult.skipped),
+    syncSkipReason: String(sync.gmailResult && sync.gmailResult.reason || ''),
+    savedCount: Number(sync.gmailResult && sync.gmailResult.savedCount || 0),
+    classroomSavedCount: Number(sync.gmailResult && sync.gmailResult.classroomSavedCount || 0),
+    inCampusSavedCount: Number(sync.gmailResult && sync.gmailResult.inCampusSavedCount || 0),
+    autoCompletedCount: Number(sync.gmailResult && sync.gmailResult.autoCompletedCount || 0),
+    gmailError: sync.gmailError,
+    completedAt: new Date().toISOString()
+  };
+}
+
+function syncClassroomApiThenGmail_() {
+  let apiResult = null;
+  let apiError = '';
+  let gmailResult = null;
+  let gmailError = '';
+
+  // The sources write to the same personal workbook. Run them in order so an
+  // API snapshot is committed before Gmail's supplemental records are saved.
+  try {
+    apiResult = syncClassroomApiCourseworkToSpreadsheet_();
+  } catch (error) {
+    apiError = String(error && error.message ? error.message : error);
+  }
+
+  try {
+    gmailResult = saveClassroomMailsToSheet();
+  } catch (error) {
+    gmailError = String(error && error.message ? error.message : error);
+  }
+
+  return {
+    apiResult,
+    apiError,
+    apiSuccess: Boolean(apiResult && !apiError),
+    gmailResult,
+    gmailError,
+    gmailSuccess: Boolean(gmailResult && !gmailError && !gmailResult.skipped)
   };
 }
 
@@ -333,6 +388,11 @@ function updateNotificationStatusLocked_(messageId, status, responseBuilder) {
     return responseBuilder();
   }
 
+  if (targetMessageId.startsWith('classroom-api:') &&
+      updateClassroomApiTaskUserStatus_(targetMessageId, status, status === '完了' ? new Date() : '')) {
+    return responseBuilder();
+  }
+
   const ss = getOrCreateSpreadsheet_();
   const sheetsBySource = ensureNotificationStorage_(ss);
   let updated = false;
@@ -370,6 +430,10 @@ function updateNotificationStatusLocked_(messageId, status, responseBuilder) {
       }
       const sheetRow = i + 1;
       sheet.getRange(sheetRow, 13).setValue(status);
+
+      if (isClassroomApiManagedRow_(values[i])) {
+        sheet.getRange(sheetRow, 15).setValue('manual-status');
+      }
 
       if (status === '完了') {
         sheet.getRange(sheetRow, 14).setValue(new Date());
@@ -493,11 +557,14 @@ function removeEmailFooterForWeb_(body) {
 
 function rowToNotificationItem_(row) {
   const dueInfo = normalizeDueInfoForWeb_(row[5], row[6]);
-  const receivedAtTime = getTimeForSort_(row[9]);
+  const isApiCoursework = isClassroomApiManagedRow_(row);
+  const apiReceivedAtTime = getTimeForSort_(row[9]);
+  const gmailReceivedAtTime = isApiCoursework ? getTimeForSort_(row[21]) : 0;
+  const displayReceivedAt = isApiCoursework && row[21] ? row[21] : row[9];
+  const receivedAtTime = apiReceivedAtTime;
   const completedAtTime = getTimeForSort_(row[13]);
   const source = String(row[2] || '');
   const body = String(row[11] || '');
-
   return {
     savedAt: formatDateForWeb_(row[0]),
     messageId: row[1],
@@ -514,9 +581,15 @@ function rowToNotificationItem_(row) {
     dueStatus: row[6],
     subject: row[7],
     from: row[8],
-    receivedAt: formatDateForWeb_(row[9]),
+    receivedAt: formatDateForWeb_(displayReceivedAt),
     receivedAtTime: receivedAtTime,
-    gmailLink: row[10],
+    displayReceivedAtTime: gmailReceivedAtTime || receivedAtTime,
+    gmailReceivedAt: isApiCoursework ? formatDateForWeb_(row[21]) : '',
+    gmailReceivedAtTime,
+    gmailLink: isApiCoursework ? String(row[18] || '') : row[10],
+    gmailMessageId: isApiCoursework ? String(row[17] || '') : '',
+    gmailBody: isApiCoursework ? String(row[19] || '') : '',
+    gmailMessageIds: isApiCoursework && Array.isArray(row[20]) ? row[20].slice() : [],
     classroomUrl: extractClassroomUrl_(source, body),
     body: cleanBodyForWeb_(body, source),
     status: row[12],

@@ -40,7 +40,8 @@ class Sheet {
   autoResizeColumns() {throw new Error('Read must not auto-resize');}
 }
 function environment(shared) {
-  const state = shared || {held: false, acquisitions: 0, releases: 0, flushes: 0, props: {}, scriptProps: {}, sheets: {}, testSheets: {}, triggers: [], gmail: [], gmailSearches: 0, gmailQueries: [], userPropertyGetCalls: 0, userPropertiesSnapshotCalls: 0, spreadsheetOpenCalls: {}};
+  const state = shared || {held: false, acquisitions: 0, releases: 0, flushes: 0, props: {}, scriptProps: {}, sheets: {}, testSheets: {}, triggers: [], gmail: [], gmailSearches: 0, gmailQueries: [], userPropertyGetCalls: 0, userPropertiesSnapshotCalls: 0, spreadsheetOpenCalls: {}, spreadsheetCreateCalls: 0};
+  state.spreadsheetCreateCalls ||= 0;
   const ss = {getId: () => 'test-sheet', getUrl: () => 'mock://test-sheet', getSheetByName: name => state.sheets[name] || null,
     insertSheet(name) {return state.sheets[name] = new Sheet(name);}, deleteSheet(sheet) {delete state.sheets[sheet.name];}};
   const testSs = {getId: () => 'test-case-sheet', getUrl: () => 'mock://test-case-sheet', getSheetByName: name => state.testSheets[name] || null,
@@ -48,12 +49,12 @@ function environment(shared) {
   const props = {getProperty(name) {state.userPropertyGetCalls++; return state.props[name] || null;}, setProperty(name, value) {state.props[name] = value;}, deleteProperty(name) {delete state.props[name];}, getProperties() {state.userPropertiesSnapshotCalls++; return {...state.props};}};
   const scriptProps = {getProperty: name => state.scriptProps[name] || null, setProperty(name, value) {state.scriptProps[name] = value;}, deleteProperty(name) {delete state.scriptProps[name];}, getProperties: () => ({...state.scriptProps})};
   const c = vm.createContext({Date, Set, Map, console, Logger: {log() {}},
-    SpreadsheetApp: {openById(id) {state.spreadsheetOpenCalls[id]=(state.spreadsheetOpenCalls[id]||0)+1;if (id === 'test-case-sheet') return testSs; if (id === 'test-sheet') return ss; throw new Error('not found');}, create: () => ss, flush() {state.flushes++;}},
+    SpreadsheetApp: {openById(id) {state.spreadsheetOpenCalls[id]=(state.spreadsheetOpenCalls[id]||0)+1;if (id === 'test-case-sheet') return testSs; if (id === 'test-sheet') return ss; throw new Error('not found');}, create() {state.spreadsheetCreateCalls++; return ss;}, flush() {state.flushes++;}},
     PropertiesService: {getUserProperties: () => props, getScriptProperties: () => scriptProps},
     LockService: {getUserLock() {return {tryLock() {if (state.held) return false; state.held = true; state.acquisitions++; return true;}, releaseLock() {assert.ok(state.held); state.held = false; state.releases++;}};}},
     Session: {getScriptTimeZone: () => 'Asia/Tokyo'},
       Utilities: {DigestAlgorithm: {SHA_256: 'sha256'}, Charset: {UTF_8: 'utf8'}, computeDigest: (_, value) => [...crypto.createHash('sha256').update(String(value)).digest()],
-      getUuid: () => crypto.randomUUID(), formatDate(value, zone, pattern) {const d = new Date(value), p = x => String(x).padStart(2, '0'); const date = `${d.getFullYear()}/${p(d.getMonth()+1)}/${p(d.getDate())}`; const full = `${date} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; if (pattern === "yyyy-MM-dd'T'HH:mm") return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; if (pattern === 'yyyy/MM/dd') return date; return pattern.endsWith(':ss') ? full : full.slice(0, 16);}},
+      getUuid: () => crypto.randomUUID(), formatDate(value, zone, pattern) {const d = new Date(value), p = x => String(x).padStart(2, '0'); const date = `${d.getFullYear()}/${p(d.getMonth()+1)}/${p(d.getDate())}`; const isoDate = `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`; const full = `${date} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; if (pattern === "yyyy-MM-dd'T'HH:mm") return `${isoDate}T${p(d.getHours())}:${p(d.getMinutes())}`; if (pattern === 'yyyy-MM-dd') return isoDate; if (pattern === 'yyyy/MM/dd') return date; return pattern.endsWith(':ss') ? full : full.slice(0, 16);}},
     ScriptApp: {
       getProjectTriggers: () => state.triggers,
       deleteTrigger(trigger) {state.triggers = state.triggers.filter(item => item !== trigger);},
@@ -66,11 +67,17 @@ function environment(shared) {
   return {c, state, ss, testSs, add(name, rows) {return state.sheets[name] = new Sheet(name, rows);}, addTest(name, rows) {return state.testSheets[name] = new Sheet(name, rows);}, headers: [...vm.runInContext('HEADER_ROW', c)], inHeaders: [...vm.runInContext('INCAMPUS_HEADERS', c)]};
 }
 function prepareTestSpreadsheet(env) {
-  const testNotificationHeaders = env.headers.concat(['テスト保存日時', 'テスト受信日時', 'テスト期限（保存値）', 'テスト期限（アプリ表示）']);
-  const testExtractHeaders = env.inHeaders.concat(['テスト受信日時', 'テスト期限（保存値）', 'テスト期限（アプリ表示）']);
+  const testNotificationHeaders = env.headers;
+  const testExtractHeaders = env.inHeaders;
   env.addTest('Classroom通知', [env.headers]);
   env.addTest('inCampus通知', [env.headers]);
   env.addTest('inCampus抽出', [env.inHeaders]);
+  env.addTest('テスト設定', [
+    ['課題通知Hub テスト設定', ''],
+    ['テスト開始日時', 'アプリ読込時'],
+    ['元データの目標位置', '今日まで'],
+    ['元の基準期限', new Date(2026, 8, 10)]
+  ]);
   env.addTest('テストClassroom', [testNotificationHeaders]);
   env.addTest('テストinCampus', [testNotificationHeaders]);
   env.addTest('テスト抽出', [testExtractHeaders]);
@@ -165,17 +172,17 @@ check('Submission binding does not migrate after an older assignment arrives', (
 check('Both duplicate Classroom task rows complete, returned mail is untouched', () => {
   const e = environment(), url = 'https://classroom.google.com/c/C/a/A/details';
   const rows = [e.headers, row('return','A','返却された課題\n'+url,{source:'Google Classroom'}), row('task1','A','新しい課題\n'+url,{source:'Google Classroom'}),row('task2','A','新しい課題\n'+url,{source:'Google Classroom'})];
-  const s = e.add('Classroom通知', rows), result = e.c.completeClassroomAssignments_([{classroomUrl:url}]);
+  const s = e.add('補足通知', rows), result = e.c.completeClassroomAssignments_([{classroomUrl:url}]);
   assert.equal(result.matchedCount,1); assert.equal(s.rows[1][12],'未確認'); assert.equal(s.rows[2][12],'完了'); assert.equal(s.rows[3][12],'完了');
 });
 check('Both duplicate Classroom deadlines update, returned mail is untouched', () => {
   const e = environment(), url='https://classroom.google.com/c/C/a/A/details';
-  const s=e.add('Classroom通知',[e.headers,...['返却された課題','新しい課題','新しい課題'].map((marker,i)=>row(String(i),'A',marker+'\n'+url,{source:'Google Classroom',due:'2026/09/15'}))]);
+  const s=e.add('補足通知',[e.headers,...['返却された課題','新しい課題','新しい課題'].map((marker,i)=>row(String(i),'A',marker+'\n'+url,{source:'Google Classroom',due:'2026/09/15'}))]);
   e.c.updateClassroomDueTimes_([{classroomUrl:url,dueDate:'2026-09-20',dueTime:'23:59'}]);
   assert.equal(s.rows[1][5],'2026/09/15'); expectDate(s.rows[2][5],2026,9,20,23,59); expectDate(s.rows[3][5],2026,9,20,23,59);
 });
 check('Classroom non-task-only mail does not claim a match', () => {
-  const e=environment(),url='https://classroom.google.com/c/C/a/A/details';e.add('Classroom通知',[e.headers,row('return','A','返却された課題\n'+url,{source:'Google Classroom'})]);
+  const e=environment(),url='https://classroom.google.com/c/C/a/A/details';e.add('補足通知',[e.headers,row('return','A','返却された課題\n'+url,{source:'Google Classroom'})]);
   assert.equal(e.c.completeClassroomAssignments_([{classroomUrl:url}]).matchedCount,0);
 });
 check('Midnight string and known Date deadline become prior day 23:59 across month/year/leap boundaries', () => {
@@ -219,7 +226,7 @@ check('Date-only dueAt does not invent midnight or subtract a day',()=>{
 check('Separate announcement update IDs sharing course URL are stored independently',()=>{
   const e=environment(),url='https://ic.ss.senshu-u.ac.jp/lms/course/C';const a={source:'inCampus',type:'announcement',title:'休講',courseName:'仮想情報演習',pageUrl:url,assignmentKey:'update:1'};
   e.c.upsertInCampusAssignment_(a);e.c.upsertInCampusAssignment_({...a,title:'教室変更',assignmentKey:'update:2'});e.c.upsertInCampusAssignment_({...a,title:'休講（更新）'});
-  const s=e.state.sheets['inCampus抽出'];assert.equal(s.getLastRow(),3);assert.equal(s.rows[1][2],'休講（更新）');assert.equal(s.rows[2][2],'教室変更');
+  const s=e.c.getOrCreateInCampusSheet_(),rows=s.getDataRange().getValues();assert.equal(s.getLastRow(),3);assert.equal(rows[1][2],'休講（更新）');assert.equal(rows[2][2],'教室変更');
 });
 check('Manual page extraction preserves course and update identity plus completed state',()=>{
   const {c}=environment(),url='https://ic.ss.senshu-u.ac.jp/lms/course/report/A';
@@ -230,14 +237,14 @@ check('Manual page extraction preserves course and update identity plus complete
 check('Extracted submission uses strict title and preserves manual undo on reprocessing',()=>{
   const e=environment(),url='https://ic.ss.senshu-u.ac.jp/lms/course/report/';const assignment=title=>({source:'inCampus',type:'assignment',title,courseName:'仮想情報演習',pageUrl:url+title,assignmentKey:title});
   e.c.upsertInCampusAssignment_(assignment('レポート10'));e.c.upsertInCampusAssignment_(assignment('レポート1'));
-  const s=e.state.sheets['inCampus抽出'],record={title:'レポート1',courseName:'仮想情報演習',submittedAt:'2026/09/13 09:00'};
-  assert.equal(e.c.completeMatchingInCampusExtractedRow_(s,record),true);assert.equal(s.rows[1][14],'未確認');assert.equal(s.rows[2][14],'完了');
-  e.c.updateInCampusExtractedStatus_('incampus:'+url+'レポート1','未確認');assert.equal(e.c.completeMatchingInCampusExtractedRow_(s,record),false);assert.equal(s.rows[2][14],'未確認');
+  const s=e.c.getOrCreateInCampusSheet_(),record={title:'レポート1',courseName:'仮想情報演習',submittedAt:'2026/09/13 09:00'};
+  assert.equal(e.c.completeMatchingInCampusExtractedRow_(s,record),true);let rows=s.getDataRange().getValues();assert.equal(rows[1][14],'未確認');assert.equal(rows[2][14],'完了');
+  e.c.updateInCampusExtractedStatus_('incampus:'+url+'レポート1','未確認');assert.equal(e.c.completeMatchingInCampusExtractedRow_(s,record),false);rows=s.getDataRange().getValues();assert.equal(rows[2][14],'未確認');
 });
 check('Two extracted report URLs with identical course/title remain ambiguous',()=>{
   const e=environment(),a={source:'inCampus',type:'assignment',title:'A',courseName:'仮想情報演習'};
   e.c.upsertInCampusAssignment_({...a,pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/1'});e.c.upsertInCampusAssignment_({...a,pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/2'});
-  assert.equal(e.c.completeMatchingInCampusExtractedRow_(e.state.sheets['inCampus抽出'],{title:'A',courseName:'仮想情報演習',submittedAt:'2026/09/13 09:00'}),false);
+  assert.equal(e.c.completeMatchingInCampusExtractedRow_(e.c.getOrCreateInCampusSheet_(),{title:'A',courseName:'仮想情報演習',submittedAt:'2026/09/13 09:00'}),false);
 });
 check('List and status response share one native lock and reads do not rewrite sheet',()=>{
   const e=environment(),s=putMail(e,[row('A','A',body('A'))]);e.c.getNotificationsForWeb();const writes=s.writes,acquires=e.state.acquisitions;
@@ -257,7 +264,7 @@ check('Stale scheduled sync trigger is replaced once and then kept stable',()=>{
   e.state.triggers.push(old);e.state.props.TASKHUB_AUTO_FETCH_TRIGGER_REVISION='old';
   const first=e.c.ensureAutoFetchTrigger_();assert.equal(first.created,true);assert.equal(first.replacedExisting,true);
   assert.equal(e.state.triggers.length,1);assert.notEqual(e.state.triggers[0],old);assert.equal(e.state.triggers[0].minutes,15);
-  assert.equal(e.state.props.TASKHUB_AUTO_FETCH_TRIGGER_REVISION,'short-lock-2026-10-03');
+  assert.equal(e.state.props.TASKHUB_AUTO_FETCH_TRIGGER_REVISION,'production-api-rollout-2026-10-05');
   const second=e.c.ensureAutoFetchTrigger_();assert.equal(second.created,false);assert.equal(e.state.triggers.length,1);
 });
 check('Logical states stay attached after normalizing/reordering and old row cleanup',()=>{
@@ -305,11 +312,40 @@ check('Failed initial Gmail scan keeps its 20-day initialization pending',()=>{
   assert.equal(e.state.props.TASKHUB_NOTIFICATION_LAST_SUCCESSFUL_SYNC_AT,undefined);
   assert.equal(e.state.held,false);
 });
+check('A first-run user gets a new workbook, imported Gmail rows, and a displayed task',()=>{
+  const e=environment(),received=new Date(Date.now()-45*60*1000),text=body('初回利用者の仮想課題','が追加されました','仮想初回授業','10/05 08:00');
+  const message={getId:()=> 'first-run-mail',getFrom:()=> 'no-reply-incampus@isc.senshu-u.ac.jp',getDate:()=>received,getSubject:()=> '更新通知',getPlainBody:()=>text};
+  e.state.gmail=[{source:'inCampus',getMessages:()=>[message],getPermalink:()=> 'https://mail.google.com/mail/#thread/first-run-mail'}];
+
+  assert.deepEqual(Array.from(e.c.getNotificationsForWeb()),[],'first page read creates an empty personal workbook');
+  assert.equal(e.state.spreadsheetCreateCalls,1,'SpreadsheetApp.create runs once for a user with no workbook');
+  const createdWorkbookId=e.state.props.TASKHUB_SPREADSHEET_ID;
+  assert.ok(createdWorkbookId,'new workbook id is saved to user properties');
+  assert.equal(e.state.props.TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING,'true','first-run backfill is marked pending');
+  assert.equal(e.state.sheets['inCampus通知'].getLastRow(),1,'new notification sheet starts with its header');
+
+  const result=e.c.syncAndGetNotificationsForWeb();
+  assert.equal(e.state.spreadsheetCreateCalls,1,'sync reuses the workbook created during initial page read');
+  assert.equal(e.state.props.TASKHUB_SPREADSHEET_ID,createdWorkbookId);
+  assert.equal(result.inCampusSavedCount,1,'initial Gmail scan saves the synthetic message');
+  assert.match(e.state.gmailQueries[0].query,/newer_than:20d/,'new workbook runs the one-time 20-day scan');
+  assert.equal(e.state.props.TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING,undefined,'successful import clears the pending flag');
+  const saved=e.state.sheets['inCampus通知'];
+  assert.equal(saved.getLastRow(),2,'imported row is present beneath the header');
+  assert.equal(saved.rows[1][1],'first-run-mail');
+  assert.ok(result.items.some(item=>item.source==='inCampus'&&item.title==='初回利用者の仮想課題'),'the first-run task is returned to the web app for display');
+});
 check('An existing workbook with no valid received-time watermark skips rather than scanning old mail',()=>{
   const e=environment();e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';
   putMail(e,[row('invalid-watermark','A',body('A'),{received:'not-a-date'})]);
   const result=e.c.saveClassroomMailsToSheet();
-  assert.equal(result.skipped,true);assert.match(result.reason,/有効な受信日時/);assert.equal(e.state.gmailSearches,0);
+  assert.equal(result.skipped,true);assert.match(result.reason,/既存の保存Excel/);assert.match(result.reason,/初回20日照合フラグもありません/);assert.equal(e.state.gmailSearches,0);
+  assert.equal(e.state.props.TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING,undefined);
+});
+check('An existing empty workbook does not become a first-run 20-day backfill',()=>{
+  const e=environment();e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';
+  const result=e.c.saveClassroomMailsToSheet();
+  assert.equal(result.skipped,true);assert.match(result.reason,/有効な受信日時と前回同期日時がなく/);assert.equal(e.state.gmailSearches,0);
   assert.equal(e.state.props.TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING,undefined);
 });
 check('Real deadline-word assignment title does not turn its update timestamp into a deadline',()=>{
@@ -345,7 +381,7 @@ check('Test mode is user-scoped, reads the fixed fixture, and keeps the saved sh
   assert.equal(e.state.props.TASKHUB_SPREADSHEET_ID,'test-sheet');
   const disabled=e.c.setTestCaseModeForWeb(false);assert.equal(disabled.testCaseModeEnabled,false);assert.equal(e.c.getOrCreateSpreadsheet_().getId(),'test-sheet');
   assert.equal(e.c.getNotificationReadSheets_().inCampus,e.state.sheets['inCampus通知']);
-  assert.equal(e.c.getInCampusReadSheet_(),e.state.sheets['inCampus抽出']);
+  const liveExtractSheet=e.c.getInCampusReadSheet_();assert.equal(liveExtractSheet.__inCampusExtractAdapter,true);assert.equal(liveExtractSheet.getName(),'inCampus通知');
 });
 check('Virtual test clock presets are user-scoped, strict JST values and independent from test mode',()=>{
   const e=environment();prepareTestSpreadsheet(e);
@@ -361,16 +397,41 @@ check('Virtual test clock presets are user-scoped, strict JST values and indepen
   assert.throws(()=>e.c.setTestCaseClockForWeb('2026-12-31T24:00'),/日時が正しくありません/);
   e.c.setTestCaseClockForWeb('');assert.equal(e.state.props.TASKHUB_TEST_CASE_CLOCK,undefined);
 });
-check('Selected test clock rebases synthetic deadlines from test receipt day without changing receipt timestamp',()=>{
+check('Test mode pins synthetic receipt timestamps to the start of the session',()=>{
+  const e=environment();prepareTestSpreadsheet(e);
+  e.c.setTestCaseModeForWeb(true);
+  const startedAt=e.state.props.TASKHUB_TEST_CASE_SESSION_STARTED_AT;
+  assert.ok(startedAt);
+  const row=Array(16).fill('');row[1]='SIM-SESSION-001';row[5]=new Date(2026,8,10);
+  const mapped=e.c.mapTestCaseNotificationRowForRead_(row);
+  assert.equal(mapped[0].toISOString(),startedAt);assert.equal(mapped[9].toISOString(),startedAt);
+  e.c.setTestCaseModeForWeb(false);
+  assert.equal(e.state.props.TASKHUB_TEST_CASE_SESSION_STARTED_AT,undefined);
+});
+check('Fixed spreadsheet dates shift in memory to the selected position and virtual clock',()=>{
   const e=environment();prepareTestSpreadsheet(e);e.state.props.TASKHUB_TEST_CASE_MODE='true';
+  e.state.testSheets['テスト設定'].rows[2][1]='明日まで';
+  // Simulate a Sheets serial value so the same conversion handles numeric cells too.
+  e.state.testSheets['テスト設定'].rows[3][1]=46275;
   e.c.setTestCaseClockForWeb('2026-12-31T23:58');
-  const receivedAt=new Date('2026-10-03T02:00:00.000Z');
-  const fixtureRow=Array(20).fill('');fixtureRow[17]=receivedAt;fixtureRow[19]=new Date('2026-10-04T14:59:00.000Z');
-  const mapped=e.c.mapTestCaseNotificationRowForRead_(fixtureRow);
-  expectDate(mapped[5],2027,1,1,23,59);assert.equal(mapped[9].getTime(),receivedAt.getTime());
-  const extracted=fixtureRow.slice();const mappedExtract=e.c.mapTestCaseExtractRowForRead_(extracted);
-  expectDate(mappedExtract[5],2027,1,1,23,59);assert.equal(mappedExtract[12].getTime(),receivedAt.getTime());
-  e.c.setTestCaseModeForWeb(false);const unchanged=e.c.mapTestCaseNotificationRowForRead_(fixtureRow);assert.equal(unchanged[5].getTime(),fixtureRow[19].getTime());
+  const referenceDate=new Date('2026-12-31T14:58:00.000Z');
+  const readAt=new Date('2026-10-03T02:00:00.000Z');
+  const context=e.c.getTestCaseDateContext_(e.testSs,referenceDate,readAt);
+  assert.equal(context.deadlineDayOffset,113);
+  const original=[new Date(2026,8,9),'SIM-CLASS-001','Google Classroom','仮想授業','仮想課題',46275,'Classroomで時刻補正','新しい課題: 仮想課題','架空担当A <fixture@example.invalid>',new Date(2026,8,9),'https://mail.example.invalid/thread/SIM-CLASS-001','仮想授業\n提出期限：2026/09/10 00:00','未確認','','',''];
+  const sourceBefore=clone(original);
+  const mapped=e.c.mapTestCaseNotificationRowForRead_(original,context);
+  expectDate(mapped[5],2027,1,1,0,0);
+  const normalized=e.c.normalizeDueInfoForWeb_(mapped[5],mapped[6]);
+  assert.equal(normalized.dueDate,'2026/12/31 23:59');assert.equal(normalized.dueDateKey,'2026-12-31');assert.equal(normalized.dueTime,'23:59');assert.equal(normalized.dueType,'detected');
+  assert.equal(mapped[0].getTime(),readAt.getTime());assert.equal(mapped[9].getTime(),readAt.getTime());
+  assert.deepEqual(original,sourceBefore,'mapping must not mutate the read-only spreadsheet row');
+  const extracted=['inCampus','assignment','仮想課題','架空の課題本文',new Date(2026,8,1),46275,'2026/09/01 09:00\n～\n2026/09/10 00:00','不可','個人','','https://portal.example.invalid/course/report/SIM-0001',new Date(2026,8,9),new Date(2026,8,9),'{}','未確認','','SIM-ASSIGN-0001'];
+  const mappedExtract=e.c.mapTestCaseExtractRowForRead_(extracted,context);
+  expectDate(mappedExtract[5],2027,1,1,0,0);
+  assert.equal(e.c.rowToInCampusExtractedItem_(mappedExtract,e.c.getInCampusHeaderMap_(e.testSs.getSheetByName('テスト抽出'))).dueDate,'2026/12/31 23:59');
+  assert.equal(mappedExtract[12].getTime(),readAt.getTime());
+  assert.equal(extracted[5],46275,'the source serial value remains unchanged');
 });
 check('Server-side test expiry follows the selected year-end clock and leaves Jan 1 date-only work active',()=>{
   const e=environment();prepareTestSpreadsheet(e);e.state.props.TASKHUB_TEST_CASE_MODE='true';
@@ -380,25 +441,25 @@ check('Server-side test expiry follows the selected year-end clock and leaves Ja
   e.c.setTestCaseModeForWeb(false);
   assert.equal(e.c.isExpiredNotificationForWeb_({dueType:'detected',dueDateKey:'2026-12-31',dueTime:'23:59'}),false);
 });
-check('Test mode reads adjusted virtual tabs, remaps shifted dates, and switches back without writing either source',()=>{
+check('Test mode reads fixed virtual tabs, shifts deadlines after reading, and switches back without writing either source',()=>{
   const e=environment();e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';prepareTestSpreadsheet(e);e.c.setTestCaseClockForWeb('2099-10-01T00:00');
-  const personal=e.add('Classroom通知',[e.headers,row('personal-live','個人課題','架空担当A が新しい課題を投稿しました\n個人課題\n提出期限：2099/11/01 23:59',{source:'Google Classroom',course:'個人授業'})]);
-  const headers=e.headers.concat(['テスト保存日時','テスト受信日時','テスト期限（保存値）','テスト期限（アプリ表示）']);
-  const fixtureRow=[new Date(2026,8,9),'SIM-CLASS-0001','Google Classroom','仮想授業','仮想課題',new Date(2026,8,10),'期限検出','新しい課題: 仮想課題','架空担当A <fixture@example.invalid>',new Date(2026,8,9),'https://mail.example.invalid/thread/SIM-CLASS-0001','仮想授業\n架空担当A が新しい課題を投稿しました\n仮想課題\n提出期限：2026/09/10 00:00\n詳細：https://courses.example.invalid/demo/SIM-CLASS-0001','未確認','','','',new Date(2099,9,1),new Date(2099,9,1),new Date(2026,8,10),new Date(2099,9,2,23,59)];
-  const testClassroom=e.addTest('テストClassroom',[headers,fixtureRow]);
+  e.state.testSheets['テスト設定'].rows[2][1]='明日まで';
+  const personal=e.add('補足通知',[e.headers,row('personal-live','個人課題','架空担当A が新しい課題を投稿しました\n個人課題\n提出期限：2099/11/01 23:59',{source:'Google Classroom',course:'個人授業'})]);
+  const fixtureRow=[new Date(2026,8,9),'SIM-CLASS-0001','Google Classroom','仮想授業','仮想課題',new Date(2026,8,10),'Classroomで時刻補正','新しい課題: 仮想課題','架空担当A <fixture@example.invalid>',new Date(2026,8,9),'https://mail.example.invalid/thread/SIM-CLASS-0001','仮想授業\n架空担当A が新しい課題を投稿しました\n仮想課題\n提出期限：2026/09/10 00:00\n詳細：https://courses.example.invalid/demo/SIM-CLASS-0001','未確認','','',''];
+  const testClassroom=e.addTest('テストClassroom',[e.headers,fixtureRow]);
   const testInCampus=e.state.testSheets['テストinCampus'];
   const fakeCourse='仮想データ演習',fakeTitle='仮想期限付きレポート',fakeUrl='https://portal.example.invalid/course/report/SIM-0002';
   const fakeBody=`曜日・時限：火曜2限\n授業名：${fakeCourse}\n教員名：架空担当B\n更新内容：\n・課題（${fakeTitle}）が追加されました。（2026/09/10 08:00）`;
-  const notificationRow=[new Date(2026,8,9),'SIM-INCA-0002','inCampus',fakeCourse,fakeTitle,new Date(2026,8,10),'期限検出','更新通知','架空担当B <fixture@example.invalid>',new Date(2026,8,9),'https://mail.example.invalid/thread/SIM-INCA-0002',fakeBody,'未確認','','','',new Date(2099,9,1),new Date(2099,9,1),new Date(2026,8,10),new Date(2099,9,5,23,59)];
+  const notificationRow=[new Date(2026,8,9),'SIM-INCA-0002','inCampus',fakeCourse,fakeTitle,new Date(2026,8,10),'期限検出','更新通知','架空担当B <fixture@example.invalid>',new Date(2026,8,9),'https://mail.example.invalid/thread/SIM-INCA-0002',fakeBody,'未確認','','',''];
   testInCampus.rows.push(notificationRow);
   const raw=JSON.stringify({courseName:fakeCourse,updateText:`・課題（${fakeTitle}）が追加されました。`,updateAction:'add',assignmentKey:'SIM-ASSIGN-0002'});
-  const extractRow=['inCampus','assignment',fakeTitle,'架空の課題本文です。',new Date(2026,8,1),new Date(2026,8,10), '2026/09/01 09:00\n～\n2026/09/10 00:00','不可','個人','','https://portal.example.invalid/course/report/SIM-0002',new Date(2026,8,9),new Date(2026,8,9),raw,'未確認','','SIM-ASSIGN-0002',new Date(2099,9,1),new Date(2026,8,10),new Date(2099,9,5,23,59)];
+  const extractRow=['inCampus','assignment',fakeTitle,'架空の課題本文です。',new Date(2026,8,1),new Date(2026,8,10), '2026/09/01 09:00\n～\n2026/09/10 00:00','不可','個人','','https://portal.example.invalid/course/report/SIM-0002',new Date(2026,8,9),new Date(2026,8,9),raw,'未確認','','SIM-ASSIGN-0002'];
   const testExtract=e.state.testSheets['テスト抽出'];testExtract.rows.push(extractRow);
   e.state.props.TASKHUB_TEST_CASE_MODE='true';
   const testItems=e.c.getNotificationsForWeb();
   assert.deepEqual(Array.from(testItems,item=>item.messageId).sort(),['SIM-CLASS-0001','SIM-INCA-0002:update:'+e.c.inCampusStableKey_(e.c.inCampusRecordIdentity_({type:'assignment',courseName:fakeCourse,weekdayPeriod:'火曜2限',title:fakeTitle}))].sort());
-  assert.equal(testItems.find(item=>item.messageId==='SIM-CLASS-0001').dueDate,'2099/10/02 23:59');
-  assert.equal(testItems.find(item=>item.source==='inCampus').dueDate,'2099/10/05 23:59');
+  assert.equal(testItems.find(item=>item.messageId==='SIM-CLASS-0001').dueDate,'2099/10/01 23:59');
+  assert.equal(testItems.find(item=>item.source==='inCampus').dueDate,'2099/10/01 23:59');
   assert.equal(testItems.some(item=>item.title==='個人課題'),false);
   assert.equal(testClassroom.writes,0);assert.equal(testInCampus.writes,0);assert.equal(testExtract.writes,0);
   const off=e.c.setTestCaseModeForWeb(false);assert.equal(off.testCaseModeEnabled,false);
@@ -408,8 +469,8 @@ check('Test mode reads adjusted virtual tabs, remaps shifted dates, and switches
 });
 check('Fixed test workbook defaults safely and rejects an inaccessible or malformed sheet',()=>{
   const e=environment();const unavailable=e.c.getSecuritySettingsForWeb();assert.equal(unavailable.testSpreadsheetConfigured,true);assert.equal(unavailable.testSpreadsheetReady,false);
-  assert.throws(()=>e.c.setTestCaseModeForWeb(true),/開けません/);assert.equal(e.state.props.TASKHUB_TEST_CASE_MODE,undefined);
-  e.state.scriptProps.TASKHUB_TEST_SPREADSHEET_ID='test-case-sheet';e.addTest('テストClassroom',[['wrong']]);
+  assert.throws(()=>e.c.setTestCaseModeForWeb(true),/このGoogleアカウントで開けません/);assert.equal(e.state.props.TASKHUB_TEST_CASE_MODE,undefined);
+  e.state.scriptProps.TASKHUB_TEST_SPREADSHEET_ID='test-case-sheet';e.addTest('テスト設定',[['設定',''],['開始',''],['位置','今日まで'],['基準日',new Date(2026,8,10)]]);e.addTest('テストClassroom',[['wrong']]);
   assert.throws(()=>e.c.setTestCaseModeForWeb(true),/見出しが一致/);assert.equal(e.state.props.TASKHUB_TEST_CASE_MODE,undefined);
 });
 check('Test mode keeps synthetic display data while Gmail sync writes only to the personal workbook',()=>{
@@ -434,9 +495,10 @@ check('Legacy rebuild endpoint uses incremental sync in test mode and extension 
     source:'inCampus',type:'assignment',title:'仮想課題',courseName:'仮想講義',pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/virtual-test'
   }})}});
   const payload=JSON.parse(response.value);assert.equal(payload.ok,true);
-  assert.equal(e.state.sheets['inCampus抽出'].getLastRow(),2);
-  assert.equal(e.state.sheets['inCampus抽出'].rows[1][2],'仮想課題');
-  assert.equal(e.state.sheets['inCampus抽出'].rows[1][10],'https://ic.ss.senshu-u.ac.jp/lms/course/report/virtual-test');
+  const liveExtractSheet=e.c.getOrCreateInCampusSheet_(),extractRows=liveExtractSheet.getDataRange().getValues();
+  assert.equal(liveExtractSheet.getLastRow(),2);
+  assert.equal(extractRows[1][2],'仮想課題');
+  assert.equal(extractRows[1][10],'https://ic.ss.senshu-u.ac.jp/lms/course/report/virtual-test');
   assert.deepEqual(e.state.testSheets['テスト抽出'].rows,fixtureBefore);
   assert.equal(e.state.testSheets['テスト抽出'].writes,0);
   assert.equal(e.state.gmailSearches,2,'the legacy endpoint uses the same narrow incremental Gmail search');
@@ -444,7 +506,7 @@ check('Legacy rebuild endpoint uses incremental sync in test mode and extension 
 check('Test task reads use the fixture and completion state is per-user without sheet writes',()=>{
   const e=environment();e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';prepareTestSpreadsheet(e);
   const personal=e.add('inCampus通知',[e.headers,row('personal','個人課題',body('個人課題'))]);
-  const fixture=e.addTest('テストinCampus',[e.headers.concat(['テスト保存日時', 'テスト受信日時', 'テスト期限（保存値）', 'テスト期限（アプリ表示）']),row('virtual-message','仮想課題',body('仮想課題'),{due:'2099/10/25',dueStatus:'抽出成功'}).concat([new Date(), new Date(), new Date(2099,9,25), new Date(2099,9,25)])]);
+  const fixture=e.addTest('テストinCampus',[e.headers,row('virtual-message','仮想課題',body('仮想課題'),{due:new Date(2026,8,10),dueStatus:'期限検出'})]);
   const testExtract=e.state.testSheets['テスト抽出'];
   e.state.props.TASKHUB_TEST_CASE_MODE='true';
   const items=e.c.getActiveNotificationItemsForWeb_();
@@ -474,9 +536,8 @@ check('A test-mode list read opens and validates the fixture once and batches co
   const e=environment();prepareTestSpreadsheet(e);
   const modeKey=vm.runInContext('TEST_CASE_MODE_PROPERTY',e.c);e.state.props[modeKey]='true';
   const prefix=vm.runInContext('TEST_NOTIFICATION_STATE_PROPERTY_PREFIX',e.c);
-  const testHeaders=e.headers.concat(['テスト保存日時','テスト受信日時','テスト期限（保存値）','テスト期限（アプリ表示）']);
-  const rows=Array.from({length:120},(_,i)=>[new Date(),`SIM-${i+1}`,'Google Classroom','仮想授業',`仮想課題${i+1}`,new Date(2099,9,25),'抽出成功',`新しい課題: 仮想課題${i+1}`,'fixture@example.invalid',new Date(),'','新しい課題\n仮想課題','未確認','','','',new Date(),new Date(),new Date(2099,9,25),new Date(2099,9,25)]);
-  e.addTest('テストClassroom',[testHeaders,...rows]);
+  const rows=Array.from({length:120},(_,i)=>[new Date(),`SIM-${i+1}`,'Google Classroom','仮想授業',`仮想課題${i+1}`,new Date(2099,9,25),'期限検出',`新しい課題: 仮想課題${i+1}`,'fixture@example.invalid',new Date(),'','新しい課題\n仮想課題','未確認','','','']);
+  e.addTest('テストClassroom',[e.headers,...rows]);
   rows.slice(0,60).forEach(row=>{e.state.props[prefix+row[1]]=JSON.stringify({status:'完了',completedAt:'2026-10-03T00:00:00.000Z'});});
   const result=e.c.getNotificationsForWeb();
   assert.equal(result.length,60);

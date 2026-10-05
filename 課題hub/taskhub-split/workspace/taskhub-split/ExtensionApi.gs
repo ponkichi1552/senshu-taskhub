@@ -154,10 +154,14 @@ function setTestCaseModeForWeb(enabled) {
     const props = PropertiesService.getUserProperties();
     if (enabled) {
       openTestCaseSpreadsheet_();
-      if (!isTestCaseModeEnabled_()) clearTestNotificationStates_();
+      if (!isTestCaseModeEnabled_()) {
+        clearTestNotificationStates_();
+        props.setProperty(TEST_CASE_SESSION_STARTED_AT_PROPERTY, new Date().toISOString());
+      }
       props.setProperty(TEST_CASE_MODE_PROPERTY, 'true');
     } else {
       props.deleteProperty(TEST_CASE_MODE_PROPERTY);
+      props.deleteProperty(TEST_CASE_SESSION_STARTED_AT_PROPERTY);
     }
   });
   return getSecuritySettingsForWeb();

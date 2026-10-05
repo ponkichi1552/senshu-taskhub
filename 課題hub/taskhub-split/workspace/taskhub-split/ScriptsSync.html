@@ -94,41 +94,47 @@
   }
 
   function manualRefreshNotifications() {
-    if (currentScreen === 'completed') {
-      requestNotificationData('completed', {loadingText: '完了済み一覧を更新中...'});
-      return;
-    }
-
     if (notificationSyncInFlight) {
       showSyncToast('メール同期を実行中です。完了すると一覧が更新されます。', 'loading');
       return;
     }
 
+    const viewMode = currentScreen === 'completed' ? 'completed' : 'active';
+    const syncMethod = viewMode === 'completed'
+      ? 'syncAndGetCompletedNotificationsForWeb'
+      : 'syncAndGetNotificationsForWeb';
     notificationSyncInFlight = true;
     setManualSyncButtonBusy(true);
-    showSyncToast('メールを同期しています。画面はそのまま操作できます。', 'loading');
-    requestNotificationData('active', {
-      method: 'syncAndGetNotificationsForWeb',
+    showSyncToast('Classroom APIを同期してからGmailを同期しています。画面はそのまま使えます。', 'loading');
+    requestNotificationData(viewMode, {
+      method: syncMethod,
       structuredResult: true,
       notify: true,
-      homeSync: true,
-      loadingStatusText: 'メールを同期中...',
+      homeSync: viewMode === 'active',
+      loadingStatusText: 'Classroom API・Gmailを同期中...',
       syncLabelForResult: result => result && result.testCaseModeEnabled
-        ? '個人用Excel同期済み'
-        : 'メール同期済み',
+        ? 'テスト表示更新・個人用Excel同期済み'
+        : 'Classroom API・Gmail同期済み',
       onSuccess: result => {
         finishManualSync();
+        const failures = [];
+        if (result && result.apiError) failures.push(`Classroom API失敗：${result.apiError}`);
+        if (result && result.gmailError) failures.push(`Gmail失敗：${result.gmailError}`);
         if (result && result.syncSkipped) {
-          const reason = String(result.syncSkipReason || '保存Excelの基準日時が確認できません。');
-          showSyncToast(`更新を見送りました：${reason}`, 'error');
+          failures.push(`Gmail同期を見送りました：${String(result.syncSkipReason || '保存Excelの基準日時が確認できません。')}`);
+        }
+        if (failures.length) {
+          const successes = [];
+          if (result && result.apiSuccess) successes.push(`API課題${Number(result.apiCourseworkCount || 0)}件は同期済み`);
+          if (result && result.gmailSuccess) successes.push(`Gmail新着${Number(result.savedCount || 0)}件は保存済み`);
+          showSyncToast(`${successes.join('。')}${successes.length ? '。' : ''}${failures.join('。')}`, 'error');
           return;
         }
         const savedCount = Number(result && result.savedCount || 0);
+        const apiCount = Number(result && result.apiCourseworkCount || 0);
         const summary = result && result.testCaseModeEnabled
-          ? `テスト表示を更新しました。個人用Excelに新着メール${savedCount}件を保存しました。`
-          : savedCount > 0
-            ? `更新完了：新着メール${savedCount}件を取り込みました。`
-            : '更新完了：新着メールはありません。';
+          ? `テスト表示を更新しました。個人用ExcelにAPI課題${apiCount}件、新着メール${savedCount}件を保存しました。`
+          : `更新完了：API課題${apiCount}件を同期し、Gmail新着${savedCount}件を取り込みました。`;
         showSyncToast(summary, 'success');
       },
       onFailure: error => {

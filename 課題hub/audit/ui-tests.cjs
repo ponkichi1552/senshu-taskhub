@@ -419,7 +419,7 @@ test('OFF switch returns to saved data with a read-only request, not a Gmail ref
   assert.equal(f.reloadCount, 0);
 });
 
-test('startup and 15-minute polling read stored rows; explicit update performs the Gmail sync', () => {
+test('startup and 15-minute polling read stored rows; explicit update performs API then Gmail sync', () => {
   const f = fixture(undefined, {holdBoot: true});
   const boot = f.take('getNotificationsForWeb');
   assert.equal(f.pending('refreshAndGetNotificationsForWeb').length, 0);
@@ -437,8 +437,8 @@ test('startup and 15-minute polling read stored rows; explicit update performs t
   assert.equal(f.document.getElementById('sync-toast').classList.contains('is-visible'), true);
   f.reply(sync, {items: [item('SYNCED-001')], testCaseModeEnabled: false, savedCount: 1});
   assert.equal(f.document.getElementById('manual-refresh-button').disabled, false);
-  assert.equal(f.document.getElementById('home-sync-text').textContent.startsWith('メール同期済み '), true);
-  assert.match(f.document.getElementById('sync-toast-message').textContent, /新着メール1件/);
+  assert.equal(f.document.getElementById('home-sync-text').textContent.startsWith('Classroom API・Gmail同期済み '), true);
+  assert.match(f.document.getElementById('sync-toast-message').textContent, /Gmail新着1件/);
   assert.deepEqual(f.ids('homeRawData'), ['SYNCED-001']);
 });
 
@@ -448,9 +448,9 @@ test('test-mode sync reports private workbook update while keeping fixture cards
   const sync = f.take('syncAndGetNotificationsForWeb');
   f.reply(sync, {items: [item('SIM-001'), item('SIM-002')], testCaseModeEnabled: true, savedCount: 3});
   assert.deepEqual(f.ids('homeRawData'), ['SIM-001', 'SIM-002']);
-  assert.match(f.document.getElementById('home-sync-text').textContent, /^個人用Excel同期済み /);
+  assert.match(f.document.getElementById('home-sync-text').textContent, /^テスト表示更新・個人用Excel同期済み /);
   assert.match(f.document.getElementById('sync-toast-message').textContent, /テスト表示を更新しました/);
-  assert.match(f.document.getElementById('sync-toast-message').textContent, /個人用Excelに新着メール3件/);
+  assert.match(f.document.getElementById('sync-toast-message').textContent, /個人用ExcelにAPI課題0件、新着メール3件/);
 });
 
 test('a skipped sync explains the missing watermark in the result toast', () => {
@@ -460,7 +460,7 @@ test('a skipped sync explains the missing watermark in the result toast', () => 
   f.reply(sync, {items: [item('SAVED-001')], testCaseModeEnabled: false, savedCount: 0,
     syncSkipped: true, syncSkipReason: '保存Excelに有効な受信日時がありません。'});
   assert.equal(f.document.getElementById('manual-refresh-button').disabled, false);
-  assert.match(f.document.getElementById('sync-toast-message').textContent, /更新を見送りました/);
+  assert.match(f.document.getElementById('sync-toast-message').textContent, /Gmail同期を見送りました/);
   assert.match(f.document.getElementById('sync-toast-message').textContent, /有効な受信日時/);
 });
 

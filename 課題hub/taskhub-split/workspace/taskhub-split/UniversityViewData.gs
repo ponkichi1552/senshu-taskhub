@@ -13,6 +13,7 @@ function getInCampusExtractedItemsForWeb_(viewMode) {
 function getInCampusExtractedItemsForWebLocked_(viewMode) {
   const testMode = isTestCaseModeEnabled_();
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
+  const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, getTestCaseReferenceNow_()) : null;
   const testStates = testMode ? getTestNotificationStateMap_() : null;
   const sheet = getInCampusReadSheet_(testSpreadsheet);
 
@@ -22,9 +23,8 @@ function getInCampusExtractedItemsForWebLocked_(viewMode) {
 
   const values = sheet.getDataRange().getValues();
   const headerMap = getInCampusHeaderMap_(sheet);
-  const testReferenceDate = testMode ? getTestCaseReferenceNow_() : null;
   const rows = values.slice(1).map(row => testMode
-    ? mapTestCaseExtractRowForRead_(row, testReferenceDate)
+    ? mapTestCaseExtractRowForRead_(row, testDateContext)
     : row);
   const items = rows
     .map(row => rowToInCampusExtractedItem_(row, headerMap))
@@ -286,39 +286,41 @@ function getCompletedNotificationsForWebLocked_() {
   const testMode = isTestCaseModeEnabled_();
   const deadlineReferenceNow = testMode ? getTestCaseReferenceNow_() : new Date(Date.now());
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
+  const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, deadlineReferenceNow) : null;
   const testStates = testMode ? getTestNotificationStateMap_() : null;
   const data = mergeNotificationAndInCampusExtractedItemsForWeb_(
-    getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates),
-    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates),
+    getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext),
+    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext),
     'assignment',
     testMode
   );
 
   return data
+    .filter(item => !isNotYetPublishedClassroomApiNotificationForWeb_(item, deadlineReferenceNow))
     .filter(item => !isExpiredNotificationForWeb_(item, deadlineReferenceNow))
-    .filter(item => !isStaleUnknownDueNotificationForWeb_(item))
+    .filter(item => !isStaleUnknownDueNotificationForWeb_(item, deadlineReferenceNow))
     .sort((a, b) => {
       if (a.completedAtTime !== b.completedAtTime) {
         return b.completedAtTime - a.completedAtTime;
       }
 
-      return b.receivedAtTime - a.receivedAtTime;
+      return (b.displayReceivedAtTime || b.receivedAtTime) - (a.displayReceivedAtTime || a.receivedAtTime);
     });
 }
 
-function getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates) {
-  return runWithUserLock_('保存データ処理', () => getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates));
+function getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext) {
+  return runWithUserLock_('保存データ処理', () => getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext));
 }
 
-function getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates) {
+function getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext) {
   const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
   const states = testMode ? (testStates || getTestNotificationStateMap_()) : null;
   const sheet = getInCampusReadSheet_(testSpreadsheet);
   if (!sheet || sheet.getLastRow() < 2) return [];
   const headerMap = getInCampusHeaderMap_(sheet);
-  const testReferenceDate = testMode ? getTestCaseReferenceNow_() : null;
+  const dateContext = testMode ? (testDateContext || getTestCaseDateContext_(testSpreadsheet, getTestCaseReferenceNow_())) : null;
   return sheet.getDataRange().getValues().slice(1)
-    .map(row => testMode ? mapTestCaseExtractRowForRead_(row, testReferenceDate) : row)
+    .map(row => testMode ? mapTestCaseExtractRowForRead_(row, dateContext) : row)
     .map(row => rowToInCampusExtractedItem_(row, headerMap))
     .map(item => applyTestNotificationStateToItem_(item, states));
 }
@@ -441,14 +443,14 @@ function isGenericInCampusCourseNameForMatch_(courseName) {
     text === 'incampusお知らせ';
 }
 
-function getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates) {
-  return runWithUserLock_('保存データ処理', () => getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates));
+function getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext) {
+  return runWithUserLock_('保存データ処理', () => getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext));
 }
 
-function getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates) {
+function getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext) {
   const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
   const sheetsBySource = getNotificationReadSheets_(testSpreadsheet);
-  let rows = getNotificationRowsFromSheets_(sheetsBySource, testMode);
+  let rows = getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext);
   applyTestNotificationStatesToRows_(rows, testStates);
 
   rows = rows.filter(row => isTaskRelatedRow_(row));

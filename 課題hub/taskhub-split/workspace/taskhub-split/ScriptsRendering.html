@@ -65,6 +65,7 @@
 
         <div class="button-row">
           ${getClassroomOpenButtonHtml(item)}
+          ${getGmailOpenButtonHtml(item)}
           <button onclick="toggleBody(${currentIndex})">詳細</button>
           ${getStatusActionButtonHtml(item, viewMode)}
         </div>
@@ -93,6 +94,19 @@
     }
 
     return `<a class="button classroom-button" href="${escapeAttribute(url)}" target="_blank" rel="noopener noreferrer">課題を開く</a>`;
+  }
+
+  function getGmailOpenButtonHtml(item) {
+    const url = item && item.gmailLink ? String(item.gmailLink).trim() : '';
+
+    try {
+      const parsedUrl = new URL(url);
+      if (parsedUrl.protocol !== 'https:' || parsedUrl.hostname !== 'mail.google.com') return '';
+    } catch (e) {
+      return '';
+    }
+
+    return `<a class="button" href="${escapeAttribute(url)}" target="_blank" rel="noopener noreferrer">元メール</a>`;
   }
 
   function isSafeHttpUrl(url) {
@@ -147,7 +161,7 @@
               return completedDiff;
             }
 
-            return (b.receivedAtTime || 0) - (a.receivedAtTime || 0);
+            return (b.displayReceivedAtTime || b.receivedAtTime || 0) - (a.displayReceivedAtTime || a.receivedAtTime || 0);
           })
         }
       ];

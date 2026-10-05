@@ -1,9 +1,21 @@
+# Local Apps Script authorization data
 .clasp.json
 .clasprc.json
 **/.clasp.json
 **/.clasprc.json
+
+# Local install and OS metadata
 node_modules/
 **/node_modules/
-local-dev/.data/
+**/node_modules
 .DS_Store
 **/.DS_Store
+
+# Local fixture state and generated test outputs
+/local-dev/.data/
+/audit/before-server.zip
+/audit/results.json
+/audit/regression-results.json
+/outputs/**/*.inspect.ndjson
+/outputs/**/課題通知Hub_テストケース.xlsx
+/outputs/**/課題通知Hub_テストケース_修正版.xlsx

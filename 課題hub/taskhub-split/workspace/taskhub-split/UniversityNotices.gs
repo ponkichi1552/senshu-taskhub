@@ -3,11 +3,15 @@ function getUniversityNoticesForWeb() {
 }
 
 function getUniversityNoticesForWebLocked_() {
-  const now = new Date();
+  const testMode = isTestCaseModeEnabled_();
+  const now = testMode ? getTestCaseReferenceNow_() : new Date();
+  const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
+  const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, now) : null;
+  const testStates = testMode ? getTestNotificationStateMap_() : null;
   const states = PropertiesService.getUserProperties().getProperties();
-  const sheetsBySource = getNotificationReadSheets_();
+  const sheetsBySource = getNotificationReadSheets_(testSpreadsheet);
 
-  const notices = getNotificationRowsFromSheets_(sheetsBySource)
+  const notices = getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext)
     .filter(row => isUniversityNoticeRow_(row))
     .filter(row => isUniversityNoticeVisible_(row, now))
     .map(row => {
@@ -20,7 +24,12 @@ function getUniversityNoticesForWebLocked_() {
       return Object.assign(notice, {read: Boolean(state.read), saved: Boolean(state.saved)});
     })
     .sort((a, b) => b.receivedAtTime - a.receivedAtTime);
-  return mergeNotificationAndInCampusExtractedItemsForWeb_(notices, getInCampusSupplementItemsForWeb_(), 'announcement');
+  return mergeNotificationAndInCampusExtractedItemsForWeb_(
+    notices,
+    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext),
+    'announcement',
+    testMode
+  );
 }
 
 function isUniversityNoticeRow_(row) {

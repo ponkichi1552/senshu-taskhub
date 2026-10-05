@@ -1,0 +1,8 @@
+# Push only Apps Script source files and the manifest from rootDir.
+**/**
+!appsscript.json
+!**/*.gs
+!**/*.js
+!**/*.html
+.git/**
+node_modules/**

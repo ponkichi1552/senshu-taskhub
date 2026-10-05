@@ -19,7 +19,7 @@ function completeClassroomAssignmentsLocked_(records) {
     };
   }
 
-  const values = sheet.getDataRange().getValues();
+  const values = sheet.getDataRange().getValues().concat(getClassroomApiNotificationRowsForWeb_());
   const results = [];
   let matchedCount = 0;
   let createdCount = 0;
@@ -70,7 +70,7 @@ function updateClassroomDueTimesLocked_(records) {
     };
   }
 
-  const values = sheet.getDataRange().getValues();
+  const values = sheet.getDataRange().getValues().concat(getClassroomApiNotificationRowsForWeb_());
   const results = [];
   let matchedCount = 0;
   let createdCount = 0;
@@ -103,9 +103,14 @@ function updateClassroomDueTimesLocked_(records) {
 function updateMatchingClassroomDueTimeRow_(sheet, values, record) {
   const matches = findMatchingClassroomNotificationRows_(values, record, {allowTextFallback: false});
   if (!matches.length) return buildClassroomDueTimeResult_(record, false, 'Classroom通知に一致するClassroom課題がないため更新しませんでした。');
+  if (matches.some(match => isClassroomApiManagedRow_(match.row))) {
+    return buildClassroomDueTimeResult_(record, false, 'Classroom API同期後は、APIの期限情報を正本として拡張機能からの期限変更を破棄しました。');
+  }
+  const writableMatches = matches.filter(match => !isClassroomApiManagedRow_(match.row));
+  if (!writableMatches.length) return buildClassroomDueTimeResult_(record, false, '更新できる期限情報がありません。');
   let savedDueValue = '';
   const updatedRows = [];
-  matches.forEach(match => {
+  writableMatches.forEach(match => {
     const dueValue = buildClassroomDueDateValue_(record, values[match.index][5]);
     if (!dueValue) return;
     // Strings without times retain their date-only meaning even after sync.
@@ -168,6 +173,10 @@ function findMatchingClassroomNotificationRows_(values, record, options) {
     const rowCourseName = normalizeClassroomCourseNameForMatch_(row[3]);
     const syntheticMessageIdMatches = recordSyntheticMessageId &&
       recordSyntheticMessageId === String(row[1] || '').trim();
+    const apiMessageIdMatches = isClassroomApiManagedRow_(row) &&
+      recordIds.coursePathId &&
+      recordIds.itemPathId &&
+      String(row[1] || '') === buildClassroomApiMessageId_(recordIds.coursePathId, recordIds.itemPathId);
     const urlMatches = recordUrl && rowUrl && recordUrl === rowUrl;
     const pathIdMatches = recordIds.coursePathId &&
       recordIds.itemPathId &&
@@ -192,6 +201,7 @@ function findMatchingClassroomNotificationRows_(values, record, options) {
 
     if (
       syntheticMessageIdMatches ||
+      apiMessageIdMatches ||
       urlMatches ||
       pathIdMatches ||
       (allowTextFallback && exactTitleMatches && exactCourseMatches) ||
@@ -224,10 +234,11 @@ function getClassroomRecordIds_(record) {
 function getClassroomRowIds_(row, rowUrl) {
   const urlIds = extractClassroomPathIds_(rowUrl);
   const bodyIds = extractClassroomIdsFromText_(row && row[11]);
+  const apiIdMatch = String(row && row[1] || '').match(/^classroom-api:([^:]+):(.+)$/);
 
   return {
-    coursePathId: urlIds.coursePathId || bodyIds.coursePathId,
-    itemPathId: urlIds.itemPathId || bodyIds.itemPathId
+    coursePathId: (apiIdMatch && apiIdMatch[1]) || urlIds.coursePathId || bodyIds.coursePathId,
+    itemPathId: (apiIdMatch && apiIdMatch[2]) || urlIds.itemPathId || bodyIds.itemPathId
   };
 }
 
@@ -336,6 +347,9 @@ function formatDateForDebug_(value) {
 function completeMatchingClassroomNotificationRow_(sheet, values, record) {
   const matches = findMatchingClassroomNotificationRows_(values, record, {allowTextFallback: false});
   if (!matches.length) return buildClassroomCompletionResult_(record, false, 'Classroom通知に一致するClassroom課題がないため完了にしませんでした。');
+  if (matches.some(match => isClassroomApiManagedRow_(match.row))) {
+    return buildClassroomCompletionResult_(record, false, '提出状態はClassroom APIを優先するため、Gmail通知ではAPI管理課題を完了にしませんでした。');
+  }
   const providedCompletedAt = parseClassroomDate_(record && record.completedAt);
   const existingCompletedAt = matches.map(match => parseClassroomDate_(values[match.index][13])).find(Boolean);
   const completedAt = providedCompletedAt || existingCompletedAt || new Date();

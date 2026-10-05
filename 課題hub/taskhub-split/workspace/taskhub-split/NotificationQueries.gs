@@ -6,28 +6,30 @@ function getNotificationsForWebLocked_() {
   const testMode = isTestCaseModeEnabled_();
   const deadlineReferenceNow = testMode ? getTestCaseReferenceNow_() : new Date(Date.now());
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
+  const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, deadlineReferenceNow) : null;
   const testStates = testMode ? getTestNotificationStateMap_() : null;
   const data = mergeNotificationAndInCampusExtractedItemsForWeb_(
-    getActiveNotificationItemsForWeb_(testSpreadsheet, testStates),
-    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates),
+    getActiveNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext),
+    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext),
     'assignment',
     testMode
   );
 
   return data
+    .filter(item => !isNotYetPublishedClassroomApiNotificationForWeb_(item, deadlineReferenceNow))
     .filter(item => !isExpiredNotificationForWeb_(item, deadlineReferenceNow))
-    .filter(item => !isStaleUnknownDueNotificationForWeb_(item))
-    .sort((a, b) => b.receivedAtTime - a.receivedAtTime);
+    .filter(item => !isStaleUnknownDueNotificationForWeb_(item, deadlineReferenceNow))
+    .sort((a, b) => (b.displayReceivedAtTime || b.receivedAtTime) - (a.displayReceivedAtTime || a.receivedAtTime));
 }
 
-function getActiveNotificationItemsForWeb_(testSpreadsheet, testStates) {
-  return runWithUserLock_('保存データ処理', () => getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates));
+function getActiveNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext) {
+  return runWithUserLock_('保存データ処理', () => getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext));
 }
 
-function getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates) {
+function getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext) {
   const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
   const sheetsBySource = getNotificationReadSheets_(testSpreadsheet);
-  let rows = getNotificationRowsFromSheets_(sheetsBySource, testMode);
+  let rows = getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext);
   applyTestNotificationStatesToRows_(rows, testStates);
 
   rows = rows.filter(row => isTaskRelatedRow_(row));
@@ -38,10 +40,12 @@ function getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates) {
   return data;
 }
 
-function getNotificationRowsFromSheets_(sheetsBySource, testMode) {
+function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext) {
   const rows = [];
   const useTestMode = typeof testMode === 'boolean' ? testMode : isTestCaseModeEnabled_();
-  const testReferenceDate = useTestMode ? getTestCaseReferenceNow_() : null;
+  const dateContext = useTestMode
+    ? (testDateContext || getTestCaseDateContext_(null, getTestCaseReferenceNow_()))
+    : null;
 
   NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
     const sheet = sheetsBySource && sheetsBySource[storageConfig.source];
@@ -50,15 +54,122 @@ function getNotificationRowsFromSheets_(sheetsBySource, testMode) {
       return;
     }
 
-    const sourceRows = sheet.getDataRange().getValues().slice(1);
+    let sourceRows = sheet.getDataRange().getValues().slice(1);
+    if (!useTestMode && storageConfig.source === 'inCampus') {
+      sourceRows = sourceRows.filter(row =>
+        String(row[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] || '') === INCAMPUS_GMAIL_RECORD_TYPE ||
+        (String(row[2] || '') === 'inCampus' && String(row[1] || '') && !row[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN])
+      );
+    }
     const rowsForRead = useTestMode
-      ? sourceRows.map(row => mapTestCaseNotificationRowForRead_(row, testReferenceDate))
+      ? sourceRows.map(row => mapTestCaseNotificationRowForRead_(row, dateContext))
       : sourceRows;
     const retainedRows = normalizeNotificationRowsForStorage_(rowsForRead, storageConfig);
     retainedRows.forEach(row => rows.push(...expandInCampusNotificationRow_(row)));
   });
 
-  return rows;
+  // Classroom API tasks live in the structured 授業 / Classroom課題 / 提出状況
+  // tabs. Convert them to the existing display model without writing a second copy.
+  if (!useTestMode) rows.push(...getClassroomApiNotificationRowsForWeb_());
+
+  return mergeClassroomGmailAssignmentsWithApiRowsForWeb_(rows);
+}
+
+/**
+ * Gmail assignment emails arrive before the hourly API snapshot. Keep their
+ * raw rows in 補足通知, show unmatched emails immediately, and collapse an
+ * unambiguous match into the API-owned task after Classroom sync completes.
+ */
+function mergeClassroomGmailAssignmentsWithApiRowsForWeb_(rows) {
+  const apiRows = rows.filter(row => isClassroomApiManagedRow_(row));
+  if (!apiRows.length) return rows;
+
+  const apiByUrl = new Map();
+  const apiByCourseTitle = new Map();
+  const addIndex = (map, key, row) => {
+    if (!key) return;
+    const matches = map.get(key) || [];
+    matches.push(row);
+    map.set(key, matches);
+  };
+  const courseTitleKey = row => [
+    normalizeClassroomCourseNameForMatch_(row[3]),
+    normalizeInCampusMatchText_(row[4])
+  ].join('\u001f');
+
+  apiRows.forEach(row => {
+    const url = normalizeClassroomUrlForMatch_(extractClassroomUrl_('Google Classroom', row[11]));
+    if (url) addIndex(apiByUrl, url, row);
+    addIndex(apiByCourseTitle, courseTitleKey(row), row);
+  });
+
+  const matchedEmailsByApiId = new Map();
+  const consumedEmailIds = new Set();
+  rows.forEach(row => {
+    if (String(row[2] || '') !== 'Google Classroom' ||
+        isClassroomApiManagedRow_(row) ||
+        getClassroomNotificationType_(row[11]) !== 'newAssignment') return;
+
+    const emailId = String(row[1] || '');
+    const emailUrl = normalizeClassroomUrlForMatch_(extractClassroomUrl_('Google Classroom', row[11]));
+    let matches = emailUrl ? (apiByUrl.get(emailUrl) || []) : [];
+
+    // A title/course fallback is safe only when one side lacks a URL and the
+    // normalized course-title pair identifies exactly one API task.
+    if (!matches.length && !emailUrl) {
+      matches = apiByCourseTitle.get(courseTitleKey(row)) || [];
+    }
+    if (emailUrl && !matches.length) {
+      const sameTitle = apiByCourseTitle.get(courseTitleKey(row)) || [];
+      if (sameTitle.length === 1) {
+        const apiUrl = normalizeClassroomUrlForMatch_(extractClassroomUrl_('Google Classroom', sameTitle[0][11]));
+        if (!apiUrl) matches = sameTitle;
+      }
+    }
+    if (matches.length !== 1) return;
+
+    const apiRow = matches[0];
+    const relatedEmails = matchedEmailsByApiId.get(String(apiRow[1])) || [];
+    relatedEmails.push(row);
+    matchedEmailsByApiId.set(String(apiRow[1]), relatedEmails);
+    consumedEmailIds.add(emailId);
+  });
+
+  const mergedApiRows = new Map();
+  apiRows.forEach(apiRow => {
+    const emails = matchedEmailsByApiId.get(String(apiRow[1] || '')) || [];
+    if (!emails.length) return;
+    emails.sort((a, b) => getTimeForSort_(b[9]) - getTimeForSort_(a[9]));
+    const latest = emails[0];
+    const merged = apiRow.slice();
+    // API fields (task identity, due date, description and status) stay intact.
+    // Gmail-only delivery details are carried in in-memory columns for the UI.
+    if (!String(merged[3] || '').trim()) merged[3] = latest[3];
+    if (!String(merged[4] || '').trim() || String(merged[4]).includes('課題名なし')) merged[4] = latest[4];
+    merged[7] = latest[7] || merged[7];
+    merged[8] = latest[8] || merged[8];
+    merged[10] = latest[10] || '';
+    const apiUrl = extractClassroomUrl_('Google Classroom', merged[11]);
+    const gmailUrl = extractClassroomUrl_('Google Classroom', latest[11]);
+    if (!apiUrl && gmailUrl) merged[11] = [merged[11], gmailUrl].filter(Boolean).join('\n\n');
+    const apiDescription = String(merged[11] || '')
+      .replace(/https?:\/\/[^\s<>]+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!apiDescription && latest[11]) {
+      merged[11] = [merged[11], '【APIに本文がないためGmailから補足】', latest[11]].filter(Boolean).join('\n\n');
+    }
+    merged[17] = latest[1] || '';
+    merged[18] = latest[10] || '';
+    merged[19] = latest[11] || '';
+    merged[20] = emails.map(row => String(row[1] || '')).filter(Boolean);
+    merged[21] = latest[9] || '';
+    mergedApiRows.set(String(apiRow[1]), merged);
+  });
+
+  return rows
+    .filter(row => !consumedEmailIds.has(String(row[1] || '')))
+    .map(row => isClassroomApiManagedRow_(row) ? (mergedApiRows.get(String(row[1])) || row) : row);
 }
 
 function getTestNotificationStateMap_() {
@@ -213,19 +324,20 @@ function isExpiredNotificationForWeb_(item, referenceNow) {
   return deadline.getTime() < now.getTime();
 }
 
-function isStaleUnknownDueNotificationForWeb_(item) {
-  if (item.dueType !== 'unknown') {
+function isStaleUnknownDueNotificationForWeb_(item, referenceNow) {
+  const isApiCoursework = String(item && item.messageId || '').startsWith('classroom-api:');
+  if (isApiCoursework) {
+    if (item.dueType === 'detected') return false;
+  } else if (item.dueType !== 'unknown') {
     return false;
   }
 
-  if (!item.receivedAtTime) {
-    return false;
-  }
+  const receivedAtTime = Number(item && item.receivedAtTime);
+  if (!Number.isFinite(receivedAtTime) || receivedAtTime <= 0) return false;
 
-  const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-  const deadline = item.receivedAtTime + ONE_WEEK_MS;
-
-  return deadline < Date.now();
+  const retentionMs = (isApiCoursework ? 21 : 7) * 24 * 60 * 60 * 1000;
+  const now = referenceNow instanceof Date ? referenceNow.getTime() : Date.now();
+  return now > receivedAtTime + retentionMs;
 }
 
 function isClassroomUrlOrWrappedUrlLine_(line) {
@@ -374,6 +486,10 @@ function isTaskRelatedRow_(row) {
   const status = String(row[12] || '');
   const subject = String(row[7] || '');
   const body = String(row[11] || '');
+
+  if (isClassroomApiManagedRow_(row)) {
+    return true;
+  }
 
   if (isClassroomExtensionSyncRow_(row)) {
     return false;

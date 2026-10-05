@@ -1,6 +1,10 @@
 const CONFIG = {
   LEGACY_SHEET_NAME: '通知一覧',
   CLASSROOM_SHEET_NAME: 'Classroom通知',
+  SUPPLEMENTARY_SHEET_NAME: '補足通知',
+  CLASSROOM_COURSES_SHEET_NAME: '授業',
+  CLASSROOM_COURSEWORK_SHEET_NAME: 'Classroom課題',
+  CLASSROOM_SUBMISSIONS_SHEET_NAME: '提出状況',
   INCAMPUS_NOTIFICATION_SHEET_NAME: 'inCampus通知',
   NOTIFICATION_RETENTION_MONTHS: 2,
   BODY_LIMIT: 5000
@@ -9,7 +13,7 @@ const CONFIG = {
 const NOTIFICATION_STORAGE_CONFIGS = [
   {
     source: 'Google Classroom',
-    sheetName: CONFIG.CLASSROOM_SHEET_NAME,
+    sheetName: CONFIG.SUPPLEMENTARY_SHEET_NAME,
     // Search slightly beyond two calendar months; filter each message precisely.
     query: 'from:classroom.google.com newer_than:63d',
     initialQuery: 'from:classroom.google.com newer_than:20d',
@@ -25,8 +29,18 @@ const NOTIFICATION_STORAGE_CONFIGS = [
 ];
 
 const AUTO_FETCH_HANDLER = 'saveClassroomMailsToSheet';
-const AUTO_FETCH_TRIGGER_REVISION = 'short-lock-2026-10-03';
+const AUTO_FETCH_TRIGGER_REVISION = 'production-api-rollout-2026-10-05';
 const AUTO_FETCH_TRIGGER_REVISION_PROPERTY = 'TASKHUB_AUTO_FETCH_TRIGGER_REVISION';
+const CLASSROOM_API_TRIGGER_HANDLER = 'syncClassroomApiCourseworkOnSchedule_';
+const CLASSROOM_API_TRIGGER_REVISION = 'hourly-coursework-2026-10-05';
+const CLASSROOM_API_TRIGGER_REVISION_PROPERTY = 'TASKHUB_CLASSROOM_API_TRIGGER_REVISION';
+const CLASSROOM_API_LAST_SUCCESS_PROPERTY = 'TASKHUB_CLASSROOM_API_LAST_SUCCESS_AT';
+const CLASSROOM_API_LAST_ERROR_PROPERTY = 'TASKHUB_CLASSROOM_API_LAST_ERROR';
+const CLASSROOM_API_STRUCTURED_SYNC_PROPERTY = 'TASKHUB_CLASSROOM_API_STRUCTURED_SYNC_AT';
+const CLASSROOM_API_STRUCTURED_SYNC_IN_PROGRESS_PROPERTY = 'TASKHUB_CLASSROOM_API_STRUCTURED_SYNC_IN_PROGRESS';
+const LEGACY_CLASSROOM_NOTICE_MIGRATION_PROPERTY = 'TASKHUB_LEGACY_CLASSROOM_NOTICE_MIGRATION';
+const LEGACY_NOTIFICATION_MIGRATION_PROPERTY = 'TASKHUB_LEGACY_NOTIFICATION_MIGRATION';
+const LEGACY_INCAMPUS_EXTRACT_MIGRATION_PROPERTY = 'TASKHUB_LEGACY_INCAMPUS_EXTRACT_MIGRATION';
 const NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY = 'TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING';
 const NOTIFICATION_LAST_SUCCESSFUL_SYNC_PROPERTY = 'TASKHUB_NOTIFICATION_LAST_SUCCESSFUL_SYNC_AT';
 
@@ -68,7 +82,11 @@ const TASK_KEYWORDS = [
 // Globals are isolated per Apps Script execution. Nested operations share its lock.
 let userStorageLockDepth_ = 0;
 
-const INCAMPUS_SHEET_NAME = 'inCampus抽出';
+const INCAMPUS_SHEET_NAME = 'inCampus通知';
+const INCAMPUS_RECORD_TYPE_HEADER = 'レコード種別';
+const INCAMPUS_GMAIL_RECORD_TYPE = 'gmail';
+const INCAMPUS_EXTRACT_RECORD_TYPE = 'extract';
+const INCAMPUS_UNIFIED_EXTRACT_HEADER_PREFIX = '抽出:';
 const INCAMPUS_SUBMISSION_RECORD_TYPE = 'submissionRecord';
 const INCAMPUS_SUBMISSION_RECORD_STATUS = '完了記録';
 
@@ -80,6 +98,7 @@ const USER_SPREADSHEET_ID_PROPERTY = 'TASKHUB_SPREADSHEET_ID';
 const LEGACY_SPREADSHEET_ID_PROPERTY = 'SPREADSHEET_ID';
 const TEST_CASE_MODE_PROPERTY = 'TASKHUB_TEST_CASE_MODE';
 const TEST_CASE_CLOCK_PROPERTY = 'TASKHUB_TEST_CASE_CLOCK';
+const TEST_CASE_SESSION_STARTED_AT_PROPERTY = 'TASKHUB_TEST_CASE_SESSION_STARTED_AT';
 const TEST_SPREADSHEET_ID_PROPERTY = 'TASKHUB_TEST_SPREADSHEET_ID';
 const DEFAULT_TEST_SPREADSHEET_ID = '1ZVGwBnMrXaOMJ-D1SqeFuL-nVndXqwEIp55Gm5cTtuQ';
 const TEST_NOTIFICATION_STATE_PROPERTY_PREFIX = 'TASKHUB_TEST_NOTIFICATION_STATE:';
@@ -159,14 +178,26 @@ const INCAMPUS_HEADERS = [
   'assignmentKey'
 ];
 
-const TEST_CASE_NOTIFICATION_HEADERS = HEADER_ROW.concat([
-  'テスト保存日時', 'テスト受信日時', 'テスト期限（保存値）', 'テスト期限（アプリ表示）'
-]);
-const TEST_CASE_EXTRACT_HEADERS = INCAMPUS_HEADERS.concat([
-  'テスト受信日時', 'テスト期限（保存値）', 'テスト期限（アプリ表示）'
-]);
+const INCAMPUS_UNIFIED_HEADERS = HEADER_ROW.concat(
+  INCAMPUS_RECORD_TYPE_HEADER,
+  INCAMPUS_HEADERS.map(header => INCAMPUS_UNIFIED_EXTRACT_HEADER_PREFIX + header)
+);
+const INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN = HEADER_ROW.length;
+const INCAMPUS_UNIFIED_EXTRACT_START_COLUMN = HEADER_ROW.length + 1;
 
-function doGet() {
+// The shared test workbook contains fixed source values only. Virtual dates
+// are applied to in-memory rows after Sheets has returned them.
+const TEST_CASE_NOTIFICATION_HEADERS = HEADER_ROW;
+const TEST_CASE_EXTRACT_HEADERS = INCAMPUS_HEADERS;
+const TEST_CASE_SETTINGS_SHEET_NAME = 'テスト設定';
+
+function doGet(e) {
+  if (e && e.parameter && e.parameter.classroomApiTest === '1') {
+    return HtmlService
+      .createHtmlOutputFromFile('ClassroomApiExperiment')
+      .setTitle('課題Hub Classroom API検証');
+  }
+
   ensureUserStorageForWeb_();
 
   return HtmlService
@@ -190,12 +221,14 @@ function ensureUserStorageForWebLocked_() {
     ensureNotificationStorage_(ss);
     getOrCreateInCampusSheet_();
     const autoFetchTrigger = ensureAutoFetchTrigger_();
+    const classroomApiTrigger = ensureClassroomApiTrigger_();
 
     return {
       ok: true,
       spreadsheetId: ss.getId(),
       spreadsheetUrl: ss.getUrl(),
       autoFetchTriggerCreated: autoFetchTrigger.created,
+      classroomApiTriggerCreated: classroomApiTrigger.created,
       removedDuplicateTriggers: autoFetchTrigger.removedDuplicates
     };
   } catch (error) {

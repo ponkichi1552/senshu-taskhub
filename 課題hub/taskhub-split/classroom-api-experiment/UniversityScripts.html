@@ -1,0 +1,55 @@
+<script>
+const universityState = {items: [], selected: null, filter: 'all', loading: false, requestId: 0};
+function showUniversityNotices() {
+ currentScreen = 'university'; closeCourseFilterPanel(); setAppView('university'); updateBottomNavState();
+ loadUniversityNotices();
+}
+function loadUniversityNotices(onSuccess, onFailure) {
+ if (universityState.loading) return;
+ const requestId = ++universityState.requestId;
+ universityState.loading = true;
+ document.getElementById('un-refresh').disabled = true;
+ document.getElementById('un-status').textContent = 'お知らせを読み込み中…';
+ google.script.run.withSuccessHandler(items => {
+  if (requestId !== universityState.requestId) return;
+  universityState.loading = false; document.getElementById('un-refresh').disabled = false;
+  universityState.items = Array.isArray(items) ? items : [];
+  universityState.selected = null;
+  document.getElementById('un-shell').classList.remove('is-reading');
+  document.getElementById('un-status').textContent = '未読・保存状態はアカウントごとに保存されます。';
+  renderUniversityNotices(); renderUniversityDetail();
+  if (typeof onSuccess === 'function') onSuccess(universityState.items);
+ }).withFailureHandler(() => {
+  if (requestId !== universityState.requestId) return;
+  universityState.loading = false; document.getElementById('un-refresh').disabled = false;
+  document.getElementById('un-status').textContent = '読み込めませんでした。「更新」で再試行してください。';
+  if (typeof onFailure === 'function') onFailure(new Error('大学のお知らせを読み込めませんでした。'));
+ }).getUniversityNoticesForWeb();
+}
+function unElement(tag, cls, text) {const el=document.createElement(tag);el.className=cls;if(text!==undefined)el.textContent=text;return el;}
+function renderUniversityNotices() {
+ const q=document.getElementById('un-search').value.trim().toLowerCase();
+ const items=universityState.items.filter(n => (universityState.filter!=='unread'||!n.read)&&(universityState.filter!=='saved'||n.saved)&&[n.title,n.body,n.from,n.source].join(' ').toLowerCase().includes(q));
+ const list=document.getElementById('un-list');list.replaceChildren();
+ document.getElementById('un-count').textContent=items.length+'件のお知らせ · 新しい順';
+ if(!items.length)list.append(unElement('p','un-empty',universityState.items.length?'該当するお知らせはありません。':'お知らせはまだありません。'));
+ items.forEach(n=>{const b=unElement('button','un-item');b.type='button';b.setAttribute('aria-current',n.messageId===universityState.selected);b.append(unElement('div','un-meta',(n.read?'':'● 未読　')+n.source+'　'+n.receivedAt),unElement('div','un-title',n.title||'件名なし'),unElement('div','un-excerpt',n.body||''));b.onclick=()=>{universityState.selected=n.messageId;document.getElementById('un-shell').classList.add('is-reading');if(!n.read)updateUniversityNotice(n,{read:true});renderUniversityNotices();renderUniversityDetail()};list.append(b)});
+}
+function updateUniversityNotice(n, change) {
+ if(n.pending)return;
+ const previous={read:n.read,saved:n.saved};Object.assign(n,change);n.pending=true;
+ google.script.run.withSuccessHandler(()=>{n.pending=false;renderUniversityNotices();renderUniversityDetail()}).withFailureHandler(()=>{Object.assign(n,previous);n.pending=false;document.getElementById('un-status').textContent='状態を保存できませんでした。もう一度お試しください。';renderUniversityNotices();renderUniversityDetail()}).setUniversityNoticeState(n.messageId,{read:Boolean(n.read),saved:Boolean(n.saved)});
+}
+function renderUniversityDetail() {
+ const pane=document.getElementById('un-detail');pane.replaceChildren();
+ const n=universityState.items.find(n=>n.messageId===universityState.selected);
+ if(!n){pane.append(unElement('p','un-empty','一覧からお知らせを選択してください。'));return;}
+ const back=unElement('button','un-back','← 一覧に戻る');back.onclick=()=>document.getElementById('un-shell').classList.remove('is-reading');
+ const top=unElement('div','un-detail-top');const save=unElement('button','un-save',n.saved?'★ 保存済み':'☆ 保存する');save.setAttribute('aria-pressed',Boolean(n.saved));save.disabled=Boolean(n.pending);save.onclick=()=>{updateUniversityNotice(n,{saved:!n.saved});renderUniversityNotices();renderUniversityDetail()};top.append(unElement('span','un-meta',n.source),save);
+ pane.append(back,top,unElement('h2','',n.title||'件名なし'),unElement('p','un-meta',(n.from||'')+'　'+n.receivedAt),unElement('div','un-body',n.body||'本文はありません。'));
+ try{const url=new URL(n.gmailLink);if(url.protocol==='https:'&&url.hostname==='mail.google.com'){const a=unElement('a','un-mail','Gmailで元のお知らせを開く ↗');a.href=url.href;a.target='_blank';a.rel='noopener noreferrer';pane.append(a)}}catch{}
+}
+document.getElementById('un-search').addEventListener('input',renderUniversityNotices);
+document.querySelectorAll('[data-un-filter]').forEach(b=>b.onclick=()=>{universityState.filter=b.dataset.unFilter;document.querySelectorAll('[data-un-filter]').forEach(x=>x.setAttribute('aria-pressed',x===b));renderUniversityNotices()});
+if(typeof google!=='undefined'&&google.script.url)google.script.url.getLocation(location=>{if(location.parameter.view==='university')showUniversityNotices()});
+</script>

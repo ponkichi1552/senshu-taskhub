@@ -1,0 +1,58 @@
+<section id="home-view" class="app-view home-view is-active" aria-label="ホーム">
+  <div class="home-hero">
+    <div class="home-hero-top">
+      <div>
+        <h1 class="home-title">課題通知Hub</h1>
+        <p class="home-subtitle">今日やることを、先に見る。</p>
+      </div>
+      <div class="home-actions">
+        <button class="home-icon-button" onclick="openHelpModal()" aria-label="使い方を開く">?</button>
+        <button class="home-icon-button" type="button" onclick="openSecurityModal()" aria-label="設定">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path fill="currentColor" d="M19.43 12.98c.04-.32.07-.65.07-.98s-.02-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.37-.31-.6-.22l-2.49 1a7.28 7.28 0 0 0-1.69-.98L14.5 2.42A.49.49 0 0 0 14 2h-4a.49.49 0 0 0-.5.42L9.12 5.07c-.61.24-1.18.56-1.69.98l-2.49-1a.5.5 0 0 0-.6.22l-2 3.46a.5.5 0 0 0 .12.64l2.11 1.65c-.04.32-.08.65-.08.98s.03.66.08.98l-2.11 1.65a.5.5 0 0 0-.12.64l2 3.46c.12.22.37.31.6.22l2.49-1c.51.4 1.08.73 1.69.98l.38 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.38-2.65c.61-.24 1.18-.57 1.69-.98l2.49 1c.23.08.48 0 .6-.22l2-3.46a.5.5 0 0 0-.12-.64l-2.11-1.65ZM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5Z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="home-sync-pill">
+      <span class="home-sync-dot"></span>
+      <span id="home-sync-text">一覧を読み込み中...</span>
+    </div>
+  </div>
+
+  <div class="home-content">
+    <section aria-labelledby="home-due-title">
+      <h2 id="home-due-title" class="home-section-title">課題一覧</h2>
+      <div id="home-due-card" class="home-due-card"></div>
+    </section>
+
+    <section class="home-menu-section" aria-labelledby="home-menu-title">
+      <h2 id="home-menu-title" class="home-section-title">メニュー</h2>
+      <div class="home-menu-list">
+        <button class="home-menu-card is-primary" onclick="loadNotifications()">
+          <span class="home-menu-icon">✓</span>
+          <span>課題通知</span>
+          <span class="home-menu-arrow">›</span>
+        </button>
+        <button class="home-menu-card" type="button" onclick="showUniversityNotices()">
+          <span class="home-menu-icon is-info">i</span>
+          <span>大学からのお知らせ</span>
+          <span class="home-menu-arrow">›</span>
+        </button>
+        <button class="home-menu-card" type="button" disabled>
+          <span class="home-menu-icon">≡</span>
+          <span>大学情報まとめ</span>
+          <span class="home-menu-arrow">›</span>
+        </button>
+        <button class="home-menu-card" type="button" disabled>
+          <span class="home-menu-icon is-file">▣</span>
+          <span>過去問データベース</span>
+          <span class="home-menu-arrow">›</span>
+        </button>
+      </div>
+    </section>
+
+    <button class="home-unknown-button" onclick="openUnknownDueAssignments()">期限未検出の課題を確認</button>
+  </div>
+</section>
