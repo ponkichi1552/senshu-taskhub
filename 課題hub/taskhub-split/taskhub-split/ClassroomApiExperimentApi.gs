@@ -154,6 +154,7 @@ function getClassroomApiExperimentWorkbookDataForWeb() {
         return;
       }
 
+      const assignedItems = [];
       items.forEach(item => {
         if (!isClassroomApiCourseworkAssignedToCurrentStudent_(item, resolveCurrentStudentId)) {
           excludedUnassignedCourseworkCount++;
@@ -185,14 +186,26 @@ function getClassroomApiExperimentWorkbookDataForWeb() {
           alternateLink: String(item.alternateLink || ''),
           fetchedAt: fetchedAt
         });
+        assignedItems.push(item);
+      });
 
+      if (assignedItems.length) {
         try {
-          const submissions = listClassroomApiExperimentStudentSubmissions_(courseId, String(item.id || ''));
-          const submission = selectClassroomApiExperimentCurrentStudentSubmission_(submissions, resolveCurrentStudentId());
-          if (submission) {
+          const submissions = listClassroomApiExperimentStudentSubmissionsForCourse_(courseId);
+          const indexedSubmissions = indexClassroomApiExperimentSubmissionsByCoursework_(submissions);
+          if (indexedSubmissions.missingCourseworkIdCount) {
+            throw new Error(`一括提出状況に課題IDがないデータが${indexedSubmissions.missingCourseworkIdCount}件あり、安全に照合できません。`);
+          }
+          assignedItems.forEach(item => {
+            const courseworkId = String(item.id || '');
+            const matches = indexedSubmissions.byCourseworkId.get(courseworkId) || [];
+            const submission = matches.length
+              ? selectClassroomApiExperimentCurrentStudentSubmission_(matches, resolveCurrentStudentId())
+              : null;
+            if (!submission) return;
             submissionRows.push({
               courseId: courseId,
-              courseworkId: String(item.id || ''),
+              courseworkId: courseworkId,
               courseName: String(course.name || '(授業名なし)'),
               courseworkTitle: String(item.title || '(課題名なし)'),
               state: String(submission.state || ''),
@@ -201,11 +214,11 @@ function getClassroomApiExperimentWorkbookDataForWeb() {
               returned: String(submission.state || '') === 'RETURNED',
               assignedGrade: submission.assignedGrade === undefined ? '' : submission.assignedGrade
             });
-          }
+          });
         } catch (error) {
-          errors.push({courseName: String(course.name || courseId), courseworkTitle: String(item.title || ''), section: '本人の提出状況', message: getClassroomApiExperimentErrorMessage_(error)});
+          errors.push({courseName: String(course.name || courseId), section: '本人の提出状況', message: getClassroomApiExperimentErrorMessage_(error)});
         }
-      });
+      }
     });
 
     courseworkRows.sort((left, right) => {
@@ -289,6 +302,40 @@ function listClassroomApiExperimentStudentSubmissions_(courseId, courseworkId) {
     pageToken = String(response.nextPageToken || '');
   } while (pageToken);
   return submissions;
+}
+
+/** Fetch this student's submissions for every published coursework in one course. */
+function listClassroomApiExperimentStudentSubmissionsForCourse_(courseId) {
+  const submissions = [];
+  if (!courseId) return submissions;
+  let pageToken = '';
+  do {
+    const request = {
+      userId: 'me',
+      pageSize: 100,
+      fields: 'nextPageToken,studentSubmissions(courseWorkId,id,userId,state,late,assignedGrade,updateTime,submissionHistory(stateHistory(state,stateTimestamp)))'
+    };
+    if (pageToken) request.pageToken = pageToken;
+    const response = Classroom.Courses.CourseWork.StudentSubmissions.list(courseId, '-', request) || {};
+    (response.studentSubmissions || []).forEach(submission => submissions.push(submission));
+    pageToken = String(response.nextPageToken || '');
+  } while (pageToken);
+  return submissions;
+}
+
+function indexClassroomApiExperimentSubmissionsByCoursework_(submissions) {
+  const byCourseworkId = new Map();
+  let missingCourseworkIdCount = 0;
+  (Array.isArray(submissions) ? submissions : []).forEach(submission => {
+    const courseworkId = String(submission && submission.courseWorkId || '').trim();
+    if (!courseworkId) {
+      missingCourseworkIdCount++;
+      return;
+    }
+    if (!byCourseworkId.has(courseworkId)) byCourseworkId.set(courseworkId, []);
+    byCourseworkId.get(courseworkId).push(submission);
+  });
+  return {byCourseworkId, missingCourseworkIdCount};
 }
 
 function getClassroomApiExperimentTeacherName_(teacher) {

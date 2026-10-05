@@ -48,6 +48,7 @@ function syncClassroomApiCourseworkToSpreadsheet_(options) {
         throw new Error(`「${courseName}」の課題を取得できませんでした: ${getClassroomApiExperimentErrorMessage_(error)}`);
       }
 
+      const assignedItems = [];
       items.forEach(item => {
         if (!item || !item.id) throw new Error(`「${courseName}」の課題IDがありません。`);
         returnedCourseworkCount++;
@@ -61,18 +62,31 @@ function syncClassroomApiCourseworkToSpreadsheet_(options) {
           item
         };
         if (isClassroomApiCourseworkAssignedToCurrentStudent_(item, resolveCurrentStudentId)) {
-          let submissions;
-          try {
-            submissions = listClassroomApiExperimentStudentSubmissions_(courseId, String(item.id || ''));
-          } catch (error) {
-            throw new Error(`「${courseName}」の提出状況を取得できませんでした: ${getClassroomApiExperimentErrorMessage_(error)}`);
-          }
-          record.submission = selectClassroomApiExperimentCurrentStudentSubmission_(submissions, resolveCurrentStudentId());
-          coursework.push(record);
+          assignedItems.push(record);
         } else {
           excludedUnassignedCourseworkCount++;
         }
       });
+
+      if (assignedItems.length) {
+        let submissions;
+        try {
+          submissions = listClassroomApiExperimentStudentSubmissionsForCourse_(courseId);
+        } catch (error) {
+          throw new Error(`「${courseName}」の提出状況を取得できませんでした: ${getClassroomApiExperimentErrorMessage_(error)}`);
+        }
+        const indexedSubmissions = indexClassroomApiExperimentSubmissionsByCoursework_(submissions);
+        if (indexedSubmissions.missingCourseworkIdCount) {
+          throw new Error(`「${courseName}」の一括提出状況に課題IDがないデータが${indexedSubmissions.missingCourseworkIdCount}件あり、安全に照合できません。`);
+        }
+        assignedItems.forEach(record => {
+          const matches = indexedSubmissions.byCourseworkId.get(String(record.item.id || '')) || [];
+          record.submission = matches.length
+            ? selectClassroomApiExperimentCurrentStudentSubmission_(matches, resolveCurrentStudentId())
+            : null;
+          coursework.push(record);
+        });
+      }
     });
 
     return runWithUserLock_('Classroom API課題保存', () => {

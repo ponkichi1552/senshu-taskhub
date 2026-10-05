@@ -9,9 +9,9 @@ function getUniversityNoticesForWebLocked_() {
   const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, now) : null;
   const testStates = testMode ? getTestNotificationStateMap_() : null;
   const states = PropertiesService.getUserProperties().getProperties();
-  const sheetsBySource = getNotificationReadSheets_(testSpreadsheet);
+  const readContext = createNotificationReadContext_(testSpreadsheet, testMode);
 
-  const notices = getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext)
+  const notices = getNotificationRowsFromSheets_(readContext.sheetsBySource, testMode, testDateContext, readContext)
     .filter(row => isUniversityNoticeRow_(row))
     .filter(row => isUniversityNoticeVisible_(row, now))
     .map(row => {
@@ -26,7 +26,7 @@ function getUniversityNoticesForWebLocked_() {
     .sort((a, b) => b.receivedAtTime - a.receivedAtTime);
   return mergeNotificationAndInCampusExtractedItemsForWeb_(
     notices,
-    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext),
+    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext),
     'announcement',
     testMode
   );

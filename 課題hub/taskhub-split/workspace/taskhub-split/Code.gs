@@ -43,6 +43,15 @@ const LEGACY_NOTIFICATION_MIGRATION_PROPERTY = 'TASKHUB_LEGACY_NOTIFICATION_MIGR
 const LEGACY_INCAMPUS_EXTRACT_MIGRATION_PROPERTY = 'TASKHUB_LEGACY_INCAMPUS_EXTRACT_MIGRATION';
 const NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY = 'TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING';
 const NOTIFICATION_LAST_SUCCESSFUL_SYNC_PROPERTY = 'TASKHUB_NOTIFICATION_LAST_SUCCESSFUL_SYNC_AT';
+const USER_STORAGE_INITIALIZATION_REVISION_PROPERTY = 'TASKHUB_USER_STORAGE_INITIALIZATION_REVISION';
+const USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY = 'TASKHUB_USER_STORAGE_INITIALIZATION_LAST_RUN_AT';
+const USER_STORAGE_INITIALIZATION_REVISION = 'weekly-background-init-load-optimization-2026-10-05-v1';
+const USER_STORAGE_INITIALIZATION_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+const USER_STORAGE_MAINTENANCE_HANDLER = 'runWeeklyUserStorageMaintenance_';
+const USER_TRIGGER_MAINTENANCE_HANDLER = 'run12HourlyUserTriggerMaintenance_';
+const LEGACY_DAILY_TRIGGER_MAINTENANCE_HANDLER = 'runDailyUserTriggerMaintenance_';
+const USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY = 'TASKHUB_USER_TRIGGER_MAINTENANCE_REVISION';
+const USER_TRIGGER_MAINTENANCE_REVISION = '12-hour-sync-trigger-repair-2026-10-05-v1';
 
 const HEADER_ROW = [
   '保存日時',
@@ -211,17 +220,61 @@ function include(filename) {
 }
 
 function ensureUserStorageForWeb_() {
+  if (isUserStorageInitializationCurrent_()) {
+    if (isUserTriggerMaintenanceConfigurationCurrent_()) return {ok: true, skipped: true};
+    return runWithUserLock_('バックグラウンドトリガー設定', () => ensureUserTriggerMaintenanceConfigurationLocked_());
+  }
   return runWithUserLock_('保存データ処理', () => ensureUserStorageForWebLocked_());
+}
+
+function isUserStorageInitializationCurrent_() {
+  const props = PropertiesService.getUserProperties();
+  const spreadsheetId = getConfiguredSpreadsheetId_() || props.getProperty(USER_SPREADSHEET_ID_PROPERTY);
+  if (props.getProperty(USER_STORAGE_INITIALIZATION_REVISION_PROPERTY) !== USER_STORAGE_INITIALIZATION_REVISION ||
+      !spreadsheetId) return false;
+  const lastRun = Date.parse(props.getProperty(USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY) || '');
+  return Number.isFinite(lastRun) && Date.now() - lastRun < USER_STORAGE_INITIALIZATION_INTERVAL_MS;
+}
+
+function isUserTriggerMaintenanceConfigurationCurrent_() {
+  return PropertiesService.getUserProperties()
+    .getProperty(USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY) === USER_TRIGGER_MAINTENANCE_REVISION;
+}
+
+function ensureUserTriggerMaintenanceConfigurationLocked_() {
+  const startedAt = Date.now();
+  const triggerMaintenance = ensure12HourlyUserTriggerMaintenanceTrigger_();
+  const storageMaintenance = ensureWeeklyUserStorageMaintenanceTrigger_();
+  PropertiesService.getUserProperties().setProperty(
+    USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY,
+    USER_TRIGGER_MAINTENANCE_REVISION
+  );
+  Logger.log('TASKHUB_TRIGGER_SETUP_TIMING ' + JSON.stringify({elapsedMs: Date.now() - startedAt}));
+  return {
+    ok: true,
+    skipped: true,
+    triggerMaintenanceCreated: triggerMaintenance.created,
+    storageMaintenanceCreated: storageMaintenance.created,
+    removedLegacyDailyTriggers: triggerMaintenance.removedLegacyDailyTriggers || 0
+  };
 }
 
 function ensureUserStorageForWebLocked_() {
   try {
+    const startedAt = Date.now();
     const ss = getOrCreateSpreadsheet_();
 
     ensureNotificationStorage_(ss);
     getOrCreateInCampusSheet_();
     const autoFetchTrigger = ensureAutoFetchTrigger_();
     const classroomApiTrigger = ensureClassroomApiTrigger_();
+    const triggerMaintenance = ensure12HourlyUserTriggerMaintenanceTrigger_();
+    const storageMaintenance = ensureWeeklyUserStorageMaintenanceTrigger_();
+    const props = PropertiesService.getUserProperties();
+    props.setProperty(USER_STORAGE_INITIALIZATION_REVISION_PROPERTY, USER_STORAGE_INITIALIZATION_REVISION);
+    props.setProperty(USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY, new Date().toISOString());
+    props.setProperty(USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY, USER_TRIGGER_MAINTENANCE_REVISION);
+    Logger.log('TASKHUB_INITIALIZATION_TIMING ' + JSON.stringify({elapsedMs: Date.now() - startedAt}));
 
     return {
       ok: true,
@@ -229,6 +282,8 @@ function ensureUserStorageForWebLocked_() {
       spreadsheetUrl: ss.getUrl(),
       autoFetchTriggerCreated: autoFetchTrigger.created,
       classroomApiTriggerCreated: classroomApiTrigger.created,
+      triggerMaintenanceCreated: triggerMaintenance.created,
+      storageMaintenanceCreated: storageMaintenance.created,
       removedDuplicateTriggers: autoFetchTrigger.removedDuplicates
     };
   } catch (error) {
@@ -239,6 +294,80 @@ function ensureUserStorageForWebLocked_() {
       error: error && error.message ? error.message : String(error)
     };
   }
+}
+
+function ensureWeeklyUserStorageMaintenanceTrigger_() {
+  const matchingTriggers = ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === USER_STORAGE_MAINTENANCE_HANDLER);
+  if (matchingTriggers.length) {
+    matchingTriggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
+    return {created: false, removedDuplicates: Math.max(0, matchingTriggers.length - 1)};
+  }
+  ScriptApp.newTrigger(USER_STORAGE_MAINTENANCE_HANDLER)
+    .timeBased()
+    .everyWeeks(1)
+    .onWeekDay(ScriptApp.WeekDay.SUNDAY)
+    .atHour(4)
+    .create();
+  return {created: true, removedDuplicates: 0};
+}
+
+function ensure12HourlyUserTriggerMaintenanceTrigger_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  const legacyTriggers = triggers.filter(trigger =>
+    trigger.getHandlerFunction() === LEGACY_DAILY_TRIGGER_MAINTENANCE_HANDLER
+  );
+  legacyTriggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+
+  const matchingTriggers = triggers.filter(trigger =>
+    trigger.getHandlerFunction() === USER_TRIGGER_MAINTENANCE_HANDLER
+  );
+  if (matchingTriggers.length) {
+    matchingTriggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
+    return {
+      created: false,
+      removedDuplicates: Math.max(0, matchingTriggers.length - 1),
+      removedLegacyDailyTriggers: legacyTriggers.length
+    };
+  }
+  ScriptApp.newTrigger(USER_TRIGGER_MAINTENANCE_HANDLER)
+    .timeBased()
+    .everyHours(12)
+    .create();
+  return {created: true, removedDuplicates: 0, removedLegacyDailyTriggers: legacyTriggers.length};
+}
+
+/** Repair sync triggers every 12 hours without opening or migrating the workbook. */
+function run12HourlyUserTriggerMaintenance_() {
+  return runWithUserLock_('12時間ごとの同期トリガー確認', () => {
+    const startedAt = Date.now();
+    const autoFetchTrigger = ensureAutoFetchTrigger_();
+    const classroomApiTrigger = ensureClassroomApiTrigger_();
+    const storageTrigger = ensureWeeklyUserStorageMaintenanceTrigger_();
+    PropertiesService.getUserProperties().setProperty(
+      USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY,
+      USER_TRIGGER_MAINTENANCE_REVISION
+    );
+    const result = {
+      ok: true,
+      autoFetchTriggerCreated: autoFetchTrigger.created,
+      classroomApiTriggerCreated: classroomApiTrigger.created,
+      storageTriggerCreated: storageTrigger.created
+    };
+    Logger.log('TASKHUB_TRIGGER_MAINTENANCE_TIMING ' + JSON.stringify({
+      elapsedMs: Date.now() - startedAt,
+      ...result
+    }));
+    return result;
+  });
+}
+
+function runWeeklyUserStorageMaintenance_() {
+  return runWithUserLock_('週次保存データ初期化', () => {
+    const result = ensureUserStorageForWebLocked_();
+    if (!result.ok) throw new Error(result.error || '週次の保存データ初期化に失敗しました。');
+    return result;
+  });
 }
 
 function detectSource_(from) {

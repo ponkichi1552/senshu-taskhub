@@ -296,15 +296,39 @@ function getConfiguredTestSpreadsheetId_() {
   return String(configuredId || DEFAULT_TEST_SPREADSHEET_ID || '').trim();
 }
 
-function getNotificationReadSheets_(testSpreadsheet) {
+function getNotificationReadSheets_(testSpreadsheet, spreadsheet) {
   if (isTestCaseModeEnabled_()) {
-    const ss = testSpreadsheet || openTestCaseSpreadsheet_();
+    const ss = testSpreadsheet || spreadsheet || openTestCaseSpreadsheet_();
     return {
       'Google Classroom': ss.getSheetByName('テストClassroom'),
       inCampus: ss.getSheetByName('テストinCampus')
     };
   }
-  return ensureNotificationStorage_(getOrCreateSpreadsheet_());
+  let ss = spreadsheet;
+  if (!ss) {
+    ensureUserStorageForWeb_();
+    ss = getOrCreateSpreadsheet_();
+  }
+  return {
+    'Google Classroom': ss.getSheetByName(CONFIG.SUPPLEMENTARY_SHEET_NAME),
+    inCampus: ss.getSheetByName(INCAMPUS_SHEET_NAME)
+  };
+}
+
+function createNotificationReadContext_(testSpreadsheet, testMode) {
+  const useTestMode = typeof testMode === 'boolean' ? testMode : isTestCaseModeEnabled_();
+  if (!useTestMode) ensureUserStorageForWeb_();
+  const spreadsheet = useTestMode
+    ? (testSpreadsheet || openTestCaseSpreadsheet_())
+    : getOrCreateSpreadsheet_();
+  return {
+    testMode: useTestMode,
+    spreadsheet,
+    sheetsBySource: getNotificationReadSheets_(useTestMode ? spreadsheet : null, spreadsheet),
+    sourceRowsBySource: Object.create(null),
+    sheetReadMs: Object.create(null),
+    sheetRowCounts: Object.create(null)
+  };
 }
 
 function getInCampusReadSheet_(testSpreadsheet) {

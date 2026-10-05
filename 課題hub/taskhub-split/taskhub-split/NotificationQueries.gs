@@ -3,33 +3,53 @@ function getNotificationsForWeb() {
 }
 
 function getNotificationsForWebLocked_() {
+  const startedAt = Date.now();
   const testMode = isTestCaseModeEnabled_();
   const deadlineReferenceNow = testMode ? getTestCaseReferenceNow_() : new Date(Date.now());
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
   const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, deadlineReferenceNow) : null;
   const testStates = testMode ? getTestNotificationStateMap_() : null;
+  const readContext = createNotificationReadContext_(testSpreadsheet, testMode);
+  const contextReadyAt = Date.now();
+  const activeItems = getActiveNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext);
+  const activeReadyAt = Date.now();
+  const supplementItems = getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext);
+  const supplementReadyAt = Date.now();
   const data = mergeNotificationAndInCampusExtractedItemsForWeb_(
-    getActiveNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext),
-    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext),
+    activeItems,
+    supplementItems,
     'assignment',
     testMode
   );
 
-  return data
+  const result = data
     .filter(item => !isNotYetPublishedClassroomApiNotificationForWeb_(item, deadlineReferenceNow))
     .filter(item => !isExpiredNotificationForWeb_(item, deadlineReferenceNow))
     .filter(item => !isStaleUnknownDueNotificationForWeb_(item, deadlineReferenceNow))
     .sort((a, b) => (b.displayReceivedAtTime || b.receivedAtTime) - (a.displayReceivedAtTime || a.receivedAtTime));
+  Logger.log('TASKHUB_NOTIFICATION_READ_TIMING ' + JSON.stringify({
+    mode: testMode ? 'test' : 'personal',
+    contextMs: contextReadyAt - startedAt,
+    activePipelineMs: activeReadyAt - contextReadyAt,
+    supplementPipelineMs: supplementReadyAt - activeReadyAt,
+    mergeFilterSortMs: Date.now() - supplementReadyAt,
+    totalMs: Date.now() - startedAt,
+    sheetReadMs: readContext.sheetReadMs,
+    sheetRowCounts: readContext.sheetRowCounts,
+    itemCounts: {active: activeItems.length, supplement: supplementItems.length, returned: result.length},
+    inCampusSnapshotReused: !testMode && Array.isArray(readContext.sourceRowsBySource.inCampus)
+  }));
+  return result;
 }
 
-function getActiveNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext) {
-  return runWithUserLock_('保存データ処理', () => getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext));
+function getActiveNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext) {
+  return runWithUserLock_('保存データ処理', () => getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext));
 }
 
-function getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext) {
+function getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext) {
   const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
-  const sheetsBySource = getNotificationReadSheets_(testSpreadsheet);
-  let rows = getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext);
+  const context = readContext || createNotificationReadContext_(testSpreadsheet, testMode);
+  let rows = getNotificationRowsFromSheets_(context.sheetsBySource, testMode, testDateContext, context);
   applyTestNotificationStatesToRows_(rows, testStates);
 
   rows = rows.filter(row => isTaskRelatedRow_(row));
@@ -40,7 +60,7 @@ function getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, te
   return data;
 }
 
-function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext) {
+function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext, readContext) {
   const rows = [];
   const useTestMode = typeof testMode === 'boolean' ? testMode : isTestCaseModeEnabled_();
   const dateContext = useTestMode
@@ -54,7 +74,13 @@ function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContex
       return;
     }
 
+    const readStartedAt = Date.now();
     let sourceRows = sheet.getDataRange().getValues().slice(1);
+    if (readContext) {
+      readContext.sheetReadMs[storageConfig.source] = (readContext.sheetReadMs[storageConfig.source] || 0) + Date.now() - readStartedAt;
+      readContext.sheetRowCounts[storageConfig.source] = sourceRows.length;
+      readContext.sourceRowsBySource[storageConfig.source] = sourceRows;
+    }
     if (!useTestMode && storageConfig.source === 'inCampus') {
       sourceRows = sourceRows.filter(row =>
         String(row[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] || '') === INCAMPUS_GMAIL_RECORD_TYPE ||
@@ -70,7 +96,7 @@ function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContex
 
   // Classroom API tasks live in the structured 授業 / Classroom課題 / 提出状況
   // tabs. Convert them to the existing display model without writing a second copy.
-  if (!useTestMode) rows.push(...getClassroomApiNotificationRowsForWeb_());
+  if (!useTestMode) rows.push(...getClassroomApiNotificationRowsForWeb_(readContext && readContext.spreadsheet, readContext));
 
   return mergeClassroomGmailAssignmentsWithApiRowsForWeb_(rows);
 }

@@ -15,12 +15,12 @@ const results = [];
 const clone = value => value instanceof Date ? new Date(value) : Array.isArray(value) ? value.map(clone) : value;
 function check(name, fn) {try {fn(); results.push({name, passed: true});} catch (error) {results.push({name, passed: false, error: error.stack});}}
 class Sheet {
-  constructor(name, rows = []) {this.name = name; this.rows = clone(rows); this.writes = 0; this.maxRows = Math.max(100, rows.length); this.frozen = 0; this.onRead = null;}
+  constructor(name, rows = []) {this.name = name; this.rows = clone(rows); this.writes = 0; this.dataRangeCalls = 0; this.maxRows = Math.max(100, rows.length); this.frozen = 0; this.onRead = null;}
   getName() {return this.name;}
   getSheetId() {return 1;}
   getLastRow() {let n = this.rows.length; while (n && this.rows[n - 1].every(v => v === '' || v == null)) n--; return n;}
   getLastColumn() {return Math.max(0, ...this.rows.map(r => r.length));}
-  getDataRange() {return this.getRange(1, 1, Math.max(1, this.getLastRow()), Math.max(1, this.getLastColumn()));}
+  getDataRange() {this.dataRangeCalls++; return this.getRange(1, 1, Math.max(1, this.getLastRow()), Math.max(1, this.getLastColumn()));}
   getRange(r, c, h = 1, w = 1) {
     const sheet = this;
     return {
@@ -40,15 +40,16 @@ class Sheet {
   autoResizeColumns() {throw new Error('Read must not auto-resize');}
 }
 function environment(shared) {
-  const state = shared || {held: false, acquisitions: 0, releases: 0, flushes: 0, props: {}, scriptProps: {}, sheets: {}, testSheets: {}, triggers: [], gmail: [], gmailSearches: 0, gmailQueries: [], userPropertyGetCalls: 0, userPropertiesSnapshotCalls: 0, spreadsheetOpenCalls: {}, spreadsheetCreateCalls: 0};
+  const state = shared || {held: false, acquisitions: 0, releases: 0, flushes: 0, props: {}, scriptProps: {}, sheets: {}, testSheets: {}, triggers: [], gmail: [], gmailSearches: 0, gmailQueries: [], userPropertyGetCalls: 0, userPropertiesSnapshotCalls: 0, spreadsheetOpenCalls: {}, spreadsheetCreateCalls: 0, logs: []};
   state.spreadsheetCreateCalls ||= 0;
+  state.logs ||= [];
   const ss = {getId: () => 'test-sheet', getUrl: () => 'mock://test-sheet', getSheetByName: name => state.sheets[name] || null,
     insertSheet(name) {return state.sheets[name] = new Sheet(name);}, deleteSheet(sheet) {delete state.sheets[sheet.name];}};
   const testSs = {getId: () => 'test-case-sheet', getUrl: () => 'mock://test-case-sheet', getSheetByName: name => state.testSheets[name] || null,
     insertSheet(name) {return state.testSheets[name] = new Sheet(name);}, deleteSheet(sheet) {delete state.testSheets[sheet.name];}};
   const props = {getProperty(name) {state.userPropertyGetCalls++; return state.props[name] || null;}, setProperty(name, value) {state.props[name] = value;}, deleteProperty(name) {delete state.props[name];}, getProperties() {state.userPropertiesSnapshotCalls++; return {...state.props};}};
   const scriptProps = {getProperty: name => state.scriptProps[name] || null, setProperty(name, value) {state.scriptProps[name] = value;}, deleteProperty(name) {delete state.scriptProps[name];}, getProperties: () => ({...state.scriptProps})};
-  const c = vm.createContext({Date, Set, Map, console, Logger: {log() {}},
+  const c = vm.createContext({Date, Set, Map, console, Logger: {log(message) {state.logs.push(String(message));}},
     SpreadsheetApp: {openById(id) {state.spreadsheetOpenCalls[id]=(state.spreadsheetOpenCalls[id]||0)+1;if (id === 'test-case-sheet') return testSs; if (id === 'test-sheet') return ss; throw new Error('not found');}, create() {state.spreadsheetCreateCalls++; return ss;}, flush() {state.flushes++;}},
     PropertiesService: {getUserProperties: () => props, getScriptProperties: () => scriptProps},
     LockService: {getUserLock() {return {tryLock() {if (state.held) return false; state.held = true; state.acquisitions++; return true;}, releaseLock() {assert.ok(state.held); state.held = false; state.releases++;}};}},
@@ -56,9 +57,10 @@ function environment(shared) {
       Utilities: {DigestAlgorithm: {SHA_256: 'sha256'}, Charset: {UTF_8: 'utf8'}, computeDigest: (_, value) => [...crypto.createHash('sha256').update(String(value)).digest()],
       getUuid: () => crypto.randomUUID(), formatDate(value, zone, pattern) {const d = new Date(value), p = x => String(x).padStart(2, '0'); const date = `${d.getFullYear()}/${p(d.getMonth()+1)}/${p(d.getDate())}`; const isoDate = `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`; const full = `${date} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; if (pattern === "yyyy-MM-dd'T'HH:mm") return `${isoDate}T${p(d.getHours())}:${p(d.getMinutes())}`; if (pattern === 'yyyy-MM-dd') return isoDate; if (pattern === 'yyyy/MM/dd') return date; return pattern.endsWith(':ss') ? full : full.slice(0, 16);}},
     ScriptApp: {
+      WeekDay: {SUNDAY: 'SUNDAY'},
       getProjectTriggers: () => state.triggers,
       deleteTrigger(trigger) {state.triggers = state.triggers.filter(item => item !== trigger);},
-      newTrigger(handler) {return {timeBased() {return this;}, everyMinutes(minutes) {this.minutes = minutes; return this;}, create() {const trigger = {handler, minutes: this.minutes, revision: 'current', getHandlerFunction() {return handler;}}; state.triggers.push(trigger); return trigger;}};}
+      newTrigger(handler) {const trigger = {handler, revision: 'current', getHandlerFunction() {return handler;}}; return {timeBased() {return this;}, everyMinutes(minutes) {trigger.minutes = minutes; return this;}, everyHours(hours) {trigger.hours = hours; return this;}, everyWeeks(weeks) {trigger.weeks = weeks; return this;}, onWeekDay(weekday) {trigger.weekday = weekday; return this;}, atHour(hour) {trigger.hour = hour; return this;}, create() {state.triggers.push(trigger); return trigger;}};}
     },
     GmailApp: {search(query, offset, count) {state.gmailSearches++; state.gmailQueries.push({query, offset, count}); if (state.onGmailSearch) {const callback = state.onGmailSearch; state.onGmailSearch = null; callback();} return state.gmail.filter(t => query.includes(t.source === 'inCampus' ? 'incampus' : 'classroom.google.com')).slice(offset, offset + count);}},
     ContentService: {MimeType: {JSON: 'JSON'}, createTextOutput(value) {return {value, setMimeType() {return this;}};}}
@@ -113,6 +115,128 @@ function putMail(env, rows) {return env.add('inCampus通知', [env.headers, ...r
 function logical(env, sheet) {return sheet.rows.slice(1).flatMap(row => Array.from(env.c.expandInCampusNotificationRow_(row)));}
 function expectDate(date, year, month, day, hour, minute) {assert.ok(date instanceof Date); assert.deepEqual([date.getFullYear(), date.getMonth()+1, date.getDate(), date.getHours(), date.getMinutes()], [year, month, day, hour, minute]);}
 check('All GAS scripts parse', () => {new vm.Script(source);});
+check('Warm page loads skip storage bootstrap while weekly maintenance remains scheduled',()=>{
+  const e=environment();
+  const revisionKey=vm.runInContext('USER_STORAGE_INITIALIZATION_REVISION_PROPERTY',e.c);
+  const lastRunKey=vm.runInContext('USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY',e.c);
+  e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';
+  e.state.props[revisionKey]=vm.runInContext('USER_STORAGE_INITIALIZATION_REVISION',e.c);
+  e.state.props[lastRunKey]=new Date().toISOString();
+  e.state.props[vm.runInContext('USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY',e.c)]=vm.runInContext('USER_TRIGGER_MAINTENANCE_REVISION',e.c);
+  const result=e.c.ensureUserStorageForWeb_();
+  assert.equal(result.ok,true);assert.equal(result.skipped,true);
+  assert.equal(e.state.acquisitions,0,'a warm home request does not wait for the user lock');
+  assert.equal(e.state.spreadsheetOpenCalls['test-sheet']||0,0,'a warm home request does not open the workbook for initialization');
+  const weekly=e.c.ensureWeeklyUserStorageMaintenanceTrigger_();
+  assert.equal(weekly.created,true);
+  const trigger=e.state.triggers.find(item=>item.handler==='runWeeklyUserStorageMaintenance_');
+  assert.deepEqual([trigger.weeks,trigger.weekday,trigger.hour],[1,'SUNDAY',4]);
+});
+check('A trigger revision update repairs its schedule on a warm request without reopening storage',()=>{
+  const e=environment();
+  e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';
+  e.state.props[vm.runInContext('USER_STORAGE_INITIALIZATION_REVISION_PROPERTY',e.c)]=vm.runInContext('USER_STORAGE_INITIALIZATION_REVISION',e.c);
+  e.state.props[vm.runInContext('USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY',e.c)]=new Date().toISOString();
+  const legacy={getHandlerFunction:()=> 'runDailyUserTriggerMaintenance_'};
+  e.state.triggers.push(legacy);
+  e.c.ensureNotificationStorage_=()=>{throw new Error('trigger configuration must not initialize workbook storage');};
+  const result=e.c.ensureUserStorageForWeb_();
+  assert.equal(result.ok,true);assert.equal(result.skipped,true);
+  assert.equal(e.state.acquisitions,1,'the one-time schedule migration takes the user lock');
+  assert.equal(e.state.spreadsheetOpenCalls['test-sheet']||0,0,'schedule migration does not open the workbook');
+  assert.equal(e.state.triggers.includes(legacy),false);
+  assert.equal(e.state.triggers.find(trigger=>trigger.handler==='run12HourlyUserTriggerMaintenance_').hours,12);
+  assert.equal(e.state.props[vm.runInContext('USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY',e.c)],vm.runInContext('USER_TRIGGER_MAINTENANCE_REVISION',e.c));
+});
+check('Trigger health check migrates the old daily trigger to exactly one 12-hour background trigger',()=>{
+  const e=environment();
+  const legacy={getHandlerFunction:()=> 'runDailyUserTriggerMaintenance_'};
+  e.state.triggers.push(legacy);
+  const first=e.c.ensure12HourlyUserTriggerMaintenanceTrigger_();
+  assert.equal(first.created,true);
+  assert.equal(first.removedLegacyDailyTriggers,1);
+  assert.equal(e.state.triggers.some(item=>item===legacy),false);
+  const installed=e.state.triggers.find(item=>item.handler==='run12HourlyUserTriggerMaintenance_');
+  assert.equal(installed.hours,12);
+  assert.equal(e.c.ensure12HourlyUserTriggerMaintenanceTrigger_().created,false);
+  assert.equal(e.state.triggers.filter(item=>item.handler==='run12HourlyUserTriggerMaintenance_').length,1);
+});
+check('12-hour trigger maintenance repairs sync triggers without opening the personal workbook',()=>{
+  const e=environment();
+  const originalAuto=e.c.ensureAutoFetchTrigger_, originalApi=e.c.ensureClassroomApiTrigger_;
+  const originalWeekly=e.c.ensureWeeklyUserStorageMaintenanceTrigger_, originalStorage=e.c.ensureNotificationStorage_;
+  e.c.ensureAutoFetchTrigger_=()=>({created:false});
+  e.c.ensureClassroomApiTrigger_=()=>({created:false});
+  e.c.ensureWeeklyUserStorageMaintenanceTrigger_=()=>({created:false});
+  e.c.ensureNotificationStorage_=()=>{throw new Error('background trigger check must not touch workbook storage');};
+  const result=e.c.run12HourlyUserTriggerMaintenance_();
+  e.c.ensureAutoFetchTrigger_=originalAuto;e.c.ensureClassroomApiTrigger_=originalApi;
+  e.c.ensureWeeklyUserStorageMaintenanceTrigger_=originalWeekly;e.c.ensureNotificationStorage_=originalStorage;
+  assert.equal(result.ok,true);
+  assert.equal(e.state.spreadsheetOpenCalls['test-sheet']||0,0);
+  assert.ok(e.state.logs.some(message=>message.startsWith('TASKHUB_TRIGGER_MAINTENANCE_TIMING ')));
+});
+check('Home notification read reuses the one inCampus workbook snapshot for Gmail and extraction rows',()=>{
+  const e=environment();
+  const revisionKey=vm.runInContext('USER_STORAGE_INITIALIZATION_REVISION_PROPERTY',e.c);
+  const lastRunKey=vm.runInContext('USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY',e.c);
+  e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';
+  e.state.props[revisionKey]=vm.runInContext('USER_STORAGE_INITIALIZATION_REVISION',e.c);
+  e.state.props[lastRunKey]=new Date().toISOString();
+  const unifiedHeaders=Array.from(vm.runInContext('INCAMPUS_UNIFIED_HEADERS',e.c));
+  const mail=row('mail-snapshot','仮想課題',body('仮想課題'),{due:new Date(2099,9,25)}).concat(Array(unifiedHeaders.length-16).fill(''));
+  mail[16]='gmail';
+  const extract=Array(unifiedHeaders.length).fill('');
+  extract[16]='extract';
+  const extractValues=['inCampus','assignment','仮想課題','架空の詳細本文',new Date(2026,8,1),new Date(2099,9,25),'2026/09/01 09:00～2026/09/10 23:59','可','レポート','','https://ic.ss.senshu-u.jp/lms/course/report/virtual-snapshot',new Date(),new Date(),JSON.stringify({courseName:'仮想情報演習',weekdayPeriod:'火曜5限',updateText:'課題(仮想課題)が追加されました',updateAction:'add',assignmentKey:'virtual-snapshot'}),'未確認','','virtual-snapshot'];
+  extractValues.forEach((value,index)=>{extract[17+index]=value;});
+  const inCampus=e.add('inCampus通知',[unifiedHeaders,mail,extract]);
+  e.add('補足通知',[e.headers]);
+  e.add('Classroom通知',[e.headers]);
+  const items=e.c.getNotificationsForWeb();
+  assert.equal(inCampus.dataRangeCalls,1,'Gmail notification and extraction data share one getDataRange call');
+  assert.ok(items.some(item=>String(item.messageId).startsWith('mail-snapshot:update:')));
+  const timing=e.state.logs.find(message=>message.startsWith('TASKHUB_NOTIFICATION_READ_TIMING '));
+  assert.ok(timing);
+  assert.equal(JSON.parse(timing.slice('TASKHUB_NOTIFICATION_READ_TIMING '.length)).inCampusSnapshotReused,true);
+});
+check('Classroom submission sync uses paginated course-wide lookups and joins by coursework ID', () => {
+  const e = environment();
+  const calls = [];
+  e.c.Classroom = {Courses: {CourseWork: {StudentSubmissions: {list(courseId, courseworkId, request) {
+    calls.push({courseId, courseworkId, request});
+    if (request.pageToken) return {studentSubmissions: [
+      {courseWorkId: 'work-2', userId: 'student-current', state: 'RETURNED', late: true, assignedGrade: 8}
+    ]};
+    return {
+      studentSubmissions: [{courseWorkId: 'work-1', userId: 'student-current', state: 'TURNED_IN'}],
+      nextPageToken: 'submissions-next'
+    };
+  }}}}};
+
+  const submissions = e.c.listClassroomApiExperimentStudentSubmissionsForCourse_('course-a');
+  assert.equal(submissions.length, 2);
+  assert.equal(calls.length, 2, 'the page token is followed for the complete response');
+  assert.ok(calls.every(call => call.courseId === 'course-a' && call.courseworkId === '-'));
+  assert.ok(calls.every(call => call.request.userId === 'me'));
+  assert.ok(calls.every(call => call.request.fields.includes('courseWorkId')));
+  assert.equal(calls[1].request.pageToken, 'submissions-next');
+
+  const indexed = e.c.indexClassroomApiExperimentSubmissionsByCoursework_(submissions);
+  assert.equal(indexed.missingCourseworkIdCount, 0);
+  assert.equal(indexed.byCourseworkId.get('work-2')[0].state, 'RETURNED');
+  assert.equal(e.c.selectClassroomApiExperimentCurrentStudentSubmission_(
+    indexed.byCourseworkId.get('work-2'), 'student-current'
+  ).assignedGrade, 8);
+  assert.equal(e.c.indexClassroomApiExperimentSubmissionsByCoursework_([{state: 'NEW'}]).missingCourseworkIdCount, 1,
+    'missing coursework IDs can be detected and cause the sync to fail closed');
+
+  const syncSource = fs.readFileSync(path.join(gasSourceDir, 'ClassroomApiSync.gs'), 'utf8');
+  const syncBody = syncSource.slice(syncSource.indexOf('function syncClassroomApiCourseworkToSpreadsheet_'), syncSource.indexOf('/** Save the Classroom API snapshot'));
+  assert.match(syncBody, /listClassroomApiExperimentStudentSubmissionsForCourse_\(courseId\)/);
+  assert.doesNotMatch(syncBody, /listClassroomApiExperimentStudentSubmissions_\(courseId, String\(item\.id/);
+  return {pages: calls.length, courseworkIds: Array.from(indexed.byCourseworkId.keys())};
+});
 check('Real added + updated mail yields one assignment with nested parentheses/quotes', () => {
   const {c} = environment();
   const text = '履修者：SIM-000001\n\n曜日・時限：火曜5限\n授業名：仮想情報演習\n教員名：架空担当B、架空担当C\n更新内容：\n・課題(「仮想対話」課題)が追加されました。(07/03 08:00)\n・課題(「仮想対話」課題)が更新されました。(07/03 08:00)\n=====\n※※このメールは専修大学のin Campus発信専用です。返信はできません。※※';

@@ -105,24 +105,35 @@ function getClassroomCourseworkKey_(courseId, courseworkId) {
   return `${String(courseId || '').trim()}\u001f${String(courseworkId || '').trim()}`;
 }
 
-function getClassroomApiNotificationRowsForWeb_() {
-  const spreadsheet = getOrCreateSpreadsheet_();
+function getClassroomApiNotificationRowsForWeb_(spreadsheet, readContext) {
+  const ss = spreadsheet || getOrCreateSpreadsheet_();
   const hasStructuredSnapshot = Boolean(
     PropertiesService.getUserProperties().getProperty(CLASSROOM_API_STRUCTURED_SYNC_PROPERTY)
   );
   if (!hasStructuredSnapshot ||
       PropertiesService.getUserProperties().getProperty(CLASSROOM_API_STRUCTURED_SYNC_IN_PROGRESS_PROPERTY) === 'true') {
-    return getLegacyClassroomApiNotificationRows_(spreadsheet);
+    return getLegacyClassroomApiNotificationRows_(ss);
   }
 
-  const courseworkSheet = spreadsheet.getSheetByName(CONFIG.CLASSROOM_COURSEWORK_SHEET_NAME);
-  const submissionsSheet = spreadsheet.getSheetByName(CONFIG.CLASSROOM_SUBMISSIONS_SHEET_NAME);
+  const courseworkSheet = ss.getSheetByName(CONFIG.CLASSROOM_COURSEWORK_SHEET_NAME);
+  const submissionsSheet = ss.getSheetByName(CONFIG.CLASSROOM_SUBMISSIONS_SHEET_NAME);
   if (!courseworkSheet || courseworkSheet.getLastRow() < 2) return [];
 
+  const courseworkReadStartedAt = Date.now();
   const taskRows = courseworkSheet.getDataRange().getValues().slice(1);
+  if (readContext) {
+    readContext.sheetReadMs.classroomCoursework = (readContext.sheetReadMs.classroomCoursework || 0) + Date.now() - courseworkReadStartedAt;
+    readContext.sheetRowCounts.classroomCoursework = taskRows.length;
+  }
   const submissionByKey = new Map();
   if (submissionsSheet && submissionsSheet.getLastRow() >= 2) {
-    submissionsSheet.getDataRange().getValues().slice(1).forEach(row => {
+    const submissionsReadStartedAt = Date.now();
+    const submissionRows = submissionsSheet.getDataRange().getValues().slice(1);
+    if (readContext) {
+      readContext.sheetReadMs.classroomSubmissions = (readContext.sheetReadMs.classroomSubmissions || 0) + Date.now() - submissionsReadStartedAt;
+      readContext.sheetRowCounts.classroomSubmissions = submissionRows.length;
+    }
+    submissionRows.forEach(row => {
       submissionByKey.set(getClassroomCourseworkKey_(row[0], row[1]), row);
     });
   }

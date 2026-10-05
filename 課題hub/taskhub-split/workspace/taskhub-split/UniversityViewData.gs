@@ -288,9 +288,10 @@ function getCompletedNotificationsForWebLocked_() {
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
   const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, deadlineReferenceNow) : null;
   const testStates = testMode ? getTestNotificationStateMap_() : null;
+  const readContext = createNotificationReadContext_(testSpreadsheet, testMode);
   const data = mergeNotificationAndInCampusExtractedItemsForWeb_(
-    getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext),
-    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext),
+    getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext),
+    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext),
     'assignment',
     testMode
   );
@@ -308,21 +309,46 @@ function getCompletedNotificationsForWebLocked_() {
     });
 }
 
-function getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext) {
-  return runWithUserLock_('保存データ処理', () => getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext));
+function getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext) {
+  return runWithUserLock_('保存データ処理', () => getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext));
 }
 
-function getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext) {
+function getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext) {
   const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
   const states = testMode ? (testStates || getTestNotificationStateMap_()) : null;
-  const sheet = getInCampusReadSheet_(testSpreadsheet);
-  if (!sheet || sheet.getLastRow() < 2) return [];
-  const headerMap = getInCampusHeaderMap_(sheet);
   const dateContext = testMode ? (testDateContext || getTestCaseDateContext_(testSpreadsheet, getTestCaseReferenceNow_())) : null;
-  return sheet.getDataRange().getValues().slice(1)
+  let rows;
+  let headerMap;
+  const savedInCampusRows = readContext && readContext.sourceRowsBySource.inCampus;
+  if (!testMode && Array.isArray(savedInCampusRows)) {
+    rows = savedInCampusRows
+      .filter(row => String(row[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] || '') === INCAMPUS_EXTRACT_RECORD_TYPE ||
+        (!row[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] && row.slice(INCAMPUS_UNIFIED_EXTRACT_START_COLUMN)
+          .some(value => value !== '' && value !== null && value !== undefined)))
+      .map(row => row.slice(INCAMPUS_UNIFIED_EXTRACT_START_COLUMN,
+        INCAMPUS_UNIFIED_EXTRACT_START_COLUMN + INCAMPUS_HEADERS.length));
+    headerMap = getInCampusExtractHeaderMap_();
+  } else {
+    const sheet = getInCampusReadSheet_(testSpreadsheet);
+    if (!sheet || sheet.getLastRow() < 2) return [];
+    headerMap = getInCampusHeaderMap_(sheet);
+    const readStartedAt = Date.now();
+    rows = sheet.getDataRange().getValues().slice(1);
+    if (readContext) {
+      readContext.sheetReadMs.inCampusExtract = (readContext.sheetReadMs.inCampusExtract || 0) + Date.now() - readStartedAt;
+      readContext.sheetRowCounts.inCampusExtract = rows.length;
+    }
+  }
+  return rows
     .map(row => testMode ? mapTestCaseExtractRowForRead_(row, dateContext) : row)
     .map(row => rowToInCampusExtractedItem_(row, headerMap))
     .map(item => applyTestNotificationStateToItem_(item, states));
+}
+
+function getInCampusExtractHeaderMap_() {
+  const headerMap = {};
+  INCAMPUS_HEADERS.forEach((header, index) => { headerMap[header] = index + 1; });
+  return headerMap;
 }
 
 function normalizeInCampusExactText_(value) {
@@ -443,14 +469,14 @@ function isGenericInCampusCourseNameForMatch_(courseName) {
     text === 'incampusお知らせ';
 }
 
-function getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext) {
-  return runWithUserLock_('保存データ処理', () => getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext));
+function getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext) {
+  return runWithUserLock_('保存データ処理', () => getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext));
 }
 
-function getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext) {
+function getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext) {
   const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
-  const sheetsBySource = getNotificationReadSheets_(testSpreadsheet);
-  let rows = getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext);
+  const context = readContext || createNotificationReadContext_(testSpreadsheet, testMode);
+  let rows = getNotificationRowsFromSheets_(context.sheetsBySource, testMode, testDateContext, context);
   applyTestNotificationStatesToRows_(rows, testStates);
 
   rows = rows.filter(row => isTaskRelatedRow_(row));
