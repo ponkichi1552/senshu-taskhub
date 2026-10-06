@@ -13,8 +13,13 @@
     <?!= include('Home'); ?>
 
     <section id="assignment-view" class="app-view assignment-view" aria-label="課題通知一覧">
-      <header>
-        <span>課題通知Hub</span>
+      <header class="assignment-header">
+        <div class="assignment-header-leading">
+          <button id="assignment-menu-toggle" class="assignment-menu-toggle" type="button" aria-label="課題通知メニューを開く" aria-controls="assignment-menu-drawer" aria-expanded="false" onclick="toggleAssignmentMenu()">
+            <span></span><span></span><span></span>
+          </button>
+          <span class="assignment-header-title">課題通知Hub</span>
+        </div>
         <div class="header-actions">
           <button id="header-test-clock-button" class="refresh-button test-clock-header-button" type="button" onclick="openTestClockModal()" hidden>テスト日時</button>
           <button class="refresh-button" onclick="requestBrowserNotificationPermission()">通知許可</button>
@@ -32,6 +37,24 @@
         <div id="list" class="loading">読み込み中...</div>
       </main>
     </section>
+
+    <div id="assignment-menu-backdrop" class="assignment-menu-backdrop" onclick="closeAssignmentMenu()"></div>
+
+    <nav id="assignment-menu-drawer" class="assignment-menu-drawer" aria-label="課題通知メニュー" aria-hidden="true" inert>
+      <div class="assignment-menu-header">
+        <strong>課題通知</strong>
+        <button class="assignment-menu-close" type="button" aria-label="メニューを閉じる" onclick="closeAssignmentMenu()">×</button>
+      </div>
+      <button id="assignment-menu-active" class="assignment-menu-item" type="button" aria-pressed="false" onclick="selectAssignmentMenu('active')">
+        <span class="assignment-menu-icon" aria-hidden="true">○</span><span>未完了</span>
+      </button>
+      <button id="assignment-menu-completed" class="assignment-menu-item" type="button" aria-pressed="false" onclick="selectAssignmentMenu('completed')">
+        <span class="assignment-menu-icon" aria-hidden="true">✓</span><span>完了</span>
+      </button>
+      <button id="assignment-menu-search" class="assignment-menu-item" type="button" aria-pressed="false" onclick="selectAssignmentMenu('search')">
+        <span class="assignment-menu-icon" aria-hidden="true">⌕</span><span>検索</span>
+      </button>
+    </nav>
 
     <div id="course-filter-backdrop" class="course-filter-backdrop" onclick="closeCourseFilterPanel()"></div>
 
@@ -70,7 +93,7 @@
             <li>ClassroomやinCampusの通知を、期限ごとに整理して表示します。</li>
             <li>「課題を開く」から、Classroomの該当ページへ移動できます。</li>
             <li>「詳細」を押すと、保存された通知本文を確認できます。</li>
-            <li>授業ごとに絞りたい時は、画面下の「フィルター」を使ってください。</li>
+            <li>未完了・完了の切り替えや授業検索は、画面左上のメニューから使えます。</li>
             <li>通知許可を押すと、新しい課題通知をブラウザ通知で受け取れます。</li>
           </ul>
           <div class="help-modal-note">

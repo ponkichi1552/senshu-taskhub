@@ -126,6 +126,48 @@ test('bottom navigation keeps the same labels and routes across home, assignment
   assert.equal(assignments.classList.contains('active'), false);
 });
 
+test('assignment hamburger drawer routes unfinished, completed, and search while tracking selection', () => {
+  const index = fs.readFileSync(path.join(sourceDir, 'Index.html'), 'utf8');
+  const header = index.match(/<header class="assignment-header">([\s\S]*?)<\/header>/);
+  const drawer = index.match(/<nav id="assignment-menu-drawer"[\s\S]*?<\/nav>/);
+  assert.ok(header && header[1].includes('assignment-menu-toggle'));
+  assert.ok(header[1].indexOf('assignment-menu-toggle') < header[1].indexOf('課題通知Hub'));
+  assert.ok(drawer);
+  const destinations = Array.from(drawer[0].matchAll(/<button id="assignment-menu-[^"]+"[^>]*>([\s\S]*?)<\/button>/g), match => match[1].replace(/<[^>]*>/g, '').trim());
+  assert.deepEqual(destinations, ['○未完了', '✓完了', '⌕検索']);
+
+  const f = fixture();
+  f.seed([item('active')], [item('done', true)]);
+  const navActive = f.document.getElementById('assignment-menu-active');
+  const navCompleted = f.document.getElementById('assignment-menu-completed');
+  const navSearch = f.document.getElementById('assignment-menu-search');
+  const assignmentDrawer = f.document.getElementById('assignment-menu-drawer');
+
+  f.c.toggleAssignmentMenu();
+  assert.equal(assignmentDrawer.classList.contains('is-open'), true);
+  assert.equal(assignmentDrawer.inert, false);
+  assert.equal(f.document.getElementById('assignment-menu-toggle')['aria-expanded'], 'true');
+  assert.equal(navActive.classList.contains('active'), true);
+
+  f.c.selectAssignmentMenu('completed');
+  assert.equal(f.read('currentScreen'), 'completed');
+  assert.equal(navCompleted.classList.contains('active'), true);
+  assert.equal(assignmentDrawer.inert, true);
+  assert.ok(f.pending('getCompletedNotificationsForWeb').length);
+
+  f.c.selectAssignmentMenu('search');
+  assert.equal(f.document.getElementById('course-filter-panel').classList.contains('is-open'), true);
+  assert.equal(navSearch.classList.contains('active'), true);
+  f.c.selectCourseFilter('仮想情報演習');
+  assert.equal(f.document.getElementById('course-filter-panel').classList.contains('is-open'), false);
+  assert.equal(navSearch.classList.contains('active'), true);
+
+  f.c.selectAssignmentMenu('active');
+  assert.equal(f.read('currentScreen'), 'active');
+  assert.equal(navActive.classList.contains('active'), true);
+  assert.equal(navSearch.classList.contains('active'), true);
+});
+
 test('reverse active/completed replies preserve completed screen and home cache', () => {
   const f = fixture(undefined, {holdBoot: true}), boot = f.take('getNotificationsForWeb');
   f.c.loadNotifications(); const active = f.pending('getNotificationsForWeb').at(-1);

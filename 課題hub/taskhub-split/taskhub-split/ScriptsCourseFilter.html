@@ -92,9 +92,7 @@
 
   function toggleCourseFilterPanel() {
     const panel = document.getElementById('course-filter-panel');
-    const backdrop = document.getElementById('course-filter-backdrop');
-
-    if (!panel || !backdrop) {
+    if (!panel) {
       return;
     }
 
@@ -103,10 +101,22 @@
     if (isOpen) {
       closeCourseFilterPanel();
     } else {
-      renderCourseFilterList();
-      panel.classList.add('is-open');
-      backdrop.classList.add('is-open');
+      openCourseFilterPanel();
     }
+  }
+
+  function openCourseFilterPanel() {
+    const panel = document.getElementById('course-filter-panel');
+    const backdrop = document.getElementById('course-filter-backdrop');
+
+    if (!panel || !backdrop) {
+      return;
+    }
+
+    renderCourseFilterList();
+    panel.classList.add('is-open');
+    backdrop.classList.add('is-open');
+    updateAssignmentMenuState();
   }
 
   function closeCourseFilterPanel() {
@@ -120,6 +130,95 @@
     if (backdrop) {
       backdrop.classList.remove('is-open');
     }
+
+    updateAssignmentMenuState();
+  }
+
+  function toggleAssignmentMenu() {
+    const drawer = document.getElementById('assignment-menu-drawer');
+
+    if (!drawer) {
+      return;
+    }
+
+    if (drawer.classList.contains('is-open')) {
+      closeAssignmentMenu();
+      return;
+    }
+
+    closeCourseFilterPanel();
+    openAssignmentMenu();
+  }
+
+  function openAssignmentMenu() {
+    const drawer = document.getElementById('assignment-menu-drawer');
+    const backdrop = document.getElementById('assignment-menu-backdrop');
+    const toggle = document.getElementById('assignment-menu-toggle');
+
+    if (!drawer || !backdrop) {
+      return;
+    }
+
+    drawer.inert = false;
+    drawer.setAttribute('aria-hidden', 'false');
+    drawer.classList.add('is-open');
+    backdrop.classList.add('is-open');
+
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', 'true');
+    }
+  }
+
+  function closeAssignmentMenu() {
+    const drawer = document.getElementById('assignment-menu-drawer');
+    const backdrop = document.getElementById('assignment-menu-backdrop');
+    const toggle = document.getElementById('assignment-menu-toggle');
+
+    if (drawer) {
+      drawer.classList.remove('is-open');
+      drawer.inert = true;
+      drawer.setAttribute('aria-hidden', 'true');
+    }
+
+    if (backdrop) {
+      backdrop.classList.remove('is-open');
+    }
+
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', 'false');
+    }
+  }
+
+  function selectAssignmentMenu(destination) {
+    closeAssignmentMenu();
+
+    if (destination === 'completed') {
+      loadCompletedNotifications();
+    } else if (destination === 'search') {
+      openCourseFilterPanel();
+    } else {
+      loadNotifications();
+    }
+  }
+
+  function updateAssignmentMenuState() {
+    const panel = document.getElementById('course-filter-panel');
+    const searchIsActive = Boolean(panel && panel.classList.contains('is-open')) || selectedCourseName !== 'すべて';
+
+    setAssignmentMenuButton('assignment-menu-active', currentScreen === 'active');
+    setAssignmentMenuButton('assignment-menu-completed', currentScreen === 'completed');
+    setAssignmentMenuButton('assignment-menu-search', searchIsActive);
+  }
+
+  function setAssignmentMenuButton(id, isActive) {
+    const button = document.getElementById(id);
+
+    if (!button) {
+      return;
+    }
+
+    button.classList.toggle('active', Boolean(isActive));
+    button.setAttribute('aria-pressed', String(Boolean(isActive)));
   }
 
   function updateBottomNavState() {
@@ -133,6 +232,7 @@
     setBottomNavButton(assignmentButton, '課題通知', loadNotifications, isAssignmentScreen, false);
     setBottomNavButton(universityButton, '大学からのお知らせ', showUniversityNotices, currentScreen === 'university', false);
     setBottomNavButton(summaryButton, '大学情報まとめ', null, false, true);
+    updateAssignmentMenuState();
   }
 
   function setBottomNavButton(button, label, handler, isActive, isDisabled) {
