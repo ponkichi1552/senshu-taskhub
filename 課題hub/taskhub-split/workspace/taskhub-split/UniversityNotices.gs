@@ -1,8 +1,9 @@
 function getUniversityNoticesForWeb() {
-  return runWithUserLock_('大学のお知らせ', () => getUniversityNoticesForWebLocked_());
+  return getUniversityNoticesForWebLocked_();
 }
 
 function getUniversityNoticesForWebLocked_() {
+  const startedAt = Date.now();
   const testMode = isTestCaseModeEnabled_();
   const now = testMode ? getTestCaseReferenceNow_() : new Date();
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
@@ -10,8 +11,17 @@ function getUniversityNoticesForWebLocked_() {
   const testStates = testMode ? getTestNotificationStateMap_() : null;
   const states = PropertiesService.getUserProperties().getProperties();
   const readContext = createNotificationReadContext_(testSpreadsheet, testMode);
+  const contextReadyAt = Date.now();
 
-  const notices = getNotificationRowsFromSheets_(readContext.sheetsBySource, testMode, testDateContext, readContext)
+  const noticeRows = getNotificationRowsFromSheets_(
+    readContext.sheetsBySource,
+    testMode,
+    testDateContext,
+    readContext,
+    {includeClassroomApi: false, mergeClassroomApiAssignments: false}
+  );
+  const rowsReadyAt = Date.now();
+  const notices = noticeRows
     .filter(row => isUniversityNoticeRow_(row))
     .filter(row => isUniversityNoticeVisible_(row, now))
     .map(row => {
@@ -24,12 +34,29 @@ function getUniversityNoticesForWebLocked_() {
       return Object.assign(notice, {read: Boolean(state.read), saved: Boolean(state.saved)});
     })
     .sort((a, b) => b.receivedAtTime - a.receivedAtTime);
-  return mergeNotificationAndInCampusExtractedItemsForWeb_(
+  const noticesReadyAt = Date.now();
+  const extractedItems = getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext);
+  const extractedReadyAt = Date.now();
+  const result = mergeNotificationAndInCampusExtractedItemsForWeb_(
     notices,
-    getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext),
+    extractedItems,
     'announcement',
     testMode
   );
+  Logger.log('TASKHUB_UNIVERSITY_NOTICE_READ_TIMING ' + JSON.stringify({
+    mode: testMode ? 'test' : 'personal',
+    contextMs: contextReadyAt - startedAt,
+    sourceRowsMs: rowsReadyAt - contextReadyAt,
+    noticeFilterAndMappingMs: noticesReadyAt - rowsReadyAt,
+    inCampusExtractMappingMs: extractedReadyAt - noticesReadyAt,
+    mergeMs: Date.now() - extractedReadyAt,
+    totalMs: Date.now() - startedAt,
+    sheetReadMs: readContext.sheetReadMs,
+    sheetRowCounts: readContext.sheetRowCounts,
+    itemCounts: {sourceRows: noticeRows.length, notices: notices.length, inCampusExtracts: extractedItems.length, returned: result.length},
+    classroomApiAssignmentsRead: false
+  }));
+  return result;
 }
 
 function isUniversityNoticeRow_(row) {

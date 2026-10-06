@@ -4,8 +4,24 @@
   updateBottomNavState();
   renderHome();
   loadTestCaseClockState();
-  loadHomeNotifications();
   showHelpOnFirstVisit();
+
+  function loadInitialTaskHubView(location) {
+    const view = location && location.parameter && location.parameter.view;
+    if (view === 'university') {
+      showUniversityNotices();
+    } else if (view === 'assignment') {
+      loadNotifications();
+    } else {
+      loadHomeNotifications();
+    }
+  }
+
+  if (google.script.url && typeof google.script.url.getLocation === 'function') {
+    google.script.url.getLocation(loadInitialTaskHubView);
+  } else {
+    loadHomeNotifications();
+  }
 
   setInterval(() => {
     if (currentScreen === 'active' || currentScreen === 'home') {

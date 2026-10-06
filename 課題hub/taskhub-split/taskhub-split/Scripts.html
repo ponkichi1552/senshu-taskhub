@@ -8,6 +8,7 @@
   let undoToastTimerId = null;
   const notificationData = {active: [], completed: []};
   const notificationRequestIds = {active: 0, completed: 0};
+  const notificationRequestsInFlight = {active: null, completed: null};
   const notificationStatusChanges = new Map();
   let notificationStatusGeneration = 0;
   let currentViewMode = 'active';

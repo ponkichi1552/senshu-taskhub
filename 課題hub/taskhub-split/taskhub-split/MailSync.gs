@@ -320,7 +320,7 @@ function createNotificationReadContext_(testSpreadsheet, testMode) {
   if (!useTestMode) ensureUserStorageForWeb_();
   const spreadsheet = useTestMode
     ? (testSpreadsheet || openTestCaseSpreadsheet_())
-    : getOrCreateSpreadsheet_();
+    : getSpreadsheetForRead_();
   return {
     testMode: useTestMode,
     spreadsheet,
@@ -329,6 +329,15 @@ function createNotificationReadContext_(testSpreadsheet, testMode) {
     sheetReadMs: Object.create(null),
     sheetRowCounts: Object.create(null)
   };
+}
+
+function getSpreadsheetForRead_() {
+  const props = PropertiesService.getUserProperties();
+  const id = getConfiguredSpreadsheetId_() || props.getProperty(USER_SPREADSHEET_ID_PROPERTY) ||
+    props.getProperty(LEGACY_SPREADSHEET_ID_PROPERTY);
+  // doGet initializes new users before serving the page. Keep first-run callers
+  // working while avoiding a shared write lock for ordinary list reads.
+  return id ? SpreadsheetApp.openById(id) : getOrCreateSpreadsheet_();
 }
 
 function getInCampusReadSheet_(testSpreadsheet) {

@@ -1,11 +1,37 @@
 <script>
   function requestNotificationData(viewMode, options = {}) {
-    const requestId = ++notificationRequestIds[viewMode];
+    const method = options.method || (viewMode === 'completed'
+      ? 'getCompletedNotificationsForWeb' : 'getNotificationsForWeb');
     const statusGeneration = notificationStatusGeneration;
     const list = document.getElementById('list');
     const syncText = document.getElementById('home-sync-text');
+    const pending = notificationRequestsInFlight[viewMode];
+    if (pending && pending.method === method && pending.statusGeneration === statusGeneration &&
+        !options.structuredResult && !options.onSuccess && !options.onFailure && !options.onStale) {
+      pending.options.remember = pending.options.remember || Boolean(options.remember);
+      pending.options.notify = pending.options.notify || Boolean(options.notify);
+      if (options.loadingText && currentScreen === viewMode) {
+        pending.options.loadingText = options.loadingText;
+        list.textContent = options.loadingText;
+      }
+      if (options.homeSync) {
+        pending.options.homeSync = true;
+        pending.options.loadingStatusText = options.loadingStatusText || pending.options.loadingStatusText;
+        if (syncText) syncText.textContent = pending.options.loadingStatusText || '一覧を読み込み中...';
+      }
+      return;
+    }
+
+    const requestId = ++notificationRequestIds[viewMode];
+    const requestState = {method, requestId, statusGeneration, options};
+    notificationRequestsInFlight[viewMode] = requestState;
     const isCurrentRequest = () => requestId === notificationRequestIds[viewMode]
       && statusGeneration === notificationStatusGeneration;
+    const clearPendingRequest = () => {
+      if (notificationRequestsInFlight[viewMode] === requestState) {
+        notificationRequestsInFlight[viewMode] = null;
+      }
+    };
 
     if (options.loadingText && currentScreen === viewMode) {
       list.textContent = options.loadingText;
@@ -16,6 +42,7 @@
 
     const runner = google.script.run
       .withSuccessHandler(data => {
+        clearPendingRequest();
         if (!isCurrentRequest()) {
           if (typeof options.onStale === 'function') options.onStale(data, false);
           return;
@@ -35,6 +62,7 @@
         if (typeof options.onSuccess === 'function') options.onSuccess(data, items);
       })
       .withFailureHandler(error => {
+        clearPendingRequest();
         if (!isCurrentRequest()) {
           if (typeof options.onStale === 'function') options.onStale(error, true);
           return;
@@ -46,8 +74,6 @@
         if (viewMode === 'active' && syncText) syncText.textContent = '同期失敗';
         if (typeof options.onFailure === 'function') options.onFailure(error);
       });
-    const method = options.method || (viewMode === 'completed'
-      ? 'getCompletedNotificationsForWeb' : 'getNotificationsForWeb');
     runner[method]();
   }
 

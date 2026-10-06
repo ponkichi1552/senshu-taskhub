@@ -1,5 +1,5 @@
 function getNotificationsForWeb() {
-  return runWithUserLock_('保存データ処理', () => getNotificationsForWebLocked_());
+  return getNotificationsForWebLocked_();
 }
 
 function getNotificationsForWebLocked_() {
@@ -43,7 +43,7 @@ function getNotificationsForWebLocked_() {
 }
 
 function getActiveNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext) {
-  return runWithUserLock_('保存データ処理', () => getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext));
+  return getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext);
 }
 
 function getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext) {
@@ -60,7 +60,7 @@ function getActiveNotificationItemsForWebLocked_(testSpreadsheet, testStates, te
   return data;
 }
 
-function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext, readContext) {
+function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContext, readContext, options = {}) {
   const rows = [];
   const useTestMode = typeof testMode === 'boolean' ? testMode : isTestCaseModeEnabled_();
   const dateContext = useTestMode
@@ -96,9 +96,13 @@ function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContex
 
   // Classroom API tasks live in the structured 授業 / Classroom課題 / 提出状況
   // tabs. Convert them to the existing display model without writing a second copy.
-  if (!useTestMode) rows.push(...getClassroomApiNotificationRowsForWeb_(readContext && readContext.spreadsheet, readContext));
+  if (!useTestMode && options.includeClassroomApi !== false) {
+    rows.push(...getClassroomApiNotificationRowsForWeb_(readContext && readContext.spreadsheet, readContext));
+  }
 
-  return mergeClassroomGmailAssignmentsWithApiRowsForWeb_(rows);
+  return options.mergeClassroomApiAssignments === false
+    ? rows
+    : mergeClassroomGmailAssignmentsWithApiRowsForWeb_(rows);
 }
 
 /**

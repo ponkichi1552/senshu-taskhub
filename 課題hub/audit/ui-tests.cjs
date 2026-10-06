@@ -25,14 +25,15 @@ function element() {
   };
 }
 
-function fixture(fixedNow, {holdBoot = false} = {}) {
+function fixture(fixedNow, {holdBoot = false, initialRoute = 'home'} = {}) {
   const calls = [], alerts = [], nodes = new Map(), timers = [];
   let reloadCount = 0;
   const document = {
     getElementById(id) {if (!nodes.has(id)) nodes.set(id, element()); return nodes.get(id);},
     querySelectorAll() {return [];}, createElement: element
   };
-  const script = {url: {getLocation() {}}};
+  const routeParameter = initialRoute === 'home' ? {} : {view: initialRoute};
+  const script = {url: {getLocation(callback) {if (typeof callback === 'function') callback({parameter: routeParameter});}}};
   Object.defineProperty(script, 'run', {get() {
     const call = {settled: false};
     const runner = new Proxy({}, {get(_, name) {
@@ -62,7 +63,7 @@ function fixture(fixedNow, {holdBoot = false} = {}) {
     vm.runInContext(fs.readFileSync(path.join(sourceDir, file), 'utf8').replace(/<\/?script>/g, ''), context, {filename: file});
   }
   if (!holdBoot) {
-    const boot = calls.find(call => call.method === 'getNotificationsForWeb');
+    const boot = calls.find(call => call.method === 'getNotificationsForWeb' || call.method === 'getUniversityNoticesForWeb');
     if (boot) {boot.settled = true; boot.success([]);}
   }
   function take(method, id) {
@@ -126,6 +127,44 @@ test('bottom navigation keeps the same labels and routes across home, assignment
   assert.equal(assignments.classList.contains('active'), false);
 });
 
+test('initial deep links request only the matching page data', () => {
+  const university = fixture(undefined, {holdBoot: true, initialRoute: 'university'});
+  assert.equal(university.pending('getUniversityNoticesForWeb').length, 1);
+  assert.equal(university.pending('getNotificationsForWeb').length, 0);
+  assert.equal(university.pending('getCompletedNotificationsForWeb').length, 0);
+
+  const assignment = fixture(undefined, {holdBoot: true, initialRoute: 'assignment'});
+  assert.equal(assignment.pending('getNotificationsForWeb').length, 1);
+  assert.equal(assignment.pending('getUniversityNoticesForWeb').length, 0);
+
+  const home = fixture(undefined, {holdBoot: true});
+  assert.equal(home.pending('getNotificationsForWeb').length, 1);
+  assert.equal(home.pending('getUniversityNoticesForWeb').length, 0);
+});
+
+test('navigating to each page calls only its matching list endpoint', () => {
+  const f = fixture();
+  const start = f.calls.length;
+  f.c.showUniversityNotices();
+  assert.deepEqual(f.calls.slice(start).map(call => call.method), ['getUniversityNoticesForWeb']);
+  const afterUniversity = f.calls.length;
+  f.c.loadNotifications();
+  assert.deepEqual(f.calls.slice(afterUniversity).map(call => call.method), ['getNotificationsForWeb']);
+  const afterAssignments = f.calls.length;
+  f.c.loadCompletedNotifications();
+  assert.deepEqual(f.calls.slice(afterAssignments).map(call => call.method), ['getCompletedNotificationsForWeb']);
+});
+
+test('assignment navigation reuses an in-flight home read instead of starting a duplicate', () => {
+  const f = fixture(undefined, {holdBoot: true});
+  const boot = f.take('getNotificationsForWeb');
+  f.c.loadNotifications();
+  assert.equal(f.pending('getNotificationsForWeb').length, 1);
+  assert.equal(f.document.getElementById('list').textContent, '読み込み中...');
+  f.reply(boot, [item('one-read')]);
+  assert.deepEqual(f.ids('currentRawData'), ['one-read']);
+});
+
 test('assignment hamburger drawer routes unfinished, completed, and search while tracking selection', () => {
   const index = fs.readFileSync(path.join(sourceDir, 'Index.html'), 'utf8');
   const header = index.match(/<header class="assignment-header">([\s\S]*?)<\/header>/);
@@ -170,9 +209,9 @@ test('assignment hamburger drawer routes unfinished, completed, and search while
 
 test('reverse active/completed replies preserve completed screen and home cache', () => {
   const f = fixture(undefined, {holdBoot: true}), boot = f.take('getNotificationsForWeb');
-  f.c.loadNotifications(); const active = f.pending('getNotificationsForWeb').at(-1);
+  f.c.loadNotifications();
   f.c.loadCompletedNotifications(); const completed = f.take('getCompletedNotificationsForWeb');
-  f.reply(completed, [item('done', true)]); f.reply(active, [item('active')]); f.reply(boot, [item('stale-boot')]);
+  f.reply(completed, [item('done', true)]); f.reply(boot, [item('active')]);
   assert.equal(f.read('currentScreen'), 'completed');
   assert.equal(f.read('currentViewMode'), 'completed');
   assert.deepEqual(f.ids('currentRawData'), ['done']);
@@ -181,20 +220,21 @@ test('reverse active/completed replies preserve completed screen and home cache'
 
 test('newest refresh wins over boot read and prior list request', () => {
   const f = fixture(undefined, {holdBoot: true}), boot = f.take('getNotificationsForWeb');
-  f.c.loadNotifications(); const old = f.take('getNotificationsForWeb');
+  f.c.loadNotifications();
   f.c.manualRefreshNotifications();
   const fresh = f.pending('syncAndGetNotificationsForWeb').at(-1);
-  f.reply(fresh, {items: [item('new')], testCaseModeEnabled: false, savedCount: 1}); f.reply(old, [item('old')]); f.reply(boot, [item('boot')]);
+  f.reply(fresh, {items: [item('new')], testCaseModeEnabled: false, savedCount: 1}); f.reply(boot, [item('boot')]);
   assert.deepEqual(f.ids('currentRawData'), ['new']); assert.deepEqual(f.ids('homeRawData'), ['new']);
 });
 
-test('completed to active to completed drops the earlier completed reply', () => {
+test('an in-flight completed read is reused after navigating away and back', () => {
   const f = fixture();
   f.c.loadCompletedNotifications(); const old = f.take('getCompletedNotificationsForWeb');
   f.c.loadNotifications(); const active = f.take('getNotificationsForWeb');
-  f.c.loadCompletedNotifications(); const fresh = f.pending('getCompletedNotificationsForWeb').at(-1);
-  f.reply(fresh, [item('new', true)]); f.reply(active, [item('active')]); f.reply(old, [item('old', true)]);
-  assert.deepEqual(f.ids('currentRawData'), ['new']); assert.equal(f.read('currentViewMode'), 'completed');
+  f.c.loadCompletedNotifications();
+  assert.equal(f.pending('getCompletedNotificationsForWeb').length, 1);
+  f.reply(active, [item('active')]); f.reply(old, [item('done', true)]);
+  assert.deepEqual(f.ids('currentRawData'), ['done']); assert.equal(f.read('currentViewMode'), 'completed');
 });
 
 test('a background active response preserves the completed loading indicator', () => {

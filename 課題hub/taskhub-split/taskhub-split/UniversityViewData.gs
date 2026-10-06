@@ -279,7 +279,7 @@ function updateInCampusExtractedStatusLocked_(messageId, status) {
 }
 
 function getCompletedNotificationsForWeb() {
-  return runWithUserLock_('保存データ処理', () => getCompletedNotificationsForWebLocked_());
+  return getCompletedNotificationsForWebLocked_();
 }
 
 function getCompletedNotificationsForWebLocked_() {
@@ -310,7 +310,7 @@ function getCompletedNotificationsForWebLocked_() {
 }
 
 function getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext) {
-  return runWithUserLock_('保存データ処理', () => getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext));
+  return getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext);
 }
 
 function getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext) {
@@ -470,7 +470,7 @@ function isGenericInCampusCourseNameForMatch_(courseName) {
 }
 
 function getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext) {
-  return runWithUserLock_('保存データ処理', () => getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext));
+  return getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext);
 }
 
 function getCompletedNotificationItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext) {

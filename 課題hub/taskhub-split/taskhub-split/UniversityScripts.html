@@ -51,5 +51,4 @@ function renderUniversityDetail() {
 }
 document.getElementById('un-search').addEventListener('input',renderUniversityNotices);
 document.querySelectorAll('[data-un-filter]').forEach(b=>b.onclick=()=>{universityState.filter=b.dataset.unFilter;document.querySelectorAll('[data-un-filter]').forEach(x=>x.setAttribute('aria-pressed',x===b));renderUniversityNotices()});
-if(typeof google!=='undefined'&&google.script.url)google.script.url.getLocation(location=>{if(location.parameter.view==='university')showUniversityNotices()});
 </script>

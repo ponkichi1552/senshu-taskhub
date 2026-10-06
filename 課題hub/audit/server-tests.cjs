@@ -113,6 +113,15 @@ function row(id, title, mailBody, options = {}) {
 }
 function putMail(env, rows) {return env.add('inCampus通知', [env.headers, ...rows]);}
 function logical(env, sheet) {return sheet.rows.slice(1).flatMap(row => Array.from(env.c.expandInCampusNotificationRow_(row)));}
+function markUserStorageWarm(env) {
+  env.state.props.TASKHUB_SPREADSHEET_ID = 'test-sheet';
+  const revisionKey = vm.runInContext('USER_STORAGE_INITIALIZATION_REVISION_PROPERTY', env.c);
+  const lastRunKey = vm.runInContext('USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY', env.c);
+  const triggerRevisionKey = vm.runInContext('USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY', env.c);
+  env.state.props[revisionKey] = vm.runInContext('USER_STORAGE_INITIALIZATION_REVISION', env.c);
+  env.state.props[lastRunKey] = new Date().toISOString();
+  env.state.props[triggerRevisionKey] = vm.runInContext('USER_TRIGGER_MAINTENANCE_REVISION', env.c);
+}
 function expectDate(date, year, month, day, hour, minute) {assert.ok(date instanceof Date); assert.deepEqual([date.getFullYear(), date.getMonth()+1, date.getDate(), date.getHours(), date.getMinutes()], [year, month, day, hour, minute]);}
 check('All GAS scripts parse', () => {new vm.Script(source);});
 check('Warm page loads skip storage bootstrap while weekly maintenance remains scheduled',()=>{
@@ -370,10 +379,10 @@ check('Two extracted report URLs with identical course/title remain ambiguous',(
   e.c.upsertInCampusAssignment_({...a,pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/1'});e.c.upsertInCampusAssignment_({...a,pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/2'});
   assert.equal(e.c.completeMatchingInCampusExtractedRow_(e.c.getOrCreateInCampusSheet_(),{title:'A',courseName:'仮想情報演習',submittedAt:'2026/09/13 09:00'}),false);
 });
-check('List and status response share one native lock and reads do not rewrite sheet',()=>{
+check('List reads skip the shared write lock while status mutation still uses it',()=>{
   const e=environment(),s=putMail(e,[row('A','A',body('A'))]);e.c.getNotificationsForWeb();const writes=s.writes,acquires=e.state.acquisitions;
   e.c.getNotificationsForWeb();e.c.getCompletedNotificationsForWeb();e.c.getUniversityNoticesForWeb();assert.equal(s.writes,writes);
-  assert.equal(e.state.acquisitions-acquires,3);const before=e.state.acquisitions;e.c.markNotificationDone(logical(e,s)[0][1]);assert.equal(e.state.acquisitions-before,1);assert.equal(e.state.held,false);
+  assert.equal(e.state.acquisitions-acquires,0);const before=e.state.acquisitions;e.c.markNotificationDone(logical(e,s)[0][1]);assert.equal(e.state.acquisitions-before,1);assert.equal(e.state.held,false);
 });
 check('Concurrent status mutation cannot interleave a snapshot read and write',()=>{
   const e=environment(),s=putMail(e,[row('A','A',body('A')),row('B','B',body('B'))]), other=environment(e.state),id=logical(e,s)[0][1];
@@ -488,6 +497,27 @@ check('Existing announcement read/save state follows only its legacy logical rec
   const e=environment(),text=body('A').replace('課題(A)','お知らせ(A)')+'\n・お知らせ(B)が追加されました。(09/13 08:00)';
   putMail(e,[row('legacy-notice','A',text)]);e.state.props['universityNotice:legacy-notice']=JSON.stringify({read:true,saved:true});
   const notices=e.c.getUniversityNoticesForWeb();assert.equal(notices.length,2);assert.equal(notices.find(n=>n.title==='A').saved,true);assert.equal(notices.find(n=>n.title==='B').saved,false);
+});
+check('University notice reads skip Classroom assignment data and all list reads avoid the shared write lock',()=>{
+  const e=environment();markUserStorageWarm(e);
+  const text=body('連絡事項').replace('課題(連絡事項)','お知らせ(連絡事項)');
+  const notice=row('read-only-notice','連絡事項',text);
+  e.add('inCampus通知',[e.headers,notice]);
+  e.add('Classroom通知',[e.headers]);e.add('補足通知',[e.headers]);
+  let classroomApiReads=0,assignmentMerges=0;
+  e.c.getClassroomApiNotificationRowsForWeb_=()=>{classroomApiReads++;return [];};
+  e.c.mergeClassroomGmailAssignmentsWithApiRowsForWeb_=rows=>{assignmentMerges++;return rows;};
+  const acquisitionsBefore=e.state.acquisitions;
+  const writesBefore=Object.values(e.state.sheets).reduce((sum,sheet)=>sum+sheet.writes,0);
+  const notices=e.c.getUniversityNoticesForWeb();
+  assert.equal(classroomApiReads,0,'university list does not open Classroom課題 / 提出状況');
+  assert.equal(assignmentMerges,0,'university list skips the assignment merge pass');
+  assert.ok(notices.some(item=>item.title==='連絡事項'));
+  const timing=e.state.logs.find(message=>message.startsWith('TASKHUB_UNIVERSITY_NOTICE_READ_TIMING '));
+  assert.ok(timing);assert.equal(JSON.parse(timing.slice('TASKHUB_UNIVERSITY_NOTICE_READ_TIMING '.length)).classroomApiAssignmentsRead,false);
+  e.c.getNotificationsForWeb();e.c.getCompletedNotificationsForWeb();
+  assert.equal(e.state.acquisitions,acquisitionsBefore,'list endpoints do not hold the shared mutation lock');
+  assert.equal(Object.values(e.state.sheets).reduce((sum,sheet)=>sum+sheet.writes,0),writesBefore,'opening lists does not write to any sheet');
 });
 check('User-deferred inline update behavior remains unchanged (#7)',()=>{
   const {c}=environment(),text='曜日・時限：火曜5限\n授業名：仮想情報演習\n教員名：教員\n更新内容：課題（レポート1）が追加されました';assert.equal(c.extractInCampusTitle_('更新通知',text),'更新通知');
