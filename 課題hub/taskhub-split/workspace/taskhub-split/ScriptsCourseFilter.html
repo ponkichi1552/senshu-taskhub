@@ -124,29 +124,15 @@
 
   function updateBottomNavState() {
     const homeButton = document.getElementById('bottom-home-button');
-    const activeButton = document.getElementById('bottom-active-button');
-    const completedButton = document.getElementById('bottom-completed-button');
-    const courseButton = document.getElementById('bottom-course-button');
+    const assignmentButton = document.getElementById('bottom-assignment-button');
+    const universityButton = document.getElementById('bottom-university-button');
+    const summaryButton = document.getElementById('bottom-summary-button');
+    const isAssignmentScreen = currentScreen === 'active' || currentScreen === 'completed';
 
-    if (currentScreen === 'home') {
-      setBottomNavButton(homeButton, '課題通知', loadNotifications, false, false);
-      setBottomNavButton(activeButton, '大学からのお知らせ', showUniversityNotices, false, false);
-      setBottomNavButton(completedButton, '大学情報まとめ', null, false, true);
-      setBottomNavButton(courseButton, '過去問データベース', null, false, true);
-      return;
-    }
-
-    if (currentScreen === 'university') {
-      setBottomNavButton(homeButton, 'ホーム', showHomeView, false, false);
-      setBottomNavButton(activeButton, '大学からのお知らせ', showUniversityNotices, true, false);
-      setBottomNavButton(completedButton, '課題通知', loadNotifications, false, false);
-      setBottomNavButton(courseButton, '大学情報まとめ', null, false, true);
-      return;
-    }
-    setBottomNavButton(homeButton, 'ホーム', showHomeView, false, false);
-    setBottomNavButton(activeButton, '未完了', loadNotifications, currentScreen === 'active', false);
-    setBottomNavButton(completedButton, '完了済み', loadCompletedNotifications, currentScreen === 'completed', false);
-    setBottomNavButton(courseButton, 'フィルター', toggleCourseFilterPanel, selectedCourseName !== 'すべて', false);
+    setBottomNavButton(homeButton, 'ホーム', showHomeView, currentScreen === 'home', false);
+    setBottomNavButton(assignmentButton, '課題通知', loadNotifications, isAssignmentScreen, false);
+    setBottomNavButton(universityButton, '大学からのお知らせ', showUniversityNotices, currentScreen === 'university', false);
+    setBottomNavButton(summaryButton, '大学情報まとめ', null, false, true);
   }
 
   function setBottomNavButton(button, label, handler, isActive, isDisabled) {

@@ -90,6 +90,42 @@ function item(id, done = false) {
 let passed = 0;
 function test(name, run) {run(); passed++; console.log('PASS ' + name);}
 
+test('home menu and bottom navigation show the requested destinations without the past-exam entry', () => {
+  const home = fs.readFileSync(path.join(sourceDir, 'Home.html'), 'utf8');
+  const index = fs.readFileSync(path.join(sourceDir, 'Index.html'), 'utf8');
+  const nav = index.match(/<nav class="bottom-nav"[\s\S]*?<\/nav>/);
+  assert.ok(nav, 'bottom navigation exists');
+  const labels = Array.from(nav[0].matchAll(/<button[^>]*>([\s\S]*?)<\/button>/g), match => match[1].replace(/<[^>]*>/g, '').trim());
+  assert.deepEqual(labels, ['ホーム', '課題通知', '大学からのお知らせ', '大学情報まとめ']);
+  assert.doesNotMatch(home + nav[0], /過去問データベース/);
+});
+
+test('bottom navigation keeps the same labels and routes across home, assignments, and university notices', () => {
+  const f = fixture();
+  const home = f.document.getElementById('bottom-home-button');
+  const assignments = f.document.getElementById('bottom-assignment-button');
+  const university = f.document.getElementById('bottom-university-button');
+  const summary = f.document.getElementById('bottom-summary-button');
+  const buttons = [home, assignments, university, summary];
+  const expectedLabels = ['ホーム', '課題通知', '大学からのお知らせ', '大学情報まとめ'];
+
+  for (const screen of ['home', 'active', 'completed', 'university']) {
+    vm.runInContext(`currentScreen = ${JSON.stringify(screen)}`, f.c);
+    f.c.updateBottomNavState();
+    assert.deepEqual(buttons.map(button => button.textContent), expectedLabels);
+    assert.equal(summary.disabled, true);
+    assert.equal(typeof home.onclick, 'function');
+    assert.equal(typeof assignments.onclick, 'function');
+    assert.equal(typeof university.onclick, 'function');
+  }
+
+  vm.runInContext("currentScreen = 'university'", f.c);
+  f.c.updateBottomNavState();
+  assert.equal(university.classList.contains('active'), true);
+  assert.equal(home.classList.contains('active'), false);
+  assert.equal(assignments.classList.contains('active'), false);
+});
+
 test('reverse active/completed replies preserve completed screen and home cache', () => {
   const f = fixture(undefined, {holdBoot: true}), boot = f.take('getNotificationsForWeb');
   f.c.loadNotifications(); const active = f.pending('getNotificationsForWeb').at(-1);

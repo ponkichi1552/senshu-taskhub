@@ -44,10 +44,10 @@
     </section>
 
     <nav class="bottom-nav" aria-label="画面切り替え">
-      <button id="bottom-home-button" class="bottom-nav-button" onclick="loadNotifications()">課題通知</button>
-      <button id="bottom-active-button" class="bottom-nav-button" type="button" onclick="showUniversityNotices()">大学からのお知らせ</button>
-      <button id="bottom-completed-button" class="bottom-nav-button" type="button" disabled>大学情報まとめ</button>
-      <button id="bottom-course-button" class="bottom-nav-button" type="button" disabled>過去問データベース</button>
+      <button id="bottom-home-button" class="bottom-nav-button" type="button" onclick="showHomeView()">ホーム</button>
+      <button id="bottom-assignment-button" class="bottom-nav-button" type="button" onclick="loadNotifications()">課題通知</button>
+      <button id="bottom-university-button" class="bottom-nav-button" type="button" onclick="showUniversityNotices()">大学からのお知らせ</button>
+      <button id="bottom-summary-button" class="bottom-nav-button" type="button" disabled>大学情報まとめ</button>
     </nav>
 
     <div id="undo-toast" class="undo-toast" role="status" aria-live="polite">

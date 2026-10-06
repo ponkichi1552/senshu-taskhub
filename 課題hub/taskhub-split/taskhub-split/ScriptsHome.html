@@ -34,6 +34,7 @@
     currentViewMode = 'active';
     closeCourseFilterPanel();
     setAppView('home');
+    updateBottomNavState();
     refreshCurrentView();
   }
 
@@ -41,6 +42,7 @@
     currentScreen = viewMode === 'completed' ? 'completed' : 'active';
     currentViewMode = currentScreen;
     setAppView('assignment');
+    updateBottomNavState();
     refreshCurrentView();
   }
 
