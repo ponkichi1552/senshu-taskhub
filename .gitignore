@@ -16,6 +16,4 @@ node_modules/
 /audit/before-server.zip
 /audit/results.json
 /audit/regression-results.json
-/outputs/**/*.inspect.ndjson
-/outputs/**/課題通知Hub_テストケース.xlsx
-/outputs/**/課題通知Hub_テストケース_修正版.xlsx
+/outputs/

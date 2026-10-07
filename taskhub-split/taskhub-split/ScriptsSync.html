@@ -24,7 +24,7 @@
     }
 
     const requestId = ++notificationRequestIds[viewMode];
-    const requestState = {method, requestId, statusGeneration, options};
+    const requestState = {method, requestId, statusGeneration, options, compatibilityFallbackStarted: false};
     notificationRequestsInFlight[viewMode] = requestState;
     const isCurrentRequest = () => requestId === notificationRequestIds[viewMode]
       && statusGeneration === notificationStatusGeneration;
@@ -42,8 +42,8 @@
     }
 
     const handleSuccess = data => {
-        clearPendingRequest();
         if (!isCurrentRequest()) {
+          clearPendingRequest();
           if (typeof options.onStale === 'function') options.onStale(data, false);
           return;
         }
@@ -51,6 +51,18 @@
           ? Boolean((data && typeof data === 'object' && Array.isArray(data.items)) ||
             (usesTaskPayload && Array.isArray(data)))
           : Array.isArray(data);
+        if (!isValidResult && usesTaskPayload && !requestState.compatibilityFallbackStarted) {
+          requestState.compatibilityFallbackStarted = true;
+          const fallbackRunner = google.script.run
+            .withSuccessHandler(handleSuccess)
+            .withFailureHandler(handleFailure);
+          const fallbackMethod = viewMode === 'completed'
+            ? 'getCompletedNotificationsForWeb'
+            : 'getNotificationsForWeb';
+          fallbackRunner[fallbackMethod]();
+          return;
+        }
+        clearPendingRequest();
         if (!isValidResult) {
           const error = new Error('一覧データの形式を確認できませんでした。時間をおいて再読み込みしてください。');
           console.error(error);
@@ -102,7 +114,7 @@
     const runner = google.script.run
       .withSuccessHandler(handleSuccess)
       .withFailureHandler(handleFailure);
-    if (usesTaskPayload) runner[method](viewMode);
+    if (usesTaskPayload) runner[method](viewMode === 'completed' ? '完了' : '未完了');
     else runner[method]();
   }
 

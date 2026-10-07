@@ -78,6 +78,9 @@
     setAppView('home');
     updateBottomNavState();
     refreshCurrentView();
+    if (!notificationDataLoaded.active && !notificationRequestsInFlight.active && !notificationSyncInFlight) {
+      loadHomeNotifications();
+    }
   }
 
   function showAssignmentView(viewMode = 'active') {

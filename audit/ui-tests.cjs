@@ -182,6 +182,46 @@ test('initial deep links request only the matching page data', () => {
     'page boot must not wait for a separate test-clock RPC');
 });
 
+test('university to home to assignment loads the task list and reuses the in-flight read', () => {
+  const f = fixture(undefined, {holdBoot: true, initialRoute: 'university'});
+  f.reply(f.take('getUniversityNoticePayloadForWeb'), {items: [], cacheToken: '', testCaseClockState: {}});
+  f.c.showHomeView();
+  const taskRead = f.take('getTaskDisplayPayloadForWeb', '未完了');
+  f.c.loadNotifications();
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', '未完了').length, 1,
+    'entering assignments while Home is loading must reuse the same task read');
+  f.reply(taskRead, {items: [item('university-home-assignment')], cacheToken: '', testCaseClockState: {}});
+  assert.equal(f.read('currentScreen'), 'active');
+  assert.deepEqual(f.ids('notificationData.active'), ['university-home-assignment']);
+  assert.ok(f.document.getElementById('list').children.length > 0);
+  assert.doesNotMatch(f.document.getElementById('list').textContent, /一覧データの形式を確認できませんでした/);
+});
+
+test('invalid task payload falls back to the compatible array endpoint', () => {
+  const f = fixture(undefined, {holdBoot: true, initialRoute: 'university'});
+  f.reply(f.take('getUniversityNoticePayloadForWeb'), {items: [], cacheToken: '', testCaseClockState: {}});
+  f.c.showHomeView();
+  const taskRead = f.take('getTaskDisplayPayloadForWeb', '未完了');
+  f.reply(taskRead, null);
+  const fallback = f.take('getNotificationsForWeb');
+  f.reply(fallback, [item('compatible-task')]);
+  assert.deepEqual(f.ids('notificationData.active'), ['compatible-task']);
+  assert.doesNotMatch(f.document.getElementById('list').textContent, /一覧データの形式を確認できませんでした/);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb').length, 0);
+});
+
+test('invalid completed payload falls back to the completed array endpoint', () => {
+  const f = fixture(undefined, {holdBoot: true});
+  f.c.loadCompletedNotifications();
+  const completedRead = f.take('getTaskDisplayPayloadForWeb', '完了');
+  f.reply(completedRead, null);
+  const fallback = f.take('getCompletedNotificationsForWeb');
+  f.reply(fallback, [item('compatible-completed-task', true)]);
+  assert.deepEqual(f.ids('notificationData.completed'), ['compatible-completed-task']);
+  assert.equal(f.read('currentScreen'), 'completed');
+  assert.doesNotMatch(f.document.getElementById('list').textContent, /一覧データの形式を確認できませんでした/);
+});
+
 test('embedded initial payload renders each entry route without a page-load data RPC', () => {
   const clockState = {testCaseModeEnabled: true, testCaseClockDateTime: '2026-12-20T10:30',
     testCaseClockPresets: [{id: 'year-end', label: '年末'}]};
@@ -250,13 +290,14 @@ test('navigating to each page calls only its matching list endpoint', () => {
   const afterAssignments = f.calls.length;
   f.c.loadCompletedNotifications();
   assert.deepEqual(f.calls.slice(afterAssignments).map(call => call.method), ['getTaskDisplayPayloadForWeb']);
+  assert.equal(f.calls.slice(afterAssignments)[0].args[0], '完了');
 });
 
 test('assignment navigation reuses an in-flight home read instead of starting a duplicate', () => {
   const f = fixture(undefined, {holdBoot: true});
   const boot = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadNotifications();
-  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'active').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', '未完了').length, 1);
   assert.equal(f.document.getElementById('list').textContent, '読み込み中...');
   f.reply(boot, [item('one-read')]);
   assert.deepEqual(f.ids('currentRawData'), ['one-read']);
@@ -372,6 +413,7 @@ test('an unexpected non-array list result is reported instead of shown as an emp
   const boot = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadNotifications();
   f.reply(boot, {});
+  f.reply(f.take('getNotificationsForWeb'), null);
   assert.match(f.document.getElementById('list').textContent, /形式を確認できませんでした/);
   assert.ok(f.document.getElementById('home-sync-text').textContent.startsWith('一覧の読み込みに失敗しました'));
 });
@@ -453,7 +495,7 @@ test('an in-flight completed read is reused after navigating away and back', () 
   f.c.loadCompletedNotifications(); const old = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadNotifications(); const active = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadCompletedNotifications();
-  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'completed').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', '完了').length, 1);
   f.reply(active, [item('active')]); f.reply(old, [item('done', true)]);
   assert.deepEqual(f.ids('currentRawData'), ['done']); assert.equal(f.read('currentViewMode'), 'completed');
 });
@@ -555,8 +597,8 @@ test('multiple done responses arriving in reverse cannot resurrect another done 
   f.reply(f.take('markNotificationDone', 'A'), [item('B')]);
   assert.deepEqual(f.ids('currentRawData'), []); assert.deepEqual(f.ids('homeRawData'), []);
   assert.deepEqual(f.ids('notificationData.completed'), ['A', 'B']);
-  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'active').length, 1);
-  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'completed').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', '未完了').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', '完了').length, 1);
 });
 
 test('latest toast undoes only the last task while another completion is pending', () => {
@@ -572,13 +614,13 @@ test('status callbacks preserve navigation and refresh both caches after writes'
   const f = fixture(); f.seed([item('A')]);
   f.c.markAsDone('A'); f.c.showUniversityNotices();
   f.reply(f.take('markNotificationDone', 'A'));
-  f.reply(f.take('getTaskDisplayPayloadForWeb', 'completed'), [item('A', true)]);
-  f.reply(f.take('getTaskDisplayPayloadForWeb', 'active'), []);
+  f.reply(f.take('getTaskDisplayPayloadForWeb', '完了'), [item('A', true)]);
+  f.reply(f.take('getTaskDisplayPayloadForWeb', '未完了'), []);
   assert.equal(f.read('currentScreen'), 'university');
   f.c.showAssignmentView('completed'); f.c.markAsUndone('A'); f.c.showHomeView();
   f.reply(f.take('markNotificationUndone', 'A'));
-  f.reply(f.take('getTaskDisplayPayloadForWeb', 'active'), [item('A')]);
-  f.reply(f.take('getTaskDisplayPayloadForWeb', 'completed'), []);
+  f.reply(f.take('getTaskDisplayPayloadForWeb', '未完了'), [item('A')]);
+  f.reply(f.take('getTaskDisplayPayloadForWeb', '完了'), []);
   assert.equal(f.read('currentScreen'), 'home'); assert.equal(f.read('currentViewMode'), 'active');
   assert.deepEqual(f.ids('homeRawData'), ['A']);
 });
@@ -589,8 +631,8 @@ test('failed done rolls back locally and retries reads without navigating', () =
   assert.deepEqual(f.ids('homeRawData'), ['A']); assert.equal(f.read('currentScreen'), 'home');
   assert.equal(f.read('notificationStatusChanges.size'), 0); assert.equal(f.alerts.length, 1);
   assert.equal(f.read('lastUndoMessageId'), '');
-  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'active').length, 1);
-  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'completed').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', '未完了').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', '完了').length, 1);
 });
 
 test('failed undo restores completed state and does not leave a queued undo', () => {
@@ -676,7 +718,7 @@ test('changing the selected test clock refetches the projection so server-side g
   f.reply(firstRead, []);
   f.c.applyTestCaseClockState({testCaseModeEnabled: true, testCaseClockDateTime: '2026-12-31T23:58', testCaseClockPresets: []});
   assert.equal(f.pending('getTaskDisplayPayloadForWeb').length, 1);
-  assert.equal(f.take('getTaskDisplayPayloadForWeb').args[0], 'active');
+  assert.equal(f.take('getTaskDisplayPayloadForWeb').args[0], '未完了');
 });
 
 test('settings switch data sources in place, read the selected source, and do not start mail sync', () => {

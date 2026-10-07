@@ -265,15 +265,15 @@ Gmailを廃止するのではなく、
 
 ## ファイル構成
 
-- [Apps Script Webアプリ本体](./課題hub/taskhub-split/taskhub-split/)
-- [本体ソースのworkspaceミラー](./課題hub/taskhub-split/workspace/taskhub-split/)
-- [Chrome拡張機能 v2.5.8](./課題hub/taskhub-extension-v2.5/)
-- [Gmail通知と拡張機能データの照合仕様](./課題hub/taskhub-split/taskhub-split/MAIL_LINKING.md)
-- [保存期間・状態管理・移行時の注意](./課題hub/taskhub-split/taskhub-split/STORAGE.md)
-- [Classroom API検証プロジェクトと専用テスト](./課題hub/taskhub-split/classroom-api-experiment/README.md)
-- [回帰テスト用Excel](./課題hub/test-fixtures/TaskHub-test-cases.xlsx)
-- [ローカル開発とApps Script更新手順](./課題hub/README.md)
-- [拡張機能の導入・設定方法](./課題hub/taskhub-extension-v2.5/README.md)
+- [Apps Script Webアプリ本体](./taskhub-split/taskhub-split/)
+- [本体ソースのworkspaceミラー](./taskhub-split/workspace/taskhub-split/)
+- [Chrome拡張機能 v2.5.8](./taskhub-extension-v2.5/)
+- [Gmail通知と拡張機能データの照合仕様](./taskhub-split/taskhub-split/MAIL_LINKING.md)
+- [保存期間・状態管理・移行時の注意](./taskhub-split/taskhub-split/STORAGE.md)
+- [Classroom API検証プロジェクトと専用テスト](./taskhub-split/classroom-api-experiment/README.md)
+- [回帰テスト用Excel](./test-fixtures/TaskHub-test-cases.xlsx)
+- [ローカル開発とApps Script更新手順](./docs/DEVELOPMENT.md)
+- [拡張機能の導入・設定方法](./taskhub-extension-v2.5/README.md)
 - [開発・改修履歴](./CHANGELOG.md)
 
 Apps Scriptサーバーは `Code.gs` に共有設定と入口を置き、メール同期・通知解析・一覧処理・拡張機能連携を機能別の `.gs` ファイルに分けています。画面側も `Scripts*.html` と `Styles*.html` に分け、`Index.html` が読み込み順を管理します。
@@ -286,7 +286,7 @@ Apps Scriptサーバーは `Code.gs` に共有設定と入口を置き、メー�
 4. 拡張機能に自分のWebアプリURLと、本体のセキュリティ設定で発行したAPIトークンを設定します。
 5. 各自のGoogleアカウントとClassroom・inCampusへログインし、必要な権限を承認して使用します。
 
-詳しい導入手順と対応範囲は[拡張機能README](./課題hub/taskhub-extension-v2.5/README.md)を参照してください。
+詳しい導入手順と対応範囲は[拡張機能README](./taskhub-extension-v2.5/README.md)を参照してください。
 
 本番同期は利用者本人のアカウントで実行します。Gmailは15分ごと、Classroom APIは1時間ごとに動作します。
 
@@ -298,14 +298,13 @@ Classroomの提出状況は課題ごとではなく、課題が存在する授�
 
 ## ローカル回帰テスト
 
-Apps Scriptの実コードとブラウザー拡張機能の回帰テストは、`課題hub/` で次のコマンドを実行します。
+Apps Scriptの実コードとブラウザー拡張機能の回帰テストは、リポジトリのルートで次のコマンドを実行します。
 
 ```sh
-cd 課題hub
 pnpm install --frozen-lockfile
 pnpm test
 ```
 
-テストは期限区分、土日・週境界、月末・年末、閏日、日付なしや0:00の締切、複数課題を含むメール、重複・誤照合、APIとGmailの統合、Classroom提出状況の授業単位一括取得、ページネーション、`courseWorkId`による課題との結合、課題ID欠落時のfail-closed動作、完了状態、設定切替、非同期更新、通常表示時の初期化省略、バックグラウンド保守を確認します。`課題hub/test-fixtures/TaskHub-test-cases.xlsx` とテストメールの値はすべて架空で、リンクには予約済みの`.invalid`ドメインを使います。個人の保存データ、Gmail、Google Drive、本番シートには接続しません。
+テストは期限区分、土日・週境界、月末・年末、閏日、日付なしや0:00の締切、複数課題を含むメール、重複・誤照合、APIとGmailの統合、Classroom提出状況の授業単位一括取得、ページネーション、`courseWorkId`による課題との結合、課題ID欠落時のfail-closed動作、完了状態、設定切替、非同期更新、通常表示時の初期化省略、バックグラウンド保守を確認します。`test-fixtures/TaskHub-test-cases.xlsx` とテストメールの値はすべて架空で、リンクには予約済みの`.invalid`ドメインを使います。個人の保存データ、Gmail、Google Drive、本番シートには接続しません。
 
-`pnpm test` はApps Script本体、拡張機能、画面のオフライン回帰テストを実行します。Excelを実際に読み込む追加スモークテストには `@oai/artifact-tool` が必要です。利用できない環境ではExcelスモークのみスキップされます。ブラウザーでローカル画面を試す手順は[ローカル起動ガイド](./課題hub/local-dev/README.md)にあります。
+`pnpm test` はApps Script本体、拡張機能、画面のオフライン回帰テストを実行します。Excelを実際に読み込む追加スモークテストには `@oai/artifact-tool` が必要です。利用できない環境ではExcelスモークのみスキップされます。ブラウザーでローカル画面を試す手順は[ローカル起動ガイド](./local-dev/README.md)にあります。

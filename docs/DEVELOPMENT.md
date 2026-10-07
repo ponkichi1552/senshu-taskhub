@@ -1,6 +1,6 @@
 # TaskHub開発とApps Script更新
 
-このフォルダーには、Apps Script本体、workspaceミラー、Chrome拡張機能、架空データのテストExcel、ローカル検証環境をまとめています。
+Apps Script本体、workspaceミラー、Chrome拡張機能、架空データのテストExcel、ローカル検証環境はリポジトリ直下に配置しています。
 
 ## ソース構成
 
@@ -18,7 +18,7 @@ pnpm install --frozen-lockfile
 pnpm test
 ```
 
-テストはApps Scriptの実コード、Chrome拡張機能、画面の期限分類を使います。通常の回帰テストはGoogleアカウントや本番データに接続しません。Excelの取込スモークテストには `@oai/artifact-tool` が必要です。ローカル画面の起動方法とテストケースの使い方は [`local-dev/README.md`](./local-dev/README.md) を参照してください。
+テストはApps Scriptの実コード、Chrome拡張機能、画面の期限分類を使います。通常の回帰テストはGoogleアカウントや本番データに接続しません。Excelの取込スモークテストには `@oai/artifact-tool` が必要です。ローカル画面の起動方法とテストケースの使い方は [`local-dev/README.md`](../local-dev/README.md) を参照してください。
 
 ## Apps Scriptへの反映
 
