@@ -1,14 +1,48 @@
-function getNotificationsForWeb() {
-  return getNotificationsForWebLocked_();
+function getNotificationsForWeb(userProperties) {
+  return getNotificationsForWebLocked_(userProperties);
 }
 
-function getNotificationsForWebLocked_() {
+function getNotificationsForWebLocked_(userPropertiesSnapshot) {
   const startedAt = Date.now();
-  const testMode = isTestCaseModeEnabled_();
-  const deadlineReferenceNow = testMode ? getTestCaseReferenceNow_() : new Date(Date.now());
+  const userProperties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  const testMode = userProperties[TEST_CASE_MODE_PROPERTY] === 'true';
+  const deadlineReferenceNow = testMode ? getTestCaseReferenceNowFromProperties_(userProperties) : new Date(Date.now());
+  if (!testMode) {
+    const cacheStartedAt = Date.now();
+    const cachedTaskItems = readTaskDisplayCache_(userProperties, '未完了');
+    if (cachedTaskItems) {
+      const displayItems = cachedTaskItems.items;
+      Logger.log('TASKHUB_NOTIFICATION_READ_TIMING ' + JSON.stringify({
+        mode: 'cache-hit',
+        cacheReadMs: Date.now() - cacheStartedAt,
+        totalMs: Date.now() - startedAt,
+        itemCounts: {returned: displayItems.length},
+        spreadsheetRead: false
+      }));
+      return displayItems;
+    }
+    const displayStartedAt = Date.now();
+    const spreadsheet = getSpreadsheetForRead_(userProperties);
+    const spreadsheetOpenMs = Date.now() - displayStartedAt;
+    const readStartedAt = Date.now();
+    const displayItems = getMaterializedTaskItemsForWeb_(spreadsheet, '未完了', userProperties);
+    if (displayItems !== null) {
+      Logger.log('TASKHUB_NOTIFICATION_READ_TIMING ' + JSON.stringify({
+        mode: 'personal-display-data',
+        spreadsheetOpenMs,
+        displaySheetReadMs: Date.now() - readStartedAt,
+        totalDisplayReadMs: Date.now() - displayStartedAt,
+        totalMs: Date.now() - startedAt,
+        itemCounts: {returned: displayItems.length},
+        rawNotificationSheetsRead: false
+      }));
+      return displayItems;
+    }
+    throw new Error('同期時に作成する課題表示データが未準備です。更新を実行してください。');
+  }
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
   const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, deadlineReferenceNow) : null;
-  const testStates = testMode ? getTestNotificationStateMap_() : null;
+  const testStates = testMode ? getTestNotificationStateMap_(userProperties) : null;
   const readContext = createNotificationReadContext_(testSpreadsheet, testMode);
   const contextReadyAt = Date.now();
   const activeItems = getActiveNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext);
@@ -22,17 +56,16 @@ function getNotificationsForWebLocked_() {
     testMode
   );
 
-  const result = data
-    .filter(item => !isNotYetPublishedClassroomApiNotificationForWeb_(item, deadlineReferenceNow))
-    .filter(item => !isExpiredNotificationForWeb_(item, deadlineReferenceNow))
-    .filter(item => !isStaleUnknownDueNotificationForWeb_(item, deadlineReferenceNow))
-    .sort((a, b) => (b.displayReceivedAtTime || b.receivedAtTime) - (a.displayReceivedAtTime || a.receivedAtTime));
+  // Production display rows are classified and sorted by the Gmail/API sync
+  // materializer. Test fixtures stay immutable, so project their selected
+  // virtual clock through the same preparation function in memory.
+  const result = prepareTaskDisplayItemsForSync_(data, '未完了', deadlineReferenceNow);
   Logger.log('TASKHUB_NOTIFICATION_READ_TIMING ' + JSON.stringify({
     mode: testMode ? 'test' : 'personal',
     contextMs: contextReadyAt - startedAt,
     activePipelineMs: activeReadyAt - contextReadyAt,
     supplementPipelineMs: supplementReadyAt - activeReadyAt,
-    mergeFilterSortMs: Date.now() - supplementReadyAt,
+    testProjectionPreparationMs: Date.now() - supplementReadyAt,
     totalMs: Date.now() - startedAt,
     sheetReadMs: readContext.sheetReadMs,
     sheetRowCounts: readContext.sheetRowCounts,
@@ -87,10 +120,26 @@ function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContex
         (String(row[2] || '') === 'inCampus' && String(row[1] || '') && !row[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN])
       );
     }
-    const rowsForRead = useTestMode
+    let rowsForRead = useTestMode
       ? sourceRows.map(row => mapTestCaseNotificationRowForRead_(row, dateContext))
       : sourceRows;
+    if (useTestMode && options.preprocessTestRows === true) {
+      // Test fixtures stay immutable. Apply the same production preprocessing
+      // to their in-memory, virtual-date-adjusted rows before expanding them.
+      rowsForRead = rowsForRead.map(row => {
+        delete row.__taskhubDisableProcessedMetadata;
+        const metadataColumn = getNotificationProcessingColumn_(row[2]);
+        while (row.length <= metadataColumn) row.push('');
+        row[metadataColumn] = '';
+        return preprocessNotificationRowForStorage_(row);
+      });
+    } else if (useTestMode) {
+      rowsForRead.forEach(row => { row.__taskhubDisableProcessedMetadata = true; });
+    }
     const retainedRows = normalizeNotificationRowsForStorage_(rowsForRead, storageConfig);
+    if (useTestMode && options.preprocessTestRows !== true) {
+      retainedRows.forEach(row => { row.__taskhubDisableProcessedMetadata = true; });
+    }
     retainedRows.forEach(row => rows.push(...expandInCampusNotificationRow_(row)));
   });
 
@@ -202,10 +251,10 @@ function mergeClassroomGmailAssignmentsWithApiRowsForWeb_(rows) {
     .map(row => isClassroomApiManagedRow_(row) ? (mergedApiRows.get(String(row[1])) || row) : row);
 }
 
-function getTestNotificationStateMap_() {
-  if (!isTestCaseModeEnabled_()) return {};
+function getTestNotificationStateMap_(userPropertiesSnapshot) {
+  const properties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  if (properties[TEST_CASE_MODE_PROPERTY] !== 'true') return {};
   const prefix = TEST_NOTIFICATION_STATE_PROPERTY_PREFIX;
-  const properties = PropertiesService.getUserProperties().getProperties();
   const states = {};
   Object.keys(properties).forEach(key => {
     if (!key.startsWith(prefix)) return;
@@ -338,6 +387,16 @@ function isExpiredNotificationForWeb_(item, referenceNow) {
     return false;
   }
 
+  if (item.deadlineAtTime !== undefined && item.deadlineAtTime !== null && item.deadlineAtTime !== '') {
+    const storedDeadline = Number(item.deadlineAtTime);
+    if (Number.isFinite(storedDeadline)) {
+      const now = referenceNow instanceof Date
+        ? referenceNow
+        : isTestCaseModeEnabled_() ? getTestCaseReferenceNow_() : new Date(Date.now());
+      return storedDeadline < now.getTime();
+    }
+  }
+
   if (!item.dueDateKey) {
     return false;
   }
@@ -364,6 +423,14 @@ function isStaleUnknownDueNotificationForWeb_(item, referenceNow) {
 
   const receivedAtTime = Number(item && item.receivedAtTime);
   if (!Number.isFinite(receivedAtTime) || receivedAtTime <= 0) return false;
+
+  if (item.staleAtTime !== undefined && item.staleAtTime !== null && item.staleAtTime !== '') {
+    const storedStaleAt = Number(item.staleAtTime);
+    if (Number.isFinite(storedStaleAt)) {
+      const now = referenceNow instanceof Date ? referenceNow.getTime() : Date.now();
+      return now > storedStaleAt;
+    }
+  }
 
   const retentionMs = (isApiCoursework ? 21 : 7) * 24 * 60 * 60 * 1000;
   const now = referenceNow instanceof Date ? referenceNow.getTime() : Date.now();
@@ -511,6 +578,12 @@ function getClassroomNotificationType_(body) {
 }
 
 function isTaskRelatedRow_(row) {
+  const processed = getNotificationProcessedData_(row);
+  if (processed) return Boolean(processed.taskRelated);
+  return isTaskRelatedRowLegacy_(row);
+}
+
+function isTaskRelatedRowLegacy_(row) {
   const source = String(row[2] || '');
   const dueStatus = String(row[6] || '');
   const status = String(row[12] || '');

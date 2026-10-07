@@ -1,16 +1,199 @@
-function getUniversityNoticesForWeb() {
-  return getUniversityNoticesForWebLocked_();
+function getUniversityNoticesForWeb(forceRefresh) {
+  return getUniversityNoticesForWebLocked_(Boolean(forceRefresh));
 }
 
-function getUniversityNoticesForWebLocked_() {
+function getUniversityNoticePayloadForWeb(forceRefresh) {
   const startedAt = Date.now();
-  const testMode = isTestCaseModeEnabled_();
+  const propertiesStartedAt = Date.now();
+  const properties = PropertiesService.getUserProperties().getProperties();
+  const propertiesMs = Date.now() - propertiesStartedAt;
+  const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
+  const now = testMode ? getTestCaseReferenceNowFromProperties_(properties) : new Date();
+  const cacheToken = getUniversityNoticeCacheKey_(properties, testMode, now);
+  const dataStartedAt = Date.now();
+  const listItems = getUniversityNoticeListItemsForWeb_(Boolean(forceRefresh), properties);
+  const items = listItems.map(toUniversityNoticeListItemForWeb_);
+  const dataMs = Date.now() - dataStartedAt;
+  const clockStateStartedAt = Date.now();
+  const testCaseClockState = getTestCaseClockStateForWeb(properties);
+  Logger.log('TASKHUB_UNIVERSITY_PAYLOAD_TIMING ' + JSON.stringify({
+    propertiesMs,
+    dataMs,
+    clockStateMs: Date.now() - clockStateStartedAt,
+    totalMs: Date.now() - startedAt,
+    itemCount: items.length,
+    cacheTokenAvailable: Boolean(cacheToken)
+  }));
+  return {items, cacheToken, testCaseClockState};
+}
+
+function getUniversityNoticeListItemsForWeb_(forceRefresh, properties) {
+  const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
+  if (testMode) {
+    // Test fixtures are projected against a user-selected virtual date in
+    // memory. Keep that real processing path, while still returning only the
+    // compact list projection to the browser.
+    return getUniversityNoticesForWebLocked_(forceRefresh, properties);
+  }
+
+  if (!isNotificationDisplayDataCurrent_(properties)) {
+    throw new Error('同期時に作成する大学通知表示データが未準備です。更新を実行してください。');
+  }
+  const spreadsheet = getSpreadsheetForRead_(properties);
+  const items = getMaterializedUniversityNoticeListForWeb_(spreadsheet, properties, properties);
+  if (items === null) {
+    throw new Error('大学通知の表示用シートを読み取れません。同期を再実行してください。');
+  }
+  Logger.log('TASKHUB_UNIVERSITY_NOTICE_LIST_READ ' + JSON.stringify({
+    mode: 'prepared-list-only', itemCount: items.length, bodyColumnRead: false
+  }));
+  return items;
+}
+
+function toUniversityNoticeListItemForWeb_(item) {
+  const preview = String(item && item.preview !== undefined
+    ? item.preview
+    : createUniversityNoticePreview_(item && item.body));
+  return {
+    messageId: String(item && item.messageId || ''),
+    source: String(item && item.source || ''),
+    title: String(item && item.title || ''),
+    courseName: String(item && item.courseName || ''),
+    from: String(item && item.from || ''),
+    receivedAt: String(item && item.receivedAt || ''),
+    receivedAtTime: Number(item && item.receivedAtTime || 0),
+    gmailLink: String(item && item.gmailLink || ''),
+    preview,
+    read: Boolean(item && item.read),
+    saved: Boolean(item && item.saved)
+  };
+}
+
+function getUniversityNoticeBodyForWeb(messageId) {
+  const id = String(messageId || '');
+  if (!id || id.length > 200) return {found: false, messageId: id, body: ''};
+  const properties = PropertiesService.getUserProperties().getProperties();
+  const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
+  if (testMode) {
+    const items = getUniversityNoticesForWebLocked_(true, properties);
+    const item = items.find(notice => String(notice.messageId || '') === id);
+    return {found: Boolean(item), messageId: id, body: item ? String(item.body || '') : ''};
+  }
+
+  if (!isNotificationDisplayDataCurrent_(properties)) return {found: false, messageId: id, body: ''};
+  // Full-body cache entries can be large. Selection needs only one body cell,
+  // so avoid parsing/decompressing the entire search cache for every click.
+  const spreadsheet = getSpreadsheetForRead_(properties);
+  const sheet = spreadsheet && spreadsheet.getSheetByName(UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME);
+  if (!sheet) return {found: false, messageId: id, body: ''};
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return {found: false, messageId: id, body: ''};
+  const headers = sheet.getRange(1, 1, 1, UNIVERSITY_NOTICE_DISPLAY_HEADERS.length).getValues()[0] || [];
+  if (!UNIVERSITY_NOTICE_DISPLAY_HEADERS.every((value, index) => headers[index] === value)) {
+    return {found: false, messageId: id, body: ''};
+  }
+  const idColumn = UNIVERSITY_NOTICE_DISPLAY_FIELDS.indexOf('messageId') + 1;
+  const ids = sheet.getRange(2, idColumn, lastRow - 1, 1).getValues();
+  const rowIndex = ids.findIndex(row => String(row[0] || '') === id);
+  if (rowIndex < 0) return {found: false, messageId: id, body: ''};
+  const bodyColumn = UNIVERSITY_NOTICE_DISPLAY_FIELDS.indexOf('body') + 1;
+  const body = sheet.getRange(rowIndex + 2, bodyColumn, 1, 1).getValues()[0][0];
+  return {found: true, messageId: id, body: String(body || '')};
+}
+
+function searchUniversityNoticesForWeb(query) {
+  const normalizedQuery = String(query || '').normalize('NFKC').trim().toLowerCase();
+  if (!normalizedQuery) return {query: '', messageIds: []};
+  if (normalizedQuery.length > 200) throw new Error('検索語が長すぎます。');
+  const result = getUniversityNoticeDetailsForDeferredWebRead_();
+  const messageIds = result.items.filter(item => [item.title, item.body, item.from, item.source]
+    .map(value => String(value || '').normalize('NFKC').toLowerCase())
+    .some(value => value.includes(normalizedQuery)))
+    .map(item => String(item.messageId || ''))
+    .filter(Boolean);
+  return {query: normalizedQuery, messageIds};
+}
+
+function getUniversityNoticeDetailsForDeferredWebRead_() {
+  const properties = PropertiesService.getUserProperties().getProperties();
+  const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
+  const now = testMode ? getTestCaseReferenceNowFromProperties_(properties) : new Date();
+  const cacheToken = getUniversityNoticeCacheKey_(properties, testMode, now);
+  const cached = readUniversityNoticeCache_(properties, testMode, now);
+  if (cached) return {items: cached.items, cacheToken};
+
+  // Detail/search data is loaded only after the list has rendered. Cache full
+  // rows for repeated searches; individual selections read only one body cell.
+  const items = getUniversityNoticesForWebLocked_(true, properties);
+  const latestProperties = PropertiesService.getUserProperties().getProperties();
+  const latestTestMode = latestProperties[TEST_CASE_MODE_PROPERTY] === 'true';
+  const latestNow = latestTestMode ? getTestCaseReferenceNowFromProperties_(latestProperties) : new Date();
+  const latestCacheToken = getUniversityNoticeCacheKey_(latestProperties, latestTestMode, latestNow);
+  if (cacheToken === latestCacheToken) writeUniversityNoticeCache_(cacheToken, items);
+  return {items, cacheToken};
+}
+
+function cacheUniversityNoticeItemsAfterWebDisplay(items, cacheToken) {
+  if (!Array.isArray(items) || items.length > 2000) return false;
+  // Older clients may still send the full list. Reject compact list projections
+  // so they cannot overwrite the server cache that supplies body search/details.
+  if (items.some(item => !item || typeof item.messageId !== 'string' || !item.messageId || typeof item.body !== 'string')) return false;
+  const properties = PropertiesService.getUserProperties().getProperties();
+  const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
   const now = testMode ? getTestCaseReferenceNow_() : new Date();
+  if (!testMode && properties[NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY] !== NOTIFICATION_DISPLAY_DATA_REVISION) return false;
+  if (!testMode && isNotificationDisplayDataBuilding_(properties)) return false;
+  if (String(cacheToken || '') !== getUniversityNoticeCacheKey_(properties, testMode, now)) return false;
+  return writeUniversityNoticeCache_(String(cacheToken), items);
+}
+
+function getUniversityNoticesForWebLocked_(forceRefresh, userPropertiesSnapshot) {
+  const startedAt = Date.now();
+  const properties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
+  const now = testMode ? getTestCaseReferenceNowFromProperties_(properties) : new Date();
+
+  if (!forceRefresh) {
+    const cacheStartedAt = Date.now();
+    const cached = readUniversityNoticeCache_(properties, testMode, now);
+    if (cached) {
+      Logger.log('TASKHUB_UNIVERSITY_NOTICE_READ_TIMING ' + JSON.stringify({
+        mode: testMode ? 'test-cache-hit' : 'cache-hit',
+        cacheReadMs: Date.now() - cacheStartedAt,
+        totalMs: Date.now() - startedAt,
+        itemCounts: {returned: cached.items.length},
+        spreadsheetRead: false
+      }));
+      return cached.items;
+    }
+  }
+
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
   const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, now) : null;
-  const testStates = testMode ? getTestNotificationStateMap_() : null;
-  const states = PropertiesService.getUserProperties().getProperties();
-  const readContext = createNotificationReadContext_(testSpreadsheet, testMode);
+  const testStates = testMode ? getTestNotificationStateMap_(properties) : null;
+  const states = properties;
+  if (!testMode) {
+    const displayStartedAt = Date.now();
+    const spreadsheet = getSpreadsheetForRead_(properties);
+    const spreadsheetOpenMs = Date.now() - displayStartedAt;
+    const readStartedAt = Date.now();
+    const displayItems = getMaterializedUniversityNoticesForWeb_(spreadsheet, now, states, properties);
+    if (displayItems !== null) {
+      Logger.log('TASKHUB_UNIVERSITY_NOTICE_READ_TIMING ' + JSON.stringify({
+        mode: 'personal-display-data',
+        spreadsheetOpenMs,
+        displaySheetReadAndStateOverlayMs: Date.now() - readStartedAt,
+        totalDisplayReadMs: Date.now() - displayStartedAt,
+        totalMs: Date.now() - startedAt,
+        itemCounts: {returned: displayItems.length},
+        rawNotificationSheetsRead: false,
+        classroomApiAssignmentsRead: false
+      }));
+      return displayItems;
+    }
+    throw new Error('同期時に作成する大学通知表示データが未準備です。更新を実行してください。');
+  }
+  const readContext = createNotificationReadContext_(testSpreadsheet, true);
   const contextReadyAt = Date.now();
 
   const noticeRows = getNotificationRowsFromSheets_(
@@ -18,33 +201,28 @@ function getUniversityNoticesForWebLocked_() {
     testMode,
     testDateContext,
     readContext,
-    {includeClassroomApi: false, mergeClassroomApiAssignments: false}
+    {
+      includeClassroomApi: false,
+      mergeClassroomApiAssignments: false,
+      preprocessTestRows: testMode
+    }
   );
   const rowsReadyAt = Date.now();
-  const notices = noticeRows
+  const noticeItems = noticeRows
     .filter(row => isUniversityNoticeRow_(row))
-    .filter(row => isUniversityNoticeVisible_(row, now))
     .map(row => {
       const notice = rowToUniversityNotice_(row);
-      let state = {};
-      const statePrefix = getUniversityNoticeStatePrefix_();
-      const storedState = states[statePrefix + notice.messageId] ||
-        (row.originalMessageIdForState ? states[statePrefix + row.originalMessageIdForState] : '') || '{}';
-      try { state = JSON.parse(storedState); } catch (_) {}
-      return Object.assign(notice, {read: Boolean(state.read), saved: Boolean(state.saved)});
-    })
-    .sort((a, b) => b.receivedAtTime - a.receivedAtTime);
+      notice.expiresAtTime = getUniversityNoticeExpiryTimeForDisplay_(row);
+      notice.originalMessageIdForState = String(row.originalMessageIdForState || '');
+      return notice;
+    });
   const noticesReadyAt = Date.now();
   const extractedItems = getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext);
   const extractedReadyAt = Date.now();
-  const result = mergeNotificationAndInCampusExtractedItemsForWeb_(
-    notices,
-    extractedItems,
-    'announcement',
-    testMode
-  );
+  const preparedItems = buildUniversityNoticeDisplayItems_(noticeItems, extractedItems, testMode);
+  const result = applyUniversityNoticeStateAndExpiryForWeb_(preparedItems, now, states, testMode);
   Logger.log('TASKHUB_UNIVERSITY_NOTICE_READ_TIMING ' + JSON.stringify({
-    mode: testMode ? 'test' : 'personal',
+    mode: testMode ? 'test-fixture-materialized' : 'personal-raw-fallback',
     contextMs: contextReadyAt - startedAt,
     sourceRowsMs: rowsReadyAt - contextReadyAt,
     noticeFilterAndMappingMs: noticesReadyAt - rowsReadyAt,
@@ -53,13 +231,31 @@ function getUniversityNoticesForWebLocked_() {
     totalMs: Date.now() - startedAt,
     sheetReadMs: readContext.sheetReadMs,
     sheetRowCounts: readContext.sheetRowCounts,
-    itemCounts: {sourceRows: noticeRows.length, notices: notices.length, inCampusExtracts: extractedItems.length, returned: result.length},
+    itemCounts: {sourceRows: noticeRows.length, notices: noticeItems.length, inCampusExtracts: extractedItems.length, returned: result.length},
     classroomApiAssignmentsRead: false
   }));
   return result;
 }
 
+function applyUniversityNoticeStateAndExpiryForWeb_(items, referenceNow, states, testMode) {
+  const statePrefix = getUniversityNoticeStatePrefix_(testMode);
+  const stateMap = states || {};
+  return filterUniversityNoticeDisplayItemsForNow_(items, referenceNow).map(item => {
+    let state = {};
+    const storedState = stateMap[statePrefix + item.messageId] ||
+      (item.originalMessageIdForState ? stateMap[statePrefix + item.originalMessageIdForState] : '') || '{}';
+    try { state = JSON.parse(storedState); } catch (_) {}
+    return Object.assign({}, item, {read: Boolean(state.read), saved: Boolean(state.saved)});
+  });
+}
+
 function isUniversityNoticeRow_(row) {
+  const processed = getNotificationProcessedData_(row);
+  if (processed) return Boolean(processed.isUniversityNotice);
+  return isUniversityNoticeRowLegacy_(row);
+}
+
+function isUniversityNoticeRowLegacy_(row) {
   const source = String(row[2] || '');
   const body = String(row[11] || '');
 
@@ -82,17 +278,19 @@ function isUniversityNoticeRow_(row) {
 
 function rowToUniversityNotice_(row) {
   const source = String(row[2] || '');
+  const processed = getNotificationProcessedData_(row);
 
   return {
     messageId: String(row[1] || ''),
     source,
-    title: source === 'inCampus' ? extractInCampusTitle_(row[7], row[11]) : String(row[7] || row[4] || ''),
+    title: processed ? String(processed.displayTitle || processed.title || '') :
+      source === 'inCampus' ? extractInCampusTitle_(row[7], row[11]) : String(row[7] || row[4] || ''),
     courseName: String(row[3] || ''),
     from: String(row[8] || ''),
     receivedAt: formatDateForWeb_(row[9]),
     receivedAtTime: getTimeForSort_(row[9]),
     gmailLink: String(row[10] || ''),
-    body: cleanBodyForWeb_(row[11], source)
+    body: processed ? String(processed.displayBody || '') : cleanBodyForWeb_(row[11], source)
   };
 }
 
@@ -102,12 +300,17 @@ function setUniversityNoticeState(messageId, state) {
 
 function setUniversityNoticeStateLocked_(messageId, state) {
   if (typeof messageId !== 'string' || !messageId || messageId.length > 200 || !state || typeof state.read !== 'boolean' || typeof state.saved !== 'boolean') throw new Error('Invalid notice state');
-  PropertiesService.getUserProperties().setProperty(getUniversityNoticeStatePrefix_() + messageId, JSON.stringify({read: state.read, saved: state.saved}));
+  const props = PropertiesService.getUserProperties();
+  props.setProperty(getUniversityNoticeStatePrefix_() + messageId, JSON.stringify({read: state.read, saved: state.saved}));
+  const previousGeneration = Number(props.getProperty(UNIVERSITY_NOTICE_STATE_GENERATION_PROPERTY) || 0);
+  props.setProperty(UNIVERSITY_NOTICE_STATE_GENERATION_PROPERTY,
+    String(Number.isFinite(previousGeneration) ? previousGeneration + 1 : 1));
   return true;
 }
 
-function getUniversityNoticeStatePrefix_() {
-  return isTestCaseModeEnabled_() ? 'universityNotice:test:' : 'universityNotice:';
+function getUniversityNoticeStatePrefix_(testMode) {
+  const useTestMode = typeof testMode === 'boolean' ? testMode : isTestCaseModeEnabled_();
+  return useTestMode ? 'universityNotice:test:' : 'universityNotice:';
 }
 
 // All visibility boundaries use Japan time, independent of the script timezone.
@@ -162,6 +365,10 @@ function isUniversityNoticeVisible_(row, referenceDate) {
   const now = referenceDate || new Date();
   const received = parseNotificationReceivedDate_(row[9]);
   if (!received) return true; // Missing dates are not evidence that mail has expired.
+  const processed = getNotificationProcessedData_(row);
+  if (processed && Object.prototype.hasOwnProperty.call(processed, 'expiresAt')) {
+    return processed.expiresAt === null || now.getTime() < Number(processed.expiresAt);
+  }
   if (String(row[2]) === 'Google Classroom') {
     const expiry = getClassroomNoticeExpiry_(row[11], received);
     return expiry !== null ? now.getTime() < expiry

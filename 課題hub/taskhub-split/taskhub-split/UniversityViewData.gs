@@ -278,16 +278,51 @@ function updateInCampusExtractedStatusLocked_(messageId, status) {
   SpreadsheetApp.flush();
 }
 
-function getCompletedNotificationsForWeb() {
-  return getCompletedNotificationsForWebLocked_();
+function getCompletedNotificationsForWeb(userProperties) {
+  return getCompletedNotificationsForWebLocked_(userProperties);
 }
 
-function getCompletedNotificationsForWebLocked_() {
-  const testMode = isTestCaseModeEnabled_();
-  const deadlineReferenceNow = testMode ? getTestCaseReferenceNow_() : new Date(Date.now());
+function getCompletedNotificationsForWebLocked_(userPropertiesSnapshot) {
+  const startedAt = Date.now();
+  const userProperties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  const testMode = userProperties[TEST_CASE_MODE_PROPERTY] === 'true';
+  const deadlineReferenceNow = testMode ? getTestCaseReferenceNowFromProperties_(userProperties) : new Date(Date.now());
+  if (!testMode) {
+    const cacheStartedAt = Date.now();
+    const cachedTaskItems = readTaskDisplayCache_(userProperties, '完了');
+    if (cachedTaskItems) {
+      const displayItems = cachedTaskItems.items;
+      Logger.log('TASKHUB_COMPLETED_NOTIFICATION_READ_TIMING ' + JSON.stringify({
+        mode: 'cache-hit',
+        cacheReadMs: Date.now() - cacheStartedAt,
+        totalMs: Date.now() - startedAt,
+        itemCounts: {returned: displayItems.length},
+        spreadsheetRead: false
+      }));
+      return displayItems;
+    }
+    const displayStartedAt = Date.now();
+    const spreadsheet = getSpreadsheetForRead_(userProperties);
+    const spreadsheetOpenMs = Date.now() - displayStartedAt;
+    const readStartedAt = Date.now();
+    const displayItems = getMaterializedTaskItemsForWeb_(spreadsheet, '完了', userProperties);
+    if (displayItems !== null) {
+      Logger.log('TASKHUB_COMPLETED_NOTIFICATION_READ_TIMING ' + JSON.stringify({
+        mode: 'personal-display-data',
+        spreadsheetOpenMs,
+        displaySheetReadMs: Date.now() - readStartedAt,
+        totalDisplayReadMs: Date.now() - displayStartedAt,
+        totalMs: Date.now() - startedAt,
+        itemCounts: {returned: displayItems.length},
+        rawNotificationSheetsRead: false
+      }));
+      return displayItems;
+    }
+    throw new Error('同期時に作成する課題表示データが未準備です。更新を実行してください。');
+  }
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
   const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, deadlineReferenceNow) : null;
-  const testStates = testMode ? getTestNotificationStateMap_() : null;
+  const testStates = testMode ? getTestNotificationStateMap_(userProperties) : null;
   const readContext = createNotificationReadContext_(testSpreadsheet, testMode);
   const data = mergeNotificationAndInCampusExtractedItemsForWeb_(
     getCompletedNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext),
@@ -296,25 +331,15 @@ function getCompletedNotificationsForWebLocked_() {
     testMode
   );
 
-  return data
-    .filter(item => !isNotYetPublishedClassroomApiNotificationForWeb_(item, deadlineReferenceNow))
-    .filter(item => !isExpiredNotificationForWeb_(item, deadlineReferenceNow))
-    .filter(item => !isStaleUnknownDueNotificationForWeb_(item, deadlineReferenceNow))
-    .sort((a, b) => {
-      if (a.completedAtTime !== b.completedAtTime) {
-        return b.completedAtTime - a.completedAtTime;
-      }
-
-      return (b.displayReceivedAtTime || b.receivedAtTime) - (a.displayReceivedAtTime || a.receivedAtTime);
-    });
+  return prepareTaskDisplayItemsForSync_(data, '完了', deadlineReferenceNow);
 }
 
-function getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext) {
-  return getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext);
+function getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext, forceProduction) {
+  return getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext, forceProduction);
 }
 
-function getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext) {
-  const testMode = Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
+function getInCampusSupplementItemsForWebLocked_(testSpreadsheet, testStates, testDateContext, readContext, forceProduction) {
+  const testMode = forceProduction === true ? false : Boolean(testSpreadsheet || testStates) || isTestCaseModeEnabled_();
   const states = testMode ? (testStates || getTestNotificationStateMap_()) : null;
   const dateContext = testMode ? (testDateContext || getTestCaseDateContext_(testSpreadsheet, getTestCaseReferenceNow_())) : null;
   let rows;

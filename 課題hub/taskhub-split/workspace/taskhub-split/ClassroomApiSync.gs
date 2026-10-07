@@ -97,8 +97,9 @@ function syncClassroomApiCourseworkToSpreadsheet_(options) {
       const existingTaskRows = getStructuredSheetRows_(structuredSheets.coursework, CLASSROOM_COURSEWORK_HEADERS.length);
       const previousSubmissionRows = getStructuredSheetRows_(structuredSheets.submissions, CLASSROOM_SUBMISSION_HEADERS.length);
       const supplementSheet = notificationSheets['Google Classroom'];
+      const supplementStorageWidth = getNotificationStorageWidth_('Google Classroom');
       const existingSupplementRows = supplementSheet.getLastRow() >= 2
-        ? supplementSheet.getRange(2, 1, supplementSheet.getLastRow() - 1, HEADER_ROW.length).getValues()
+        ? supplementSheet.getRange(2, 1, supplementSheet.getLastRow() - 1, supplementStorageWidth).getValues()
         : [];
       const courseIdColumn = getClassroomCourseworkColumn_('授業ID');
       const courseworkIdColumn = getClassroomCourseworkColumn_('課題ID');
@@ -175,6 +176,9 @@ function syncClassroomApiCourseworkToSpreadsheet_(options) {
       userProperties.deleteProperty(CLASSROOM_API_LAST_ERROR_PROPERTY);
       userProperties.deleteProperty(CLASSROOM_API_STRUCTURED_SYNC_IN_PROGRESS_PROPERTY);
       SpreadsheetApp.flush();
+      if (syncOptions.deferDisplayDataRefresh !== true) {
+        refreshNotificationDisplayDataAfterSyncLocked_(ss, 'classroom-api-sync');
+      }
 
       const submissionStateCounts = {};
       submissionRows.forEach(row => {
@@ -313,12 +317,16 @@ function buildClassroomApiSubmissionStorageRow_(record, fetchedAt) {
 }
 
 function replaceNotificationSheetRows_(sheet, rows) {
+  const width = getNotificationStorageWidth_('Google Classroom');
+  if (!rows.every(row => Array.isArray(row) && row.length === width)) {
+    throw new Error(`「${sheet.getName()}」の保存列数が通知シート形式と一致しません。`);
+  }
   const currentDataRowCount = Math.max(0, sheet.getLastRow() - 1);
   if (rows.length) {
-    sheet.getRange(2, 1, rows.length, HEADER_ROW.length).setValues(rows);
+    sheet.getRange(2, 1, rows.length, width).setValues(rows);
   }
   if (currentDataRowCount > rows.length) {
-    sheet.getRange(rows.length + 2, 1, currentDataRowCount - rows.length, HEADER_ROW.length).clearContent();
+    sheet.getRange(rows.length + 2, 1, currentDataRowCount - rows.length, width).clearContent();
   }
 }
 

@@ -241,7 +241,12 @@
   }
 
   function reloadCurrentViewForTestClock() {
-    if (!testCaseModeEnabled || currentScreen === 'university') {
+    if (currentScreen === 'university') {
+      universityState.loading = false;
+      loadUniversityNotices(undefined, undefined, true);
+      return;
+    }
+    if (!testCaseModeEnabled) {
       refreshCurrentView();
       return;
     }
@@ -268,8 +273,7 @@
     google.script.run
       .withSuccessHandler(settings => {
         renderSecuritySettings(settings);
-        notificationRequestIds.active++;
-        notificationRequestIds.completed++;
+        invalidateClientNotificationData_();
         const reportReadFailure = error => {
           setSecurityMessage(`${enabled ? 'ON' : 'OFF'}設定は保存済みですが、切替後のデータ読込に失敗しました。更新を再試行してください：${getErrorMessage(error)}`, true);
         };

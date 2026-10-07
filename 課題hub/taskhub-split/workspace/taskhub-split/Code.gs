@@ -43,6 +43,10 @@ const LEGACY_NOTIFICATION_MIGRATION_PROPERTY = 'TASKHUB_LEGACY_NOTIFICATION_MIGR
 const LEGACY_INCAMPUS_EXTRACT_MIGRATION_PROPERTY = 'TASKHUB_LEGACY_INCAMPUS_EXTRACT_MIGRATION';
 const NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY = 'TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING';
 const NOTIFICATION_LAST_SUCCESSFUL_SYNC_PROPERTY = 'TASKHUB_NOTIFICATION_LAST_SUCCESSFUL_SYNC_AT';
+const USER_INITIAL_DATA_SYNC_PENDING_PROPERTY = 'TASKHUB_INITIAL_DATA_SYNC_PENDING';
+const USER_INITIAL_DATA_SYNC_IN_PROGRESS_PROPERTY = 'TASKHUB_INITIAL_DATA_SYNC_IN_PROGRESS_AT';
+const USER_INITIAL_DATA_SYNC_COMPLETED_AT_PROPERTY = 'TASKHUB_INITIAL_DATA_SYNC_COMPLETED_AT';
+const USER_INITIAL_DATA_SYNC_IN_PROGRESS_STALE_MS = 10 * 60 * 1000;
 const USER_STORAGE_INITIALIZATION_REVISION_PROPERTY = 'TASKHUB_USER_STORAGE_INITIALIZATION_REVISION';
 const USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY = 'TASKHUB_USER_STORAGE_INITIALIZATION_LAST_RUN_AT';
 const USER_STORAGE_INITIALIZATION_REVISION = 'weekly-background-init-load-optimization-2026-10-05-v1';
@@ -71,6 +75,7 @@ const HEADER_ROW = [
   '更新レコード状態',
   '適用済み提出記録'
 ];
+const NOTICE_PREPROCESSING_METADATA_HEADER = '解析済み通知データ';
 
 const TASK_KEYWORDS = [
   '課題',
@@ -201,30 +206,127 @@ const TEST_CASE_EXTRACT_HEADERS = INCAMPUS_HEADERS;
 const TEST_CASE_SETTINGS_SHEET_NAME = 'テスト設定';
 
 function doGet(e) {
+  const startedAt = Date.now();
   if (e && e.parameter && e.parameter.classroomApiTest === '1') {
     return HtmlService
       .createHtmlOutputFromFile('ClassroomApiExperiment')
       .setTitle('課題Hub Classroom API検証');
   }
 
+  const ensureStartedAt = Date.now();
   ensureUserStorageForWeb_();
+  const userStorageEnsureMs = Date.now() - ensureStartedAt;
 
-  return HtmlService
-    .createTemplateFromFile('Index')
-    .evaluate()
-    .setTitle('課題通知Hub');
+  const initialView = getInitialTaskHubViewForWeb_(e);
+  const initialPayloadStartedAt = Date.now();
+  const initialPayload = getInitialTaskHubPayloadForWeb_(initialView);
+  const initialPayloadGenerationMs = Date.now() - initialPayloadStartedAt;
+  const initialPayloadJson = serializeTaskHubInitialPayload_(initialPayload);
+  const template = HtmlService.createTemplateFromFile('Index');
+  template.initialView = initialView;
+  template.initialPayloadJson = initialPayloadJson;
+  const evaluateStartedAt = Date.now();
+  const output = template.evaluate().setTitle('課題通知Hub');
+  Logger.log('TASKHUB_WEB_BOOT_TIMING ' + JSON.stringify({
+    userStorageEnsureMs,
+    initialPayloadGenerationMs,
+    initialPayloadCharacters: initialPayloadJson.length,
+    templateEvaluateMs: Date.now() - evaluateStartedAt,
+    totalMs: Date.now() - startedAt,
+    initialView
+  }));
+  return output;
+}
+
+function getInitialTaskHubViewForWeb_(event) {
+  const requested = String(event && event.parameter && event.parameter.view || '');
+  return requested === 'assignment' || requested === 'university' ? requested : 'home';
+}
+
+function getInitialTaskHubPayloadForWeb_(view) {
+  try {
+    const payload = view === 'university'
+      ? getUniversityNoticePayloadForWeb(false)
+      : getTaskDisplayPayloadForWeb('未完了');
+    return {view, payload};
+  } catch (error) {
+    Logger.log('TASKHUB_INITIAL_DISPLAY_PAYLOAD_FAILED ' + String(error && error.message ? error.message : error));
+    return null;
+  }
+}
+
+function serializeTaskHubInitialPayload_(payload) {
+  if (!payload) return 'null';
+  return JSON.stringify(payload)
+    .replace(/&/g, '\\u0026')
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 function include(filename) {
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
+function isInitialPersonalDataSyncPendingForWeb_() {
+  const props = PropertiesService.getUserProperties().getProperties();
+  return props[USER_INITIAL_DATA_SYNC_PENDING_PROPERTY] === 'true' ||
+    props[NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY] === 'true';
+}
+
+function completeInitialPersonalDataSyncIfReadyLocked_() {
+  const props = PropertiesService.getUserProperties();
+  if (props.getProperty(USER_INITIAL_DATA_SYNC_PENDING_PROPERTY) !== 'true') return false;
+  if (props.getProperty(NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY) === 'true' ||
+      !props.getProperty(NOTIFICATION_LAST_SUCCESSFUL_SYNC_PROPERTY) ||
+      !props.getProperty(CLASSROOM_API_LAST_SUCCESS_PROPERTY)) return false;
+
+  props.deleteProperty(USER_INITIAL_DATA_SYNC_PENDING_PROPERTY);
+  props.deleteProperty(USER_INITIAL_DATA_SYNC_IN_PROGRESS_PROPERTY);
+  props.setProperty(USER_INITIAL_DATA_SYNC_COMPLETED_AT_PROPERTY, new Date().toISOString());
+  return true;
+}
+
 function ensureUserStorageForWeb_() {
-  if (isUserStorageInitializationCurrent_()) {
-    if (isUserTriggerMaintenanceConfigurationCurrent_()) return {ok: true, skipped: true};
+  const properties = PropertiesService.getUserProperties().getProperties();
+  if (isUserStorageInitializationCurrentForProperties_(properties)) {
+    if (isNotificationDisplayDataBuildingForProperties_(properties)) {
+      return {ok: true, skipped: true, displayDataBuilding: true};
+    }
+    if (!isNotificationDisplayDataCurrentForProperties_(properties)) {
+      return runWithUserLock_('表示用データ初期化', () => {
+        if (isNotificationDisplayDataCurrent_()) return {ok: true, skipped: true};
+        const spreadsheet = getSpreadsheetForRead_(PropertiesService.getUserProperties().getProperties());
+        const result = refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, 'display-data-migration');
+        return Object.assign({ok: Boolean(result && result.taskCount !== undefined)}, result);
+      });
+    }
+    if (properties[USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY] === USER_TRIGGER_MAINTENANCE_REVISION) {
+      return {ok: true, skipped: true};
+    }
     return runWithUserLock_('バックグラウンドトリガー設定', () => ensureUserTriggerMaintenanceConfigurationLocked_());
   }
   return runWithUserLock_('保存データ処理', () => ensureUserStorageForWebLocked_());
+}
+
+function isUserStorageInitializationCurrentForProperties_(properties) {
+  const values = properties || {};
+  const spreadsheetId = getConfiguredSpreadsheetId_() || values[USER_SPREADSHEET_ID_PROPERTY];
+  if (values[USER_STORAGE_INITIALIZATION_REVISION_PROPERTY] !== USER_STORAGE_INITIALIZATION_REVISION ||
+      !spreadsheetId) return false;
+  const lastRun = Date.parse(values[USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY] || '');
+  return Number.isFinite(lastRun) && Date.now() - lastRun < USER_STORAGE_INITIALIZATION_INTERVAL_MS;
+}
+
+function isNotificationDisplayDataBuildingForProperties_(properties) {
+  const startedAt = Number((properties || {})[NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY] || 0);
+  return Number.isFinite(startedAt) && startedAt > 0 && Date.now() - startedAt < 5 * 60 * 1000;
+}
+
+function isNotificationDisplayDataCurrentForProperties_(properties) {
+  return (properties || {})[NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY] === NOTIFICATION_DISPLAY_DATA_REVISION &&
+    !isNotificationDisplayDataBuildingForProperties_(properties);
 }
 
 function isUserStorageInitializationCurrent_() {
@@ -274,12 +376,14 @@ function ensureUserStorageForWebLocked_() {
     props.setProperty(USER_STORAGE_INITIALIZATION_REVISION_PROPERTY, USER_STORAGE_INITIALIZATION_REVISION);
     props.setProperty(USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY, new Date().toISOString());
     props.setProperty(USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY, USER_TRIGGER_MAINTENANCE_REVISION);
+    const displayDataResult = refreshNotificationDisplayDataAfterSyncLocked_(ss, 'storage-initialization');
     Logger.log('TASKHUB_INITIALIZATION_TIMING ' + JSON.stringify({elapsedMs: Date.now() - startedAt}));
 
     return {
       ok: true,
       spreadsheetId: ss.getId(),
       spreadsheetUrl: ss.getUrl(),
+      displayDataReady: Boolean(displayDataResult && displayDataResult.taskCount !== undefined),
       autoFetchTriggerCreated: autoFetchTrigger.created,
       classroomApiTriggerCreated: classroomApiTrigger.created,
       triggerMaintenanceCreated: triggerMaintenance.created,

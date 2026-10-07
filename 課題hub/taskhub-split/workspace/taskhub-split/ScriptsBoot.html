@@ -1,26 +1,105 @@
 <script>
   groupOpenState = getGroupOpenState();
+  let initialPersonalSyncRequestStarted = false;
 
   updateBottomNavState();
   renderHome();
-  loadTestCaseClockState();
   showHelpOnFirstVisit();
 
-  function loadInitialTaskHubView(location) {
-    const view = location && location.parameter && location.parameter.view;
-    if (view === 'university') {
-      showUniversityNotices();
-    } else if (view === 'assignment') {
-      loadNotifications();
-    } else {
-      loadHomeNotifications();
+  function getInitialTaskHubPayload_() {
+    const element = document.getElementById('taskhub-initial-payload');
+    if (!element || !String(element.textContent || '').trim()) return null;
+    try {
+      return JSON.parse(element.textContent);
+    } catch (error) {
+      console.error('初期表示データを読み込めませんでした。', error);
+      return null;
     }
   }
 
-  if (google.script.url && typeof google.script.url.getLocation === 'function') {
-    google.script.url.getLocation(loadInitialTaskHubView);
-  } else {
-    loadHomeNotifications();
+  function loadInitialTaskHubView(view, initialData) {
+    const initialPayload = initialData && initialData.view === view ? initialData.payload : null;
+    const hasInitialPayload = view === 'university'
+      ? Boolean(initialPayload && Array.isArray(initialPayload.items))
+      : Boolean(initialPayload && Array.isArray(initialPayload.items));
+    const payload = hasInitialPayload ? initialPayload : undefined;
+    if (view === 'university') {
+      showUniversityNotices(payload);
+    } else if (view === 'assignment') {
+      loadNotifications(payload);
+    } else {
+      loadHomeNotifications(payload);
+    }
+    startInitialPersonalSyncIfPending_();
+  }
+
+  loadInitialTaskHubView(document.body.dataset.taskhubInitialView || 'home', getInitialTaskHubPayload_());
+
+  function startInitialPersonalSyncIfPending_() {
+    if (document.body.dataset.taskhubInitialSync !== 'true' || initialPersonalSyncRequestStarted) return;
+    initialPersonalSyncRequestStarted = true;
+    notificationSyncInFlight = true;
+    setManualSyncButtonBusy(true);
+    showSyncToast('初回データを取得しています（Classroom API → Gmail）…', 'loading');
+
+    google.script.run
+      .withSuccessHandler(result => {
+        if (result && result.inProgress) {
+          initialPersonalSyncRequestStarted = false;
+          setTimeout(startInitialPersonalSyncIfPending_, 5000);
+          return;
+        }
+        finishManualSync();
+        if (result && result.started && result.apiSuccess && result.gmailSuccess) {
+          const status = result.testCaseModeEnabled
+            ? `初回同期完了：個人ExcelにAPI課題${Number(result.apiCourseworkCount || 0)}件、Gmail新着${Number(result.savedCount || 0)}件を保存しました。テスト表示は維持します。`
+            : `初回同期完了：API課題${Number(result.apiCourseworkCount || 0)}件、Gmail新着${Number(result.savedCount || 0)}件を取り込みました。`;
+          showSyncToast(status, 'success');
+          if (!result.testCaseModeEnabled) refreshPageAfterInitialSync_();
+          return;
+        }
+        if (result && result.skipped) {
+          if (result.completed || result.reason === 'already-initialized') {
+            if (!result.testCaseModeEnabled) refreshPageAfterInitialSync_();
+          }
+          return;
+        }
+        const errors = [];
+        if (result && result.apiError) errors.push(`Classroom API：${result.apiError}`);
+        if (result && result.gmailError) errors.push(`Gmail：${result.gmailError}`);
+        if (result && result.syncSkipped) errors.push(`Gmail同期を見送りました：${result.syncSkipReason || '保存データを確認できません。'}`);
+        showSyncToast(`初回同期に失敗しました。再読み込み時に再試行します。${errors.length ? ` ${errors.join('。')}` : ''}`, 'error');
+      })
+      .withFailureHandler(error => {
+        finishManualSync();
+        showSyncToast(`初回同期に失敗しました。再読み込み時に再試行します：${getErrorMessage(error)}`, 'error');
+      })
+      .bootstrapInitialPersonalDataForWeb();
+  }
+
+  function refreshPageAfterInitialSync_() {
+    if (currentScreen === 'university') {
+      if (universityState.loading) {
+        setTimeout(refreshPageAfterInitialSync_, 250);
+        return;
+      }
+      loadUniversityNotices();
+      return;
+    }
+    if (currentScreen === 'completed') {
+      if (notificationRequestsInFlight.completed) {
+        setTimeout(refreshPageAfterInitialSync_, 250);
+        return;
+      }
+      loadCompletedNotifications();
+      return;
+    }
+    if (notificationRequestsInFlight.active) {
+      setTimeout(refreshPageAfterInitialSync_, 250);
+      return;
+    }
+    if (currentScreen === 'active') loadNotifications();
+    else loadHomeNotifications();
   }
 
   setInterval(() => {

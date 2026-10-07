@@ -20,8 +20,9 @@ const HOST = '127.0.0.1';
 const EXCEL_EPOCH_UTC = Date.UTC(1899, 11, 30);
 const TEST_DUE_POSITIONS = new Set(['期限切れ', '今日まで', '明日まで', '今週中', '来週以降']);
 const WEB_METHODS = new Set([
-  'getNotificationsForWeb', 'getCompletedNotificationsForWeb',
-  'refreshAndGetNotificationsForWeb', 'syncAndGetNotificationsForWeb', 'markNotificationDone',
+  'getNotificationsForWeb', 'getCompletedNotificationsForWeb', 'getTaskDisplayPayloadForWeb', 'getUniversityNoticePayloadForWeb',
+  'getUniversityNoticeBodyForWeb', 'searchUniversityNoticesForWeb',
+  'refreshAndGetNotificationsForWeb', 'syncAndGetNotificationsForWeb', 'bootstrapInitialPersonalDataForWeb', 'markNotificationDone',
   'markNotificationUndone', 'getUniversityNoticesForWeb',
   'setUniversityNoticeState', 'getSecuritySettingsForWeb', 'rotateApiTokenForWeb',
   'setTestCaseModeForWeb', 'getTestCaseClockStateForWeb', 'setTestCaseClockForWeb'
@@ -462,7 +463,9 @@ class LocalSheet {
     return range;
   }
   appendRow(row) { if (this.readOnly) throw new Error('テストケース用シートは読み取り専用です。'); this.rows().push(row); saveState(); return this; }
+  deleteRow(row) { if (this.readOnly) throw new Error('テストケース用シートは読み取り専用です。'); this.rows().splice(row - 1, 1); saveState(); }
   deleteRows(start, count) { if (this.readOnly) throw new Error('テストケース用シートは読み取り専用です。'); this.rows().splice(start - 1, count); saveState(); }
+  insertRowsBefore(row, count) { if (this.readOnly) throw new Error('テストケース用シートは読み取り専用です。'); this.rows().splice(row - 1, 0, ...Array.from({length: count}, () => [])); saveState(); }
   insertRowsAfter() { if (this.readOnly) throw new Error('テストケース用シートは読み取り専用です。'); /* row capacity is elastic in this local sheet */ }
 }
 
@@ -496,9 +499,13 @@ function gasFormatDate(value, _zone, pattern) {
   return full;
 }
 
-function buildHtml() {
+function buildHtml(initialView = 'home', initialPayloadJson = 'null') {
   const source = fs.readFileSync(path.join(GAS_DIR, 'Index.html'), 'utf8');
-  const rendered = source.replace(/<\?!=\s*include\(['"]([^'"]+)['"]\)\s*;?\s*\?>/g, (_all, name) => fs.readFileSync(path.join(GAS_DIR, name + '.html'), 'utf8'));
+  const renderedIncludes = source.replace(/<\?!=\s*include\(['"]([^'"]+)['"]\)\s*;?\s*\?>/g, (_all, name) => fs.readFileSync(path.join(GAS_DIR, name + '.html'), 'utf8'));
+  const rendered = renderedIncludes.replace(/<\?!=\s*JSON\.stringify\(isInitialPersonalDataSyncPendingForWeb_\(\)\)\s*\?>/g,
+    JSON.stringify(Boolean(gas.isInitialPersonalDataSyncPendingForWeb_())))
+    .replace(/<\?=\s*initialView\s*\?>/g, ['assignment', 'university'].includes(initialView) ? initialView : 'home')
+    .replace(/<\?!=\s*initialPayloadJson\s*\?>/g, () => String(initialPayloadJson || 'null'));
   const testClock = state.testClock ? new Date(state.testClock) : null;
   const titlePage = rendered.replace(/<head>/i, '<head><script>\n' + LOCAL_BRIDGE + '\n</script>');
   const banner = `<div id="local-test-clock" style="background:#fff4d6;color:#633d00;border-bottom:1px solid #e5c66b;padding:9px 14px;text-align:center;font:13px system-ui,sans-serif">ローカル検証環境：テスト日時は設定または課題ヘッダーから選択できます。メール受信日時は取込時刻で記録します。</div>`;
@@ -507,7 +514,6 @@ function buildHtml() {
 
 const LOCAL_BRIDGE = `
 window.google = {script: {
-  url: {getLocation(callback) { const params = new URLSearchParams(location.search); callback({parameter: Object.fromEntries(params.entries())}); } },
   run: (() => { const makeRunner = (handlers={}) => new Proxy({}, { get(_target, property) {
     if (property === 'withSuccessHandler') return fn => makeRunner({...handlers, success:fn});
     if (property === 'withFailureHandler') return fn => makeRunner({...handlers, failure:fn});
@@ -538,6 +544,9 @@ function createContext() {
       timeBased() { return this; },
       everyMinutes(minutes) { record.cadence = 'minutes'; record.interval = minutes; return this; },
       everyHours(hours) { record.cadence = 'hours'; record.interval = hours; return this; },
+      everyWeeks(weeks) { record.cadence = 'weeks'; record.interval = weeks; return this; },
+      onWeekDay(weekday) { record.weekday = weekday; return this; },
+      atHour(hour) { record.hour = hour; return this; },
       create() { state.triggers.push(record); saveState(); return trigger; }
     };
     return trigger;
@@ -578,6 +587,7 @@ function createContext() {
       getUuid: () => crypto.randomUUID(), formatDate: gasFormatDate
     },
     ScriptApp: {
+      WeekDay: {SUNDAY: 'SUNDAY'},
       getProjectTriggers: () => state.triggers.map(record => ({
         getHandlerFunction: () => typeof record === 'string' ? record : record.handler
       })),
@@ -593,7 +603,7 @@ function createContext() {
     Classroom: {Courses: {list: () => ({courses: []})}},
     ContentService: {MimeType: {JSON: 'application/json'}, createTextOutput(value) { return {value, setMimeType() {return this;}}; }},
     HtmlService: {
-      createTemplateFromFile() { return {evaluate() { return {getContent: buildHtml, setTitle() {return this;}}; }}; },
+      createTemplateFromFile() { return {initialView: 'home', initialPayloadJson: 'null', evaluate() { const initialView = this.initialView; const initialPayloadJson = this.initialPayloadJson; return {getContent: () => buildHtml(initialView, initialPayloadJson), setTitle() {return this;}}; }}; },
       createHtmlOutputFromFile(name) { return {getContent: () => fs.readFileSync(path.join(GAS_DIR, name + '.html'), 'utf8')}; }
     }
   });
@@ -641,7 +651,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://' + HOST + ':' + PORT);
     if (req.method === 'GET' && url.pathname === '/') {
-      const page = gas.doGet().getContent(); return send(res, 200, page, 'text/html; charset=utf-8');
+      const page = gas.doGet({parameter: Object.fromEntries(url.searchParams.entries())}).getContent(); return send(res, 200, page, 'text/html; charset=utf-8');
     }
     if (req.method === 'GET' && url.pathname === '/__local') return send(res, 200, dashboard(), 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/__local/data') return send(res, 200, JSON.stringify(encode(state), null, 2), 'application/json; charset=utf-8');
@@ -690,7 +700,8 @@ if (process.argv.includes('--smoke') || process.argv.includes('--smoke-workbook'
       const origin = `http://${HOST}:${address.port}`;
       const page = await fetch(origin + '/');
       const html = await page.text();
-      if (!page.ok || !html.includes('id="home-view"') || !html.includes('font-family: system-ui') || html.includes('<?!=')) throw new Error('local app template did not render its includes/styles');
+      if (!page.ok || !html.includes('id="home-view"') || !html.includes('font-family: system-ui') ||
+          !html.includes('data-taskhub-initial-sync="true"') || html.includes('<?!=')) throw new Error('local app template did not render its includes/styles/first-run sync state');
       const health = await fetch(origin + '/health').then(r => r.json());
       if (!health.ok || health.mode !== 'local-mock') throw new Error('local health failed');
       const emptyList = await fetch(origin + '/__local/rpc', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({method:'getNotificationsForWeb', args:[]})}).then(r => r.json());
@@ -700,11 +711,12 @@ if (process.argv.includes('--smoke') || process.argv.includes('--smoke-workbook'
           state.sheets['補足通知']?.length !== 1 || state.sheets['inCampus通知']?.length !== 1 ||
           state.sheets['授業']?.length !== 1 || state.sheets['Classroom課題']?.length !== 1 ||
           state.sheets['提出状況']?.length !== 1) throw new Error('first page read did not create a new workbook with initialized headers');
-      const result = await fetch(origin + '/__local/rpc', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({method:'syncAndGetNotificationsForWeb', args:[]})}).then(r => r.json());
-      if (result.error || !result.value?.apiSuccess || result.value?.classroomSavedCount < 1 || result.value?.inCampusSavedCount < 2 || result.value?.items?.length < 3) throw new Error(`first-run API + Gmail sync did not save and return tasks: ${JSON.stringify(result)}`);
+      const result = await fetch(origin + '/__local/rpc', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({method:'bootstrapInitialPersonalDataForWeb', args:[]})}).then(r => r.json());
+      if (result.error || !result.value?.started || !result.value?.completed || !result.value?.apiSuccess || !result.value?.gmailSuccess ||
+          result.value?.classroomSavedCount < 1 || result.value?.inCampusSavedCount < 2) throw new Error(`first-run API + Gmail bootstrap did not save data: ${JSON.stringify(result)}`);
       if (state.properties.TASKHUB_SPREADSHEET_ID !== newWorkbookId || state.properties.TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING) throw new Error('first-run sync did not reuse the new workbook or clear its pending flag');
       if (state.sheets['補足通知']?.length !== 2 || state.sheets['inCampus通知']?.length !== 3) throw new Error('first-run Gmail rows were not persisted in the new workbook');
-      process.stdout.write('PASS first-run creates a personal workbook, saves initial mail rows, and returns tasks for display\n');
+      process.stdout.write('PASS first-run creates a personal workbook, bootstraps API + Gmail once, and clears its pending marker\n');
       const notifications = await fetch(origin + '/__local/rpc', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({method:'getNotificationsForWeb', args:[]})}).then(r => r.json());
       if (notifications.error || !Array.isArray(notifications.value) || notifications.value.length < 3) throw new Error('local GAS RPC failed');
       const target = notifications.value.find(item => item.title === 'ローカル確認レポート1');

@@ -14,7 +14,9 @@ function checkSyntax(dir) {
     if (!/\.(js|gs|html)$/.test(entry.name)) continue;
     const source = fs.readFileSync(file, 'utf8');
     const chunks = entry.name.endsWith('.html')
-      ? [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map(match => match[1])
+      ? [...source.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)]
+        .filter(match => !/\btype\s*=\s*["']application\/json["']/i.test(match[1]))
+        .map(match => match[2])
       : [source];
     chunks.forEach(chunk => {new vm.Script(chunk, {filename: file}); scripts++;});
   }

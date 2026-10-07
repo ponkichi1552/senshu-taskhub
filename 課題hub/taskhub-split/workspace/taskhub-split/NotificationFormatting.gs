@@ -239,16 +239,22 @@ function syncClassroomApiThenGmail_() {
   // The sources write to the same personal workbook. Run them in order so an
   // API snapshot is committed before Gmail's supplemental records are saved.
   try {
-    apiResult = syncClassroomApiCourseworkToSpreadsheet_();
+    apiResult = syncClassroomApiCourseworkToSpreadsheet_({deferDisplayDataRefresh: true});
   } catch (error) {
     apiError = String(error && error.message ? error.message : error);
   }
 
   try {
-    gmailResult = saveClassroomMailsToSheet();
+    gmailResult = saveClassroomMailsToSheet({deferDisplayDataRefresh: true});
   } catch (error) {
     gmailError = String(error && error.message ? error.message : error);
   }
+
+  refreshNotificationDisplayDataAfterCombinedSync_('manual-api-gmail-sync');
+
+  const initialSyncCompleted = isInitialPersonalDataSyncPendingForWeb_()
+    ? runWithUserLock_('初回同期状態の保存', () => completeInitialPersonalDataSyncIfReadyLocked_())
+    : false;
 
   return {
     apiResult,
@@ -256,7 +262,138 @@ function syncClassroomApiThenGmail_() {
     apiSuccess: Boolean(apiResult && !apiError),
     gmailResult,
     gmailError,
-    gmailSuccess: Boolean(gmailResult && !gmailError && !gmailResult.skipped)
+    gmailSuccess: Boolean(gmailResult && !gmailError && !gmailResult.skipped),
+    initialSyncCompleted
+  };
+}
+
+function syncPendingInitialPersonalData_() {
+  const props = PropertiesService.getUserProperties();
+  const apiNeedsInitialSync = !props.getProperty(CLASSROOM_API_LAST_SUCCESS_PROPERTY);
+  const gmailNeedsInitialSync = props.getProperty(NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY) === 'true' ||
+    !props.getProperty(NOTIFICATION_LAST_SUCCESSFUL_SYNC_PROPERTY);
+  let apiResult = null;
+  let apiError = '';
+  let gmailResult = null;
+  let gmailError = '';
+
+  // Keep the required API-before-Gmail order, but do not repeat a source that
+  // already completed while the other source was failing.
+  if (apiNeedsInitialSync) {
+    try {
+      apiResult = syncClassroomApiCourseworkToSpreadsheet_({deferDisplayDataRefresh: true});
+    } catch (error) {
+      apiError = String(error && error.message ? error.message : error);
+    }
+  }
+  if (gmailNeedsInitialSync) {
+    try {
+      gmailResult = saveClassroomMailsToSheet({deferDisplayDataRefresh: true});
+    } catch (error) {
+      gmailError = String(error && error.message ? error.message : error);
+    }
+  }
+
+  const apiSuccess = apiNeedsInitialSync ? Boolean(apiResult && !apiError) : true;
+  const gmailSuccess = gmailNeedsInitialSync
+    ? Boolean(gmailResult && !gmailError && !gmailResult.skipped)
+    : true;
+  if (apiNeedsInitialSync || gmailNeedsInitialSync) {
+    refreshNotificationDisplayDataAfterCombinedSync_('initial-api-gmail-sync');
+  }
+  const initialSyncCompleted = isInitialPersonalDataSyncPendingForWeb_()
+    ? runWithUserLock_('初回同期状態の保存', () => completeInitialPersonalDataSyncIfReadyLocked_())
+    : false;
+
+  return {apiResult, apiError, apiSuccess, gmailResult, gmailError, gmailSuccess, initialSyncCompleted};
+}
+
+/**
+ * Run the first Gmail + Classroom import only for a newly created personal workbook.
+ * Ordinary page loads and normal list reads never invoke either data source.
+ */
+function bootstrapInitialPersonalDataForWeb() {
+  const claim = runWithUserLock_('初回同期判定', () => {
+    const props = PropertiesService.getUserProperties();
+    const spreadsheetId = getConfiguredSpreadsheetId_() ||
+      props.getProperty(USER_SPREADSHEET_ID_PROPERTY) ||
+      props.getProperty(LEGACY_SPREADSHEET_ID_PROPERTY);
+    if (!spreadsheetId) return {run: false, reason: 'personal-workbook-missing'};
+
+    if (props.getProperty(NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY) === 'true') {
+      // Compatibility with blank personal workbooks created before this
+      // one-time bootstrap marker was added.
+      if (props.getProperty(USER_INITIAL_DATA_SYNC_PENDING_PROPERTY) !== 'true') {
+        props.deleteProperty(CLASSROOM_API_LAST_SUCCESS_PROPERTY);
+        props.deleteProperty(CLASSROOM_API_STRUCTURED_SYNC_PROPERTY);
+      }
+      props.setProperty(USER_INITIAL_DATA_SYNC_PENDING_PROPERTY, 'true');
+    }
+    if (props.getProperty(USER_INITIAL_DATA_SYNC_PENDING_PROPERTY) !== 'true') {
+      return {run: false, reason: 'already-initialized'};
+    }
+
+    if (completeInitialPersonalDataSyncIfReadyLocked_()) {
+      return {run: false, completed: true, reason: 'sources-already-synced'};
+    }
+
+    const inProgressAt = Number(props.getProperty(USER_INITIAL_DATA_SYNC_IN_PROGRESS_PROPERTY) || 0);
+    if (inProgressAt && Date.now() - inProgressAt < USER_INITIAL_DATA_SYNC_IN_PROGRESS_STALE_MS) {
+      return {run: false, inProgress: true, reason: 'initial-sync-in-progress'};
+    }
+
+    props.setProperty(USER_INITIAL_DATA_SYNC_PENDING_PROPERTY, 'true');
+    props.setProperty(USER_INITIAL_DATA_SYNC_IN_PROGRESS_PROPERTY, String(Date.now()));
+    return {run: true};
+  });
+
+  if (!claim.run) {
+    return {
+      started: false,
+      skipped: true,
+      inProgress: Boolean(claim.inProgress),
+      completed: Boolean(claim.completed),
+      reason: claim.reason,
+      testCaseModeEnabled: isTestCaseModeEnabled_()
+    };
+  }
+
+  let sync;
+  try {
+    sync = syncPendingInitialPersonalData_();
+  } catch (error) {
+    sync = {
+      apiSuccess: false,
+      apiError: String(error && error.message ? error.message : error),
+      gmailSuccess: false,
+      gmailError: ''
+    };
+  }
+
+  const finalized = runWithUserLock_('初回同期結果の保存', () => {
+    const props = PropertiesService.getUserProperties();
+    const completed = completeInitialPersonalDataSyncIfReadyLocked_() ||
+      Boolean(props.getProperty(USER_INITIAL_DATA_SYNC_COMPLETED_AT_PROPERTY));
+    props.deleteProperty(USER_INITIAL_DATA_SYNC_IN_PROGRESS_PROPERTY);
+    return completed;
+  });
+
+  return {
+    started: true,
+    completed: finalized,
+    apiSuccess: Boolean(sync.apiSuccess),
+    apiCourseworkCount: Number(sync.apiResult && sync.apiResult.courseworkCount || 0),
+    apiCourseCount: Number(sync.apiResult && sync.apiResult.courseCount || 0),
+    apiError: String(sync.apiError || ''),
+    gmailSuccess: Boolean(sync.gmailSuccess),
+    syncSkipped: Boolean(sync.gmailResult && sync.gmailResult.skipped),
+    syncSkipReason: String(sync.gmailResult && sync.gmailResult.reason || ''),
+    savedCount: Number(sync.gmailResult && sync.gmailResult.savedCount || 0),
+    classroomSavedCount: Number(sync.gmailResult && sync.gmailResult.classroomSavedCount || 0),
+    inCampusSavedCount: Number(sync.gmailResult && sync.gmailResult.inCampusSavedCount || 0),
+    gmailError: String(sync.gmailError || ''),
+    testCaseModeEnabled: isTestCaseModeEnabled_(),
+    completedAt: new Date().toISOString()
   };
 }
 
@@ -278,11 +415,13 @@ function clearNotificationSheetDataLocked_() {
       return;
     }
 
-    sheet
-      .getRange(2, 1, sheet.getLastRow() - 1, HEADER_ROW.length)
-      .clearContent();
+    const lastDataRow = sheet.getLastRow();
+    sheet.getRange(2, 1, lastDataRow - 1, HEADER_ROW.length).clearContent();
+    const metadataColumn = getNotificationProcessingColumn_(storageConfig.source);
+    sheet.getRange(2, metadataColumn + 1, lastDataRow - 1, 1).clearContent();
   });
 
+  refreshNotificationDisplayDataAfterSyncLocked_(ss, 'clear-notification-data');
   SpreadsheetApp.flush();
 }
 
@@ -385,11 +524,13 @@ function updateNotificationStatusLocked_(messageId, status, responseBuilder) {
 
   if (targetMessageId.startsWith('incampus:')) {
     updateInCampusExtractedStatus_(targetMessageId, status);
+    updateMaterializedTaskStatusLocked_(getSpreadsheetForRead_(), targetMessageId, status, status === '完了' ? new Date() : '');
     return responseBuilder();
   }
 
   if (targetMessageId.startsWith('classroom-api:') &&
       updateClassroomApiTaskUserStatus_(targetMessageId, status, status === '完了' ? new Date() : '')) {
+    updateMaterializedTaskStatusLocked_(getSpreadsheetForRead_(), targetMessageId, status, status === '完了' ? new Date() : '');
     return responseBuilder();
   }
 
@@ -451,6 +592,9 @@ function updateNotificationStatusLocked_(messageId, status, responseBuilder) {
     }
   }
 
+  if (updated) {
+    updateMaterializedTaskStatusLocked_(ss, targetMessageId, status, status === '完了' ? new Date() : '');
+  }
   return responseBuilder();
 }
 
@@ -556,6 +700,7 @@ function removeEmailFooterForWeb_(body) {
 }
 
 function rowToNotificationItem_(row) {
+  const processed = getNotificationProcessedData_(row);
   const dueInfo = normalizeDueInfoForWeb_(row[5], row[6]);
   const isApiCoursework = isClassroomApiManagedRow_(row);
   const apiReceivedAtTime = getTimeForSort_(row[9]);
@@ -570,8 +715,9 @@ function rowToNotificationItem_(row) {
     messageId: row[1],
     source: row[2],
     courseName: row[3],
-    title: source === 'inCampus' ? extractInCampusTitle_(row[7], body) : (row[4] && row[4] !== 'タイトル未抽出' ? row[4] : row[7]),
-    weekdayPeriod: (extractRequiredInCampusFieldsFromBody_(body) || {}).weekdayPeriod || '',
+    title: processed ? String(processed.displayTitle || processed.title || '') :
+      source === 'inCampus' ? extractInCampusTitle_(row[7], body) : (row[4] && row[4] !== 'タイトル未抽出' ? row[4] : row[7]),
+    weekdayPeriod: processed ? String(processed.weekdayPeriod || '') : (extractRequiredInCampusFieldsFromBody_(body) || {}).weekdayPeriod || '',
 
     dueDate: dueInfo.dueDate,
     dueDateKey: dueInfo.dueDateKey,
@@ -590,8 +736,8 @@ function rowToNotificationItem_(row) {
     gmailMessageId: isApiCoursework ? String(row[17] || '') : '',
     gmailBody: isApiCoursework ? String(row[19] || '') : '',
     gmailMessageIds: isApiCoursework && Array.isArray(row[20]) ? row[20].slice() : [],
-    classroomUrl: extractClassroomUrl_(source, body),
-    body: cleanBodyForWeb_(body, source),
+    classroomUrl: processed ? String(processed.classroomUrl || '') : extractClassroomUrl_(source, body),
+    body: processed ? String(processed.displayBody || '') : cleanBodyForWeb_(body, source),
     status: row[12],
     completedAt: formatDateForWeb_(row[13]),
     completedAtTime: completedAtTime

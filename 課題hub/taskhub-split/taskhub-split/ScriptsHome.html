@@ -12,21 +12,63 @@
 
   function applyTestCaseClockState(state) {
     const value = state || {};
+    const previousTestCaseModeEnabled = testCaseModeEnabled;
+    const previousTestCaseClockDateTime = testCaseClockDateTime;
+    applyInitialTestCaseClockState(value);
+    const testClockChanged = testCaseModeEnabled &&
+      previousTestCaseClockDateTime !== testCaseClockDateTime;
+    if (previousTestCaseModeEnabled !== testCaseModeEnabled || testClockChanged) {
+      invalidateClientNotificationData_();
+      if (currentScreen === 'university') {
+        loadUniversityNotices();
+      } else if (!notificationSyncInFlight) {
+        const viewMode = currentScreen === 'completed' ? 'completed' : 'active';
+        requestNotificationData(viewMode, {
+          loadingText: '表示データを読み込み中...',
+          remember: false
+        });
+      }
+      return;
+    }
+    if (notificationData.active.length || notificationData.completed.length) refreshCurrentView();
+  }
+
+  function applyInitialTestCaseClockState(state) {
+    const value = state || {};
     testCaseModeEnabled = Boolean(value.testCaseModeEnabled);
     testCaseClockDateTime = String(value.testCaseClockDateTime || '');
     testCaseClockPresets = Array.isArray(value.testCaseClockPresets) ? value.testCaseClockPresets.slice() : [];
     renderTestCaseClockControls();
     updateTestClockHeaderButton();
-    if (notificationData.active.length || notificationData.completed.length) refreshCurrentView();
   }
 
-  function loadHomeNotifications() {
-    requestNotificationData('active', {
+  function invalidateClientNotificationData_() {
+    notificationRequestIds.active++;
+    notificationRequestIds.completed++;
+    notificationRequestsInFlight.active = null;
+    notificationRequestsInFlight.completed = null;
+    notificationData.active = [];
+    notificationData.completed = [];
+    notificationDataLoaded.active = false;
+    notificationDataLoaded.completed = false;
+    homeRawData = [];
+    currentRawData = [];
+    universityState.items = [];
+    universityState.selected = null;
+    universityState.requestId++;
+    universityState.loading = false;
+    universityState.loaded = false;
+  }
+
+  function loadHomeNotifications(initialData) {
+    const options = {
       remember: true,
       homeSync: true,
       loadingStatusText: '一覧を読み込み中...',
       syncLabel: '一覧更新'
-    });
+    };
+    if (initialData !== undefined) options.initialData = initialData;
+    requestNotificationData('active', options);
   }
 
   function showHomeView() {
@@ -86,29 +128,30 @@
       return;
     }
 
-    const activeData = homeRawData;
-    const groups = groupNotificationsByDue(activeData);
     const homeGroups = [
-      getHomeDueGroup(groups, 'today', '今日まで'),
-      getHomeDueGroup(groups, 'tomorrow', '明日まで'),
-      getHomeDueGroup(groups, 'thisWeek', '今週中')
+      {key: 'today', label: '今日まで', count: 0, courseCounts: new Map()},
+      {key: 'tomorrow', label: '明日まで', count: 0, courseCounts: new Map()},
+      {key: 'thisWeek', label: '今週中', count: 0, courseCounts: new Map()}
     ];
+    homeGroups.forEach(group => {
+      const summaryItem = homeRawData.find(item =>
+        String(item.displayDueGroupKey || '') === group.key && item.displayDueGroupCourseCountsJson
+      );
+      if (!summaryItem) return;
+      group.count = Number(summaryItem.displayDueGroupCount || 0);
+      try {
+        const courseCounts = JSON.parse(String(summaryItem.displayDueGroupCourseCountsJson || '[]'));
+        if (Array.isArray(courseCounts)) group.courseCounts = new Map(courseCounts);
+      } catch (_) {
+        group.courseCounts = new Map();
+      }
+    });
 
     container.innerHTML = homeGroups.map(group => getHomeDueGroupHtml(group)).join('');
   }
 
-  function getHomeDueGroup(groups, key, label) {
-    const group = groups.find(item => item.key === key);
-
-    return {
-      key,
-      label,
-      items: group ? group.items : []
-    };
-  }
-
   function getHomeDueGroupHtml(group) {
-    const count = group.items.length;
+    const count = group.count;
     const isExpanded = expandedHomeDueGroup === group.key && count > 0;
     const rowClasses = [
       'home-due-row',
@@ -126,23 +169,15 @@
         <span class="home-due-arrow">${arrow}</span>
       </button>
       <div class="home-due-items${isExpanded ? ' is-open' : ''}">
-        ${getHomeDueItemsHtml(group.items)}
+        ${getHomeDueItemsHtml(group.courseCounts)}
       </div>
     `;
   }
 
-  function getHomeDueItemsHtml(items) {
-    if (!items || items.length === 0) {
+  function getHomeDueItemsHtml(courseCounts) {
+    if (!courseCounts || courseCounts.size === 0) {
       return '';
     }
-
-    const courseCounts = new Map();
-
-    items.forEach(item => {
-      const courseName = getCourseName(item);
-      courseCounts.set(courseName, (courseCounts.get(courseName) || 0) + 1);
-    });
-
     return Array.from(courseCounts.entries()).map(([courseName, count]) => {
       return `
         <div class="home-due-item">

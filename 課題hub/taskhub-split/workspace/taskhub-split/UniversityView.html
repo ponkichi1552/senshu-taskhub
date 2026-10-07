@@ -1,5 +1,5 @@
 <section id="university-view" class="app-view" aria-label="大学からのお知らせ">
-<header><span>課題通知Hub</span><button class="refresh-button" id="un-refresh" onclick="loadUniversityNotices()">更新</button></header>
+<header><span>課題通知Hub</span><button class="refresh-button" id="un-refresh" onclick="refreshUniversityNotices()">更新</button></header>
 <main class="un-main"><h1>大学からのお知らせ</h1><p class="un-sub">学内の連絡を、ひとつの場所で。</p>
 <p id="un-status" role="status" aria-live="polite"></p>
 <div class="un-shell" id="un-shell"><section class="un-inbox" aria-label="お知らせ一覧"><div class="un-tools"><input id="un-search" type="search" placeholder="お知らせを検索…" aria-label="お知らせを検索"><div class="un-tabs"><button data-un-filter="all" aria-pressed="true">すべて</button><button data-un-filter="unread" aria-pressed="false">未読</button><button data-un-filter="saved" aria-pressed="false">保存済み</button></div></div><p id="un-count" class="un-count"></p><div id="un-list"></div></section><article id="un-detail" class="un-detail"></article></div></main></section>

@@ -9,6 +9,7 @@ function doPost(e) {
       validateAssignment_(assignment);
 
       const result = upsertInCampusAssignment_(assignment);
+      refreshNotificationDisplayDataAfterSyncLocked_(getOrCreateSpreadsheetLocked_(), 'extension-incampus-upsert');
 
       return jsonResponse_({
         ok: true,
@@ -19,6 +20,7 @@ function doPost(e) {
 
     if (payload.action === 'completeClassroomAssignments') {
       const result = completeClassroomAssignments_(sanitizePostRecords_(payload.records || []));
+      refreshNotificationDisplayDataAfterSyncLocked_(getOrCreateSpreadsheetLocked_(), 'extension-classroom-completion');
 
       return jsonResponse_({
         ok: true,
@@ -32,6 +34,7 @@ function doPost(e) {
 
     if (payload.action === 'updateClassroomDueTimes') {
       const result = updateClassroomDueTimes_(sanitizePostRecords_(payload.records || []));
+      refreshNotificationDisplayDataAfterSyncLocked_(getOrCreateSpreadsheetLocked_(), 'extension-classroom-due-time');
 
       return jsonResponse_({
         ok: true,
@@ -96,12 +99,25 @@ function getTestCaseSettings_() {
   };
 }
 
-function getTestCaseClockStateForWeb() {
+function getTestCaseClockStateForWeb(userProperties) {
+  const properties = userProperties || PropertiesService.getUserProperties().getProperties();
+  const clock = getTestCaseClockFromProperties_(properties);
   return {
-    testCaseModeEnabled: isTestCaseModeEnabled_(),
-    testCaseClockDateTime: getTestCaseClockDateTime_(),
+    testCaseModeEnabled: properties[TEST_CASE_MODE_PROPERTY] === 'true',
+    testCaseClockDateTime: clock ? Utilities.formatDate(clock, 'Asia/Tokyo', "yyyy-MM-dd'T'HH:mm") : '',
     testCaseClockPresets: TEST_CASE_CLOCK_PRESETS.map(preset => ({...preset}))
   };
+}
+
+function getTestCaseClockFromProperties_(properties) {
+  const saved = (properties || {})[TEST_CASE_CLOCK_PROPERTY];
+  if (!saved) return null;
+  const date = new Date(saved);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function getTestCaseReferenceNowFromProperties_(properties) {
+  return getTestCaseClockFromProperties_(properties) || new Date();
 }
 
 function setTestCaseClockForWeb(dateTime) {

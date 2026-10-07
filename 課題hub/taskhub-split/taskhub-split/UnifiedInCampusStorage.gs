@@ -18,7 +18,7 @@ function setupInCampusUnifiedHeader_(sheet) {
   }
 
   const hasContent = currentHeader.some(value => String(value || '').trim()) || sheet.getLastRow() >= 2;
-  const isMailTable = HEADER_ROW.every((header, index) => currentHeader[index] === header);
+  const isMailTable = HEADER_ROW.every((header, index) => currentHeader[index] === header) || isLegacyNotificationMailHeader_(currentHeader);
   const isExtractTable = INCAMPUS_HEADERS.every((header, index) => currentHeader[index] === header);
   if (hasContent && !isMailTable && !isExtractTable) {
     throw new Error('inCampus通知シートの既存見出しを判別できないため、統合を中止しました。');
@@ -57,6 +57,11 @@ function setupInCampusUnifiedHeader_(sheet) {
   }
   sheet.setFrozenRows(1);
   ensureInCampusRecordTypeMarkers_(sheet, Math.max(width, INCAMPUS_UNIFIED_HEADERS.length));
+}
+
+function isLegacyNotificationMailHeader_(header) {
+  return HEADER_ROW.length === 16 && header[15] === '適用済み提出記録' &&
+    HEADER_ROW.slice(0, 15).every((name, index) => header[index] === name);
 }
 
 function ensureInCampusRecordTypeMarkers_(sheet, width) {

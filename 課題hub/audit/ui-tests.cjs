@@ -3,12 +3,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
-const {matrixCases, boundaryCases} = require('./deadline-cases.cjs');
 const sourceDir = path.resolve(__dirname, '../taskhub-split/taskhub-split');
 
 function element() {
   const classes = new Set();
-  return {
+  const node = {
     children: [], style: {}, dataset: {}, value: '', textContent: '', innerHTML: '',
     classList: {
       add(...names) {names.forEach(name => classes.add(name));},
@@ -23,17 +22,27 @@ function element() {
     replaceChildren(...children) {this.children = children;},
     addEventListener() {}
   };
+  let innerHTML = '';
+  Object.defineProperty(node, 'innerHTML', {
+    get() {return innerHTML;},
+    set(value) {innerHTML = String(value); this.children = [];}
+  });
+  return node;
 }
 
-function fixture(fixedNow, {holdBoot = false, initialRoute = 'home'} = {}) {
-  const calls = [], alerts = [], nodes = new Map(), timers = [];
+function fixture(fixedNow, {holdBoot = false, initialRoute = 'home', initialSyncPending = false, initialPayload = null} = {}) {
+  const calls = [], alerts = [], nodes = new Map(), timers = [], animationFrames = [];
   let reloadCount = 0;
+  const body = {dataset: {taskhubInitialSync: initialSyncPending ? 'true' : 'false', taskhubInitialView: initialRoute}};
+  const initialPayloadNode = element();
+  initialPayloadNode.textContent = initialPayload ? JSON.stringify(initialPayload) : '';
+  nodes.set('taskhub-initial-payload', initialPayloadNode);
   const document = {
+    body,
     getElementById(id) {if (!nodes.has(id)) nodes.set(id, element()); return nodes.get(id);},
     querySelectorAll() {return [];}, createElement: element
   };
-  const routeParameter = initialRoute === 'home' ? {} : {view: initialRoute};
-  const script = {url: {getLocation(callback) {if (typeof callback === 'function') callback({parameter: routeParameter});}}};
+  const script = {};
   Object.defineProperty(script, 'run', {get() {
     const call = {settled: false};
     const runner = new Proxy({}, {get(_, name) {
@@ -51,7 +60,8 @@ function fixture(fixedNow, {holdBoot = false, initialRoute = 'home'} = {}) {
   const context = vm.createContext({Date: ClockDate, URL, document,
     window: {location},
     localStorage: {getItem: () => 'true', setItem() {}},
-    google: {script}, console: {error() {}}, alert: message => alerts.push(message),
+    google: {script}, console: {error() {}, info() {}}, alert: message => alerts.push(message),
+    requestAnimationFrame(callback) {animationFrames.push(callback); return animationFrames.length;},
     setInterval() {}, setTimeout(callback) {timers.push(callback); return timers.length;}, clearTimeout() {}
   });
   const scriptFiles = [
@@ -63,7 +73,7 @@ function fixture(fixedNow, {holdBoot = false, initialRoute = 'home'} = {}) {
     vm.runInContext(fs.readFileSync(path.join(sourceDir, file), 'utf8').replace(/<\/?script>/g, ''), context, {filename: file});
   }
   if (!holdBoot) {
-    const boot = calls.find(call => call.method === 'getNotificationsForWeb' || call.method === 'getUniversityNoticesForWeb');
+    const boot = calls.find(call => call.method === 'getTaskDisplayPayloadForWeb' || call.method === 'getUniversityNoticePayloadForWeb');
     if (boot) {boot.settled = true; boot.success([]);}
   }
   function take(method, id) {
@@ -81,12 +91,15 @@ function fixture(fixedNow, {holdBoot = false, initialRoute = 'home'} = {}) {
   }
   function pending(method, id) {return calls.filter(call => !call.settled && call.method === method && (id === undefined || call.args[0] === id));}
   return {c: context, calls, alerts, document, take, reply, fail, read, ids, seed, pending,
+    flushAnimationFrame() {const callbacks = animationFrames.splice(0); callbacks.forEach(callback => callback(0));},
     flushTimers() {while (timers.length) timers.shift()();}, get reloadCount() {return reloadCount;}};
 }
 
 function item(id, done = false) {
   return {messageId: id, title: id, courseName: '仮想情報演習', source: 'inCampus',
-    status: done ? '完了' : '未確認', dueType: 'unknown'};
+    status: done ? '完了' : '未確認', dueType: 'unknown', displayDueGroupKey: done ? 'completed' : 'unknown',
+    displayDueGroupCount: 1,
+    displayDueGroupCourseCountsJson: JSON.stringify([['仮想情報演習', 1]])};
 }
 let passed = 0;
 function test(name, run) {run(); passed++; console.log('PASS ' + name);}
@@ -127,42 +140,250 @@ test('bottom navigation keeps the same labels and routes across home, assignment
   assert.equal(assignments.classList.contains('active'), false);
 });
 
+test('a new personal workbook starts one background import and rereads the selected notice view after it completes', () => {
+  const f = fixture(null, {holdBoot: true, initialRoute: 'university', initialSyncPending: true});
+  const initialRead = f.take('getUniversityNoticePayloadForWeb');
+  f.reply(initialRead, []);
+  const sync = f.take('bootstrapInitialPersonalDataForWeb');
+  f.reply(sync, {started: true, completed: true, apiSuccess: true, gmailSuccess: true,
+    apiCourseworkCount: 4, savedCount: 2, testCaseModeEnabled: false});
+  const refreshedRead = f.take('getUniversityNoticePayloadForWeb');
+  assert.notEqual(refreshedRead, initialRead);
+  assert.match(f.document.getElementById('sync-toast-message').textContent, /初回同期完了/);
+});
+
+test('first-run personal import leaves the fixed test-case display in place', () => {
+  const f = fixture(null, {holdBoot: true, initialSyncPending: true});
+  const initialRead = f.take('getTaskDisplayPayloadForWeb');
+  f.reply(initialRead, [item('fixture-task')]);
+  const sync = f.take('bootstrapInitialPersonalDataForWeb');
+  f.reply(sync, {started: true, completed: true, apiSuccess: true, gmailSuccess: true,
+    apiCourseworkCount: 4, savedCount: 2, testCaseModeEnabled: true});
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb').length, 0);
+  assert.match(f.document.getElementById('sync-toast-message').textContent, /テスト表示は維持/);
+});
+
 test('initial deep links request only the matching page data', () => {
   const university = fixture(undefined, {holdBoot: true, initialRoute: 'university'});
-  assert.equal(university.pending('getUniversityNoticesForWeb').length, 1);
-  assert.equal(university.pending('getNotificationsForWeb').length, 0);
-  assert.equal(university.pending('getCompletedNotificationsForWeb').length, 0);
+  assert.equal(university.pending('getUniversityNoticePayloadForWeb').length, 1);
+  assert.equal(university.pending('getTaskDisplayPayloadForWeb').length, 0);
+  assert.equal(university.pending('getTaskDisplayPayloadForWeb').length, 0);
 
   const assignment = fixture(undefined, {holdBoot: true, initialRoute: 'assignment'});
-  assert.equal(assignment.pending('getNotificationsForWeb').length, 1);
-  assert.equal(assignment.pending('getUniversityNoticesForWeb').length, 0);
+  assert.equal(assignment.pending('getTaskDisplayPayloadForWeb').length, 1);
+  assert.equal(assignment.pending('getUniversityNoticePayloadForWeb').length, 0);
 
   const home = fixture(undefined, {holdBoot: true});
-  assert.equal(home.pending('getNotificationsForWeb').length, 1);
-  assert.equal(home.pending('getUniversityNoticesForWeb').length, 0);
+  assert.equal(home.pending('getTaskDisplayPayloadForWeb').length, 1);
+  assert.equal(home.pending('getUniversityNoticePayloadForWeb').length, 0);
+  assert.equal(university.calls.some(call => call.method === 'getTestCaseClockStateForWeb'), false,
+    'page boot must not send a second test-clock RPC');
+  assert.equal(assignment.calls.some(call => call.method === 'getTestCaseClockStateForWeb'), false,
+    'page boot must not wait for a separate test-clock RPC');
+});
+
+test('embedded initial payload renders each entry route without a page-load data RPC', () => {
+  const clockState = {testCaseModeEnabled: true, testCaseClockDateTime: '2026-12-20T10:30',
+    testCaseClockPresets: [{id: 'year-end', label: '年末'}]};
+  const assignmentItem = item('embedded-assignment');
+  const assignment = fixture(undefined, {holdBoot: true, initialRoute: 'assignment',
+    initialPayload: {view: 'assignment', payload: {items: [assignmentItem], cacheToken: '', testCaseClockState: clockState}}});
+  assert.deepEqual(assignment.calls.map(call => call.method), []);
+  assert.deepEqual(assignment.ids('notificationData.active'), ['embedded-assignment']);
+  assert.equal(assignment.read('testCaseClockDateTime'), '2026-12-20T10:30');
+  assert.ok(assignment.document.getElementById('list').children.length > 0);
+
+  const homeItem = item('embedded-home');
+  const home = fixture(undefined, {holdBoot: true,
+    initialPayload: {view: 'home', payload: {items: [homeItem], cacheToken: '', testCaseClockState: clockState}}});
+  assert.deepEqual(home.calls.map(call => call.method), []);
+  assert.deepEqual(home.ids('notificationData.active'), ['embedded-home']);
+  assert.equal(home.read('notificationDataLoaded.active'), true);
+
+  const universityItem = {messageId: 'embedded-notice', title: '初期HTMLのお知らせ', source: 'inCampus',
+    receivedAt: '2026/12/20 10:00', receivedAtTime: 1, body: '仮想のお知らせ', read: false, saved: false};
+  const university = fixture(undefined, {holdBoot: true, initialRoute: 'university',
+    initialPayload: {view: 'university', payload: {items: [universityItem], cacheToken: '', testCaseClockState: clockState}}});
+  assert.deepEqual(university.calls.map(call => call.method), []);
+  assert.equal(university.read('universityState.loaded'), true);
+  assert.equal(university.read('universityState.items[0].messageId'), 'embedded-notice');
+  assert.equal(university.read('testCaseClockDateTime'), '2026-12-20T10:30');
+});
+
+test('invalid university preload falls back to a valid server response before showing a format error', () => {
+  const f = fixture(undefined, {holdBoot: true, initialPayload: {
+    view: 'home', payload: {items: [item('home-task')], cacheToken: '', testCaseClockState: {}}
+  }});
+  f.c.showUniversityNotices(null);
+  const payloadRequest = f.take('getUniversityNoticePayloadForWeb');
+  f.reply(payloadRequest, null);
+  const compatibilityRequest = f.take('getUniversityNoticesForWeb');
+  const notice = {messageId: 'rpc-notice', title: '大学のお知らせ', source: 'inCampus',
+    receivedAt: '2026/10/07 10:00', receivedAtTime: 1, body: '本文', read: false, saved: false};
+  f.reply(compatibilityRequest, [notice]);
+  assert.equal(f.read('universityState.loaded'), true);
+  assert.equal(f.read('universityState.items[0].messageId'), 'rpc-notice');
+  assert.doesNotMatch(f.document.getElementById('un-status').textContent, /形式を確認できません/);
+});
+
+test('the initial data response supplies test-clock state without triggering another list read', () => {
+  const f = fixture(undefined, {holdBoot: true, initialRoute: 'assignment'});
+  const boot = f.take('getTaskDisplayPayloadForWeb');
+  f.reply(boot, {items: [item('virtual-task')], testCaseClockState: {
+    testCaseModeEnabled: true,
+    testCaseClockDateTime: '2026-12-20T10:30',
+    testCaseClockPresets: [{id: 'year-end', label: '年末'}]
+  }});
+  assert.equal(f.read('testCaseModeEnabled'), true);
+  assert.equal(f.read('testCaseClockDateTime'), '2026-12-20T10:30');
+  assert.deepEqual(f.calls.map(call => call.method), ['getTaskDisplayPayloadForWeb']);
 });
 
 test('navigating to each page calls only its matching list endpoint', () => {
   const f = fixture();
   const start = f.calls.length;
   f.c.showUniversityNotices();
-  assert.deepEqual(f.calls.slice(start).map(call => call.method), ['getUniversityNoticesForWeb']);
+  assert.deepEqual(f.calls.slice(start).map(call => call.method), ['getUniversityNoticePayloadForWeb']);
   const afterUniversity = f.calls.length;
   f.c.loadNotifications();
-  assert.deepEqual(f.calls.slice(afterUniversity).map(call => call.method), ['getNotificationsForWeb']);
+  assert.deepEqual(f.calls.slice(afterUniversity).map(call => call.method), ['getTaskDisplayPayloadForWeb']);
   const afterAssignments = f.calls.length;
   f.c.loadCompletedNotifications();
-  assert.deepEqual(f.calls.slice(afterAssignments).map(call => call.method), ['getCompletedNotificationsForWeb']);
+  assert.deepEqual(f.calls.slice(afterAssignments).map(call => call.method), ['getTaskDisplayPayloadForWeb']);
 });
 
 test('assignment navigation reuses an in-flight home read instead of starting a duplicate', () => {
   const f = fixture(undefined, {holdBoot: true});
-  const boot = f.take('getNotificationsForWeb');
+  const boot = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadNotifications();
-  assert.equal(f.pending('getNotificationsForWeb').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'active').length, 1);
   assert.equal(f.document.getElementById('list').textContent, '読み込み中...');
   f.reply(boot, [item('one-read')]);
   assert.deepEqual(f.ids('currentRawData'), ['one-read']);
+});
+
+test('cached assignment data renders immediately while a background read refreshes it', () => {
+  const f = fixture();
+  f.c.setNotificationData([item('FAST-ACTIVE')], 'active');
+  const before = f.calls.length;
+  f.c.loadNotifications();
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb').length, 1);
+  assert.equal(f.calls.slice(before).at(-1).method, 'getTaskDisplayPayloadForWeb');
+  assert.notEqual(f.document.getElementById('list').textContent, '読み込み中...');
+  assert.ok(f.document.getElementById('list').children.length > 0);
+});
+
+test('university notice list omits full bodies and fetches a body only when a notice is selected', () => {
+  const f = fixture(undefined, {holdBoot: true, initialRoute: 'university'});
+  const initial = f.take('getUniversityNoticePayloadForWeb');
+  const body = '本文'.repeat(200);
+  const notice = {messageId: 'FAST-NOTICE', title: '仮想連絡', preview: body.slice(0, 179) + '…', source: 'inCampus', receivedAt: '', from: '', read: false, saved: false};
+  f.reply(initial, {items: [notice], cacheToken: 'notice-generation-1'});
+  const list = f.document.getElementById('un-list');
+  let firstCard = list.children[0];
+  assert.ok(firstCard.children[2].textContent.length <= 180, 'list preview stays compact');
+  assert.equal(vm.runInContext("Object.prototype.hasOwnProperty.call(universityState.items[0], 'body')", f.c), false, 'the initial client data does not contain the full body');
+  assert.equal(f.pending('getUniversityNoticeBodyForWeb').length, 0, 'list boot does not request detail bodies');
+  firstCard.onclick();
+  firstCard = list.children[0];
+  const bodyRequest = f.take('getUniversityNoticeBodyForWeb');
+  assert.deepEqual(bodyRequest.args, [notice.messageId]);
+  f.reply(bodyRequest, {found: true, messageId: notice.messageId, body});
+  assert.equal(f.document.getElementById('un-detail').children[4].textContent, body);
+
+  const before = f.calls.length;
+  let renderCount = 0;
+  const originalRender = f.c.renderUniversityNotices;
+  f.c.renderUniversityNotices = (...args) => {renderCount++; return originalRender(...args);};
+  f.c.showUniversityNotices();
+  assert.equal(f.pending('getUniversityNoticePayloadForWeb').length, 1);
+  assert.equal(f.calls.slice(before).at(-1).method, 'getUniversityNoticePayloadForWeb');
+  assert.equal(renderCount, 0);
+  assert.notEqual(f.document.getElementById('un-status').textContent, 'お知らせを読み込み中…');
+  assert.equal(f.document.getElementById('un-list').children.length, 1);
+  const readNotice = {...notice, read: true};
+  f.reply(f.take('getUniversityNoticePayloadForWeb'), {items: [readNotice], cacheToken: 'notice-generation-1'});
+  assert.equal(renderCount, 0, 'unchanged list DOM is reused after the background response');
+  assert.equal(f.document.getElementById('un-list').children[0], firstCard);
+  f.c.showUniversityNotices();
+  const updated = {...readNotice, preview: '更新後の本文抜粋'};
+  f.reply(f.take('getUniversityNoticePayloadForWeb'), {items: [updated], cacheToken: 'notice-generation-2'});
+  assert.equal(renderCount, 1, 'changed compact list content triggers a list update');
+  assert.notEqual(f.document.getElementById('un-list').children[0], firstCard);
+  assert.equal(f.pending('getUniversityNoticeBodyForWeb').length, 1, 'a new display generation invalidates the old full body');
+  assert.equal(f.document.getElementById('un-detail').children[4].textContent, '本文を読み込み中…');
+});
+
+test('university notice search queries full server-side bodies and keeps the result in the compact list', () => {
+  const f = fixture(undefined, {holdBoot: true, initialRoute: 'university'});
+  const initial = f.take('getUniversityNoticePayloadForWeb');
+  const notice = {messageId: 'BODY-SEARCH-001', title: '一般連絡', preview: '通常の抜粋', source: 'inCampus', receivedAt: '', from: '', read: false, saved: false};
+  f.reply(initial, {items: [notice], cacheToken: 'search-generation'});
+  f.document.getElementById('un-search').value = '本文の奥にある語';
+  f.c.handleUniversitySearchInput();
+  f.flushTimers();
+  const search = f.take('searchUniversityNoticesForWeb');
+  assert.deepEqual(search.args, ['本文の奥にある語']);
+  f.reply(search, {query: '本文の奥にある語', messageIds: [notice.messageId]});
+  assert.equal(f.document.getElementById('un-list').children.length, 1);
+  assert.equal(f.document.getElementById('un-count').textContent.startsWith('1件'), true);
+});
+
+test('task display cache write waits for paint while university list opening does no background body read', () => {
+  const task = fixture(undefined, {holdBoot: true});
+  const taskRead = task.take('getTaskDisplayPayloadForWeb');
+  const taskItem = item('AFTER-PAINT-TASK');
+  task.reply(taskRead, {items: [taskItem], cacheToken: 'task-cache-token'});
+  assert.equal(task.pending('cacheTaskDisplayItemsAfterWebDisplay').length, 0);
+  task.flushAnimationFrame();
+  assert.equal(task.pending('cacheTaskDisplayItemsAfterWebDisplay').length, 0);
+  task.flushAnimationFrame();
+  const taskCache = task.take('cacheTaskDisplayItemsAfterWebDisplay');
+  assert.deepEqual(taskCache.args, [[taskItem], 'active', 'task-cache-token']);
+
+  const university = fixture(undefined, {holdBoot: true, initialRoute: 'university'});
+  const noticeRead = university.take('getUniversityNoticePayloadForWeb');
+  const notice = {messageId: 'AFTER-PAINT-NOTICE', title: '仮想連絡', preview: '本文抜粋', read: false, saved: false};
+  const before = university.calls.length;
+  university.reply(noticeRead, {items: [notice], cacheToken: 'notice-cache-token'});
+  university.flushAnimationFrame();
+  university.flushAnimationFrame();
+  assert.deepEqual(university.calls.slice(before).map(call => call.method), [],
+    'rendered notice lists must not issue a background full-body cache request');
+  assert.equal(university.pending('getUniversityNoticeBodyForWeb').length, 0,
+    'notice bodies are fetched only after a card is selected');
+});
+
+test('discovering test mode invalidates old client data and rejects the old source reply', () => {
+  const f = fixture(undefined, {holdBoot: true});
+  const old = f.take('getTaskDisplayPayloadForWeb');
+  f.c.setNotificationData([item('LIVE-TASK')], 'active');
+  f.c.applyTestCaseClockState({testCaseModeEnabled: true, testCaseClockDateTime: '', testCaseClockPresets: []});
+  assert.deepEqual(f.ids('notificationData.active'), []);
+  const fresh = f.pending('getTaskDisplayPayloadForWeb').at(-1);
+  assert.notEqual(fresh, old);
+  f.reply(fresh, [item('SIM-TASK')]);
+  f.reply(old, [item('STALE-LIVE-TASK')]);
+  assert.deepEqual(f.ids('notificationData.active'), ['SIM-TASK']);
+});
+
+test('an unexpected non-array list result is reported instead of shown as an empty list', () => {
+  const f = fixture(undefined, {holdBoot: true});
+  const boot = f.take('getTaskDisplayPayloadForWeb');
+  f.c.loadNotifications();
+  f.reply(boot, {});
+  assert.match(f.document.getElementById('list').textContent, /形式を確認できませんでした/);
+  assert.ok(f.document.getElementById('home-sync-text').textContent.startsWith('一覧の読み込みに失敗しました'));
+});
+
+test('an unexpected non-array university result keeps an explicit read error instead of a false empty state', () => {
+  const f = fixture(undefined, {holdBoot: true, initialRoute: 'university'});
+  const read = f.take('getUniversityNoticePayloadForWeb');
+  f.reply(read, {});
+  const fallback = f.take('getUniversityNoticesForWeb');
+  f.reply(fallback, {});
+  assert.match(f.document.getElementById('un-status').textContent, /形式を確認できませんでした/);
+  assert.equal(f.document.getElementById('un-count').textContent, '');
 });
 
 test('assignment hamburger drawer routes unfinished, completed, and search while tracking selection', () => {
@@ -192,7 +413,7 @@ test('assignment hamburger drawer routes unfinished, completed, and search while
   assert.equal(f.read('currentScreen'), 'completed');
   assert.equal(navCompleted.classList.contains('active'), true);
   assert.equal(assignmentDrawer.inert, true);
-  assert.ok(f.pending('getCompletedNotificationsForWeb').length);
+  assert.ok(f.pending('getTaskDisplayPayloadForWeb').length);
 
   f.c.selectAssignmentMenu('search');
   assert.equal(f.document.getElementById('course-filter-panel').classList.contains('is-open'), true);
@@ -208,9 +429,9 @@ test('assignment hamburger drawer routes unfinished, completed, and search while
 });
 
 test('reverse active/completed replies preserve completed screen and home cache', () => {
-  const f = fixture(undefined, {holdBoot: true}), boot = f.take('getNotificationsForWeb');
+  const f = fixture(undefined, {holdBoot: true}), boot = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadNotifications();
-  f.c.loadCompletedNotifications(); const completed = f.take('getCompletedNotificationsForWeb');
+  f.c.loadCompletedNotifications(); const completed = f.take('getTaskDisplayPayloadForWeb');
   f.reply(completed, [item('done', true)]); f.reply(boot, [item('active')]);
   assert.equal(f.read('currentScreen'), 'completed');
   assert.equal(f.read('currentViewMode'), 'completed');
@@ -219,7 +440,7 @@ test('reverse active/completed replies preserve completed screen and home cache'
 });
 
 test('newest refresh wins over boot read and prior list request', () => {
-  const f = fixture(undefined, {holdBoot: true}), boot = f.take('getNotificationsForWeb');
+  const f = fixture(undefined, {holdBoot: true}), boot = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadNotifications();
   f.c.manualRefreshNotifications();
   const fresh = f.pending('syncAndGetNotificationsForWeb').at(-1);
@@ -229,16 +450,16 @@ test('newest refresh wins over boot read and prior list request', () => {
 
 test('an in-flight completed read is reused after navigating away and back', () => {
   const f = fixture();
-  f.c.loadCompletedNotifications(); const old = f.take('getCompletedNotificationsForWeb');
-  f.c.loadNotifications(); const active = f.take('getNotificationsForWeb');
+  f.c.loadCompletedNotifications(); const old = f.take('getTaskDisplayPayloadForWeb');
+  f.c.loadNotifications(); const active = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadCompletedNotifications();
-  assert.equal(f.pending('getCompletedNotificationsForWeb').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'completed').length, 1);
   f.reply(active, [item('active')]); f.reply(old, [item('done', true)]);
   assert.deepEqual(f.ids('currentRawData'), ['done']); assert.equal(f.read('currentViewMode'), 'completed');
 });
 
 test('a background active response preserves the completed loading indicator', () => {
-  const f = fixture(); f.c.loadNotifications(); const active = f.take('getNotificationsForWeb');
+  const f = fixture(); f.c.loadNotifications(); const active = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadCompletedNotifications();
   f.reply(active, [item('active')]);
   assert.equal(f.document.getElementById('list').textContent, '完了済み一覧を読み込み中...');
@@ -247,11 +468,11 @@ test('a background active response preserves the completed loading indicator', (
 
 test('home and university navigation survive background assignment responses', () => {
   const f = fixture();
-  f.c.loadNotifications(); const active = f.take('getNotificationsForWeb');
-  f.c.loadCompletedNotifications(); const completed = f.take('getCompletedNotificationsForWeb');
+  f.c.loadNotifications(); const active = f.take('getTaskDisplayPayloadForWeb');
+  f.c.loadCompletedNotifications(); const completed = f.take('getTaskDisplayPayloadForWeb');
   f.c.showHomeView(); f.reply(completed, [item('done', true)]);
   assert.equal(f.read('currentViewMode'), 'active'); assert.equal(f.read('currentScreen'), 'home');
-  f.c.showUniversityNotices(); const university = f.take('getUniversityNoticesForWeb');
+  f.c.showUniversityNotices(); const university = f.take('getUniversityNoticePayloadForWeb');
   f.reply(active, [item('active')]); f.reply(university, []);
   assert.equal(f.read('currentScreen'), 'university');
   assert.ok(f.document.getElementById('university-view').classList.contains('is-active'));
@@ -259,21 +480,21 @@ test('home and university navigation survive background assignment responses', (
 });
 
 test('stale failures cannot replace newer data or another screen with an error', () => {
-  const f = fixture(); f.c.loadNotifications(); const old = f.take('getNotificationsForWeb');
+  const f = fixture(); f.c.loadNotifications(); const old = f.take('getTaskDisplayPayloadForWeb');
   f.c.manualRefreshNotifications(); const fresh = f.pending('syncAndGetNotificationsForWeb').at(-1);
   f.reply(fresh, {items: [item('new')], testCaseModeEnabled: false, savedCount: 1}); f.fail(old);
   assert.deepEqual(f.ids('currentRawData'), ['new']);
   assert.ok(!f.document.getElementById('list').textContent.includes('エラー'));
-  f.c.loadNotifications(); const active = f.take('getNotificationsForWeb');
+  f.c.loadNotifications(); const active = f.take('getTaskDisplayPayloadForWeb');
   f.c.loadCompletedNotifications(); f.fail(active);
   assert.equal(f.document.getElementById('list').textContent, '完了済み一覧を読み込み中...');
-  f.fail(f.take('getCompletedNotificationsForWeb'));
+  f.fail(f.take('getTaskDisplayPayloadForWeb'));
   assert.match(f.document.getElementById('list').textContent, /エラー.*offline/);
 });
 
 test('done immediately updates the home count and stale reads cannot resurrect it', () => {
   const f = fixture(); f.seed([item('A')]);
-  f.c.refreshNotifications(); const before = f.pending('getNotificationsForWeb').at(-1);
+  f.c.refreshNotifications(); const before = f.pending('getTaskDisplayPayloadForWeb').at(-1);
   f.c.markAsDone('A'); assert.deepEqual(f.ids('homeRawData'), []);
   f.reply(before, [item('A')]); assert.deepEqual(f.ids('currentRawData'), []);
   f.c.manualRefreshNotifications(); const during = f.pending('syncAndGetNotificationsForWeb').at(-1);
@@ -334,8 +555,8 @@ test('multiple done responses arriving in reverse cannot resurrect another done 
   f.reply(f.take('markNotificationDone', 'A'), [item('B')]);
   assert.deepEqual(f.ids('currentRawData'), []); assert.deepEqual(f.ids('homeRawData'), []);
   assert.deepEqual(f.ids('notificationData.completed'), ['A', 'B']);
-  assert.equal(f.pending('getNotificationsForWeb').length, 1);
-  assert.equal(f.pending('getCompletedNotificationsForWeb').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'active').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'completed').length, 1);
 });
 
 test('latest toast undoes only the last task while another completion is pending', () => {
@@ -351,13 +572,13 @@ test('status callbacks preserve navigation and refresh both caches after writes'
   const f = fixture(); f.seed([item('A')]);
   f.c.markAsDone('A'); f.c.showUniversityNotices();
   f.reply(f.take('markNotificationDone', 'A'));
-  f.reply(f.take('getCompletedNotificationsForWeb'), [item('A', true)]);
-  f.reply(f.take('getNotificationsForWeb'), []);
+  f.reply(f.take('getTaskDisplayPayloadForWeb', 'completed'), [item('A', true)]);
+  f.reply(f.take('getTaskDisplayPayloadForWeb', 'active'), []);
   assert.equal(f.read('currentScreen'), 'university');
   f.c.showAssignmentView('completed'); f.c.markAsUndone('A'); f.c.showHomeView();
   f.reply(f.take('markNotificationUndone', 'A'));
-  f.reply(f.take('getNotificationsForWeb'), [item('A')]);
-  f.reply(f.take('getCompletedNotificationsForWeb'), []);
+  f.reply(f.take('getTaskDisplayPayloadForWeb', 'active'), [item('A')]);
+  f.reply(f.take('getTaskDisplayPayloadForWeb', 'completed'), []);
   assert.equal(f.read('currentScreen'), 'home'); assert.equal(f.read('currentViewMode'), 'active');
   assert.deepEqual(f.ids('homeRawData'), ['A']);
 });
@@ -368,7 +589,8 @@ test('failed done rolls back locally and retries reads without navigating', () =
   assert.deepEqual(f.ids('homeRawData'), ['A']); assert.equal(f.read('currentScreen'), 'home');
   assert.equal(f.read('notificationStatusChanges.size'), 0); assert.equal(f.alerts.length, 1);
   assert.equal(f.read('lastUndoMessageId'), '');
-  assert.equal(f.pending('getNotificationsForWeb').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'active').length, 1);
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb', 'completed').length, 1);
 });
 
 test('failed undo restores completed state and does not leave a queued undo', () => {
@@ -388,88 +610,77 @@ test('a failed earlier write still sends the newer intent explicitly', () => {
   assert.deepEqual(f.ids('homeRawData'), ['A']); assert.equal(f.read('notificationStatusChanges.size'), 0);
 });
 
-test('weekday test clock renders today, tomorrow, this week and next week as separate groups', () => {
-  const fixedNow = new Date(2026, 9, 8, 10, 30).getTime();
-  const f = fixture(fixedNow);
-  const rows = [
-    {messageId: 'expired', dueType: 'detected', dueDateKey: '2026-10-07', dueTime: '23:59'},
-    {messageId: 'today', dueType: 'detected', dueDateKey: '2026-10-08', dueTime: '23:59'},
-    {messageId: 'tomorrow', dueType: 'detected', dueDateKey: '2026-10-09', dueTime: '23:59'},
-    {messageId: 'this-week', dueType: 'detected', dueDateKey: '2026-10-11', dueTime: '23:59'},
-    {messageId: 'next-week', dueType: 'detected', dueDateKey: '2026-10-18', dueTime: '23:59'},
-    {messageId: 'no-deadline', dueType: 'none', dueDateKey: ''},
-    {messageId: 'unknown-date', dueType: 'unknown', dueDateKey: ''}
-  ];
-  const grouped = JSON.parse(JSON.stringify(f.c.groupNotificationsByDue(rows)));
-  const assigned = Object.fromEntries(grouped.flatMap(group => group.items.map(item => [item.messageId, group.key])));
-  assert.deepEqual(assigned, {
-    expired: 'expired', today: 'today', tomorrow: 'tomorrow', 'this-week': 'thisWeek',
-    'next-week': 'later', 'no-deadline': 'none', 'unknown-date': 'unknown'
-  });
-});
-
-test('63 weekday/date-offset combinations follow today, tomorrow, Sunday-ending week and later boundaries', () => {
-  const byViewDate = new Map();
-  for (const testCase of matrixCases) {
-    if (!byViewDate.has(testCase.viewDate)) byViewDate.set(testCase.viewDate, []);
-    byViewDate.get(testCase.viewDate).push(testCase);
-  }
-  for (const cases of byViewDate.values()) {
-    const f = fixture(cases[0].viewAt);
-    const rows = cases.map(testCase => ({messageId: testCase.id, dueType: testCase.dueType,
-      dueDateKey: testCase.dueDateKey, dueTime: testCase.dueTime}));
-    const grouped = JSON.parse(JSON.stringify(f.c.groupNotificationsByDue(rows)));
-    const assigned = grouped.flatMap(group => group.items.map(item => [item.messageId, group.key]));
-    assert.equal(assigned.length, cases.length, `Each deadline must occur in exactly one group on ${cases[0].viewDate}`);
-    const actual = Object.fromEntries(assigned);
-    for (const testCase of cases) assert.equal(actual[testCase.id], testCase.expectedGroup, testCase.id);
-  }
-});
-
-test('deadline minute, midnight normalization, calendar rollover and invalid inputs match the shared case table', () => {
-  for (const testCase of boundaryCases) {
-    const f = fixture(testCase.viewAt);
-    const row = {messageId: testCase.id, dueType: testCase.dueType,
-      dueDateKey: testCase.dueDateKey, dueTime: testCase.dueTime};
-    const grouped = JSON.parse(JSON.stringify(f.c.groupNotificationsByDue([row])));
-    const assigned = grouped.flatMap(group => group.items.map(item => [item.messageId, group.key]));
-    assert.deepEqual(assigned, [[testCase.id, testCase.expectedGroup]], testCase.id);
-  }
-});
-
-test('selected JST test clock drives deadline groups only while test mode is ON', () => {
+test('assignment rendering trusts stored group metadata and incoming order without date classification or sorting', () => {
   const f = fixture(Date.parse('2026-10-08T10:30:00+09:00'));
-  f.c.applyTestCaseClockState({testCaseModeEnabled: true, testCaseClockDateTime: '2026-12-31T23:58', testCaseClockPresets: []});
   const rows = [
-    {messageId: 'year-end-today', dueType: 'detected', dueDateKey: '2026-12-31', dueTime: '23:59'},
-    {messageId: 'new-year-tomorrow', dueType: 'detected', dueDateKey: '2027-01-01', dueTime: ''},
-    {messageId: 'sunday-this-week', dueType: 'detected', dueDateKey: '2027-01-03', dueTime: '23:59'},
-    {messageId: 'monday-next-week', dueType: 'detected', dueDateKey: '2027-01-04', dueTime: '23:59'}
+    {...item('prepared-first'), title: '準備済み先頭', dueType: 'detected', dueDateKey: '2099-10-08', displayDueGroupKey: 'today', displayDueGroupCount: 2},
+    {...item('prepared-second'), title: '準備済み次点', dueType: 'detected', dueDateKey: '2026-10-09', displayDueGroupKey: 'today', displayDueGroupCount: 2, displayDueGroupCourseCountsJson: ''},
+    {...item('prepared-third'), title: '準備済み次週', dueType: 'detected', dueDateKey: '2026-10-10', displayDueGroupKey: 'later', displayDueGroupCount: 1}
   ];
-  const assignedFor = () => Object.fromEntries(f.c.groupNotificationsByDue(rows)
-    .flatMap(group => group.items.map(item => [item.messageId, group.key])));
-  assert.deepEqual(assignedFor(), {
-    'year-end-today': 'today', 'new-year-tomorrow': 'tomorrow',
-    'sunday-this-week': 'thisWeek', 'monday-next-week': 'later'
-  });
-  f.c.applyTestCaseClockState({testCaseModeEnabled: false, testCaseClockDateTime: '2026-12-31T23:58', testCaseClockPresets: []});
-  assert.equal(assignedFor()['year-end-today'], 'later');
+  f.seed(rows);
+  const list = f.document.getElementById('list');
+  const groupTitles = list.children.filter(child => child.className.startsWith('group-title'))
+    .map(child => child.innerHTML.match(/group-label\">([^<]*)</)[1]);
+  const cardTitles = list.children.filter(child => child.className === 'group-body')
+    .flatMap(group => group.children)
+    .map(card => (card.innerHTML.match(/<div class="title">([^<]*)<\/div>/) || [])[1]);
+  assert.deepEqual(groupTitles, ['今日まで', '来週以降']);
+  assert.deepEqual(cardTitles, ['準備済み先頭', '準備済み次点', '準備済み次週']);
+  assert.equal(typeof f.c.getDueGroupKey, 'undefined');
+  assert.equal(typeof f.c.groupNotificationsByDue, 'undefined');
+  const renderer = fs.readFileSync(path.join(sourceDir, 'ScriptsRendering.html'), 'utf8');
+  assert.doesNotMatch(renderer, /countsByGroup/);
+  assert.match(renderer, /displayDueGroupCount/);
 });
 
-test('items in one group are ordered by deadline time without moving groups', () => {
-  const f = fixture(Date.parse('2026-10-08T08:00:00+09:00'));
+test('Home renders saved group and course counts without regrouping or recounting notification rows', () => {
+  const f = fixture();
   const rows = [
-    {messageId: 'late', dueType: 'detected', dueDateKey: '2026-10-08', dueTime: '23:59'},
-    {messageId: 'early', dueType: 'detected', dueDateKey: '2026-10-08', dueTime: '09:00'},
-    {messageId: 'middle', dueType: 'detected', dueDateKey: '2026-10-08', dueTime: '12:30'},
+    {...item('home-today-1'), displayDueGroupKey: 'today', displayDueGroupCount: 3,
+      displayDueGroupCourseCountsJson: JSON.stringify([['仮想A', 2], ['仮想B', 1]])},
+    {...item('home-today-2'), displayDueGroupKey: 'today', displayDueGroupCount: 3,
+      displayDueGroupCourseCountsJson: ''},
+    {...item('home-today-3'), displayDueGroupKey: 'today', displayDueGroupCount: 3,
+      displayDueGroupCourseCountsJson: ''}
   ];
-  const grouped = JSON.parse(JSON.stringify(f.c.groupNotificationsByDue(rows)));
-  assert.deepEqual(grouped.find(group => group.key === 'today').items.map(item => item.messageId),
-    ['early', 'middle', 'late']);
+  f.c.setNotificationData(rows, 'active');
+  f.c.showHomeView();
+  const html = f.document.getElementById('home-due-card').innerHTML;
+  assert.match(html, /今日まで/);
+  assert.match(html, /3件/);
+  assert.match(html, /仮想A/);
+  assert.match(html, /2件/);
+  const homeScript = fs.readFileSync(path.join(sourceDir, 'ScriptsHome.html'), 'utf8');
+  assert.doesNotMatch(homeScript, /homeRawData\.forEach/);
+  assert.match(homeScript, /displayDueGroupCourseCountsJson/);
+});
+
+test('completed rendering keeps the sync-provided completion order', () => {
+  const f = fixture();
+  const rows = [
+    {...item('completed-newer', true), completedAtTime: 200},
+    {...item('completed-older', true), completedAtTime: 100}
+  ];
+  f.c.setNotificationData(rows, 'completed');
+  f.c.showAssignmentView('completed');
+  const cardTitles = f.document.getElementById('list').children
+    .filter(child => child.className === 'group-body')
+    .flatMap(group => group.children)
+    .map(card => (card.innerHTML.match(/<div class="title">([^<]*)<\/div>/) || [])[1]);
+  assert.deepEqual(cardTitles, ['completed-newer', 'completed-older']);
+});
+
+test('changing the selected test clock refetches the projection so server-side groups can be regenerated', () => {
+  const f = fixture(undefined, {holdBoot: true});
+  const firstRead = f.take('getTaskDisplayPayloadForWeb');
+  f.reply(firstRead, []);
+  f.c.applyTestCaseClockState({testCaseModeEnabled: true, testCaseClockDateTime: '2026-12-31T23:58', testCaseClockPresets: []});
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb').length, 1);
+  assert.equal(f.take('getTaskDisplayPayloadForWeb').args[0], 'active');
 });
 
 test('settings switch data sources in place, read the selected source, and do not start mail sync', () => {
-  const f = fixture(undefined, {holdBoot: true}), boot = f.take('getNotificationsForWeb');f.c.openSecurityModal();
+  const f = fixture(undefined, {holdBoot: true}), boot = f.take('getTaskDisplayPayloadForWeb');f.c.openSecurityModal();
   f.reply(f.take('getSecuritySettingsForWeb'), {hasApiToken: true, tokenPreview: '••••', postAuthRequired: true,
     testCaseModeEnabled: false, testSpreadsheetReady: true});
   const toggle = f.document.getElementById('test-mode-toggle');
@@ -479,7 +690,7 @@ test('settings switch data sources in place, read the selected source, and do no
   f.c.toggleTestCaseMode(true);assert.deepEqual(f.take('setTestCaseModeForWeb').args, [true]);
   f.reply(f.take('setTestCaseModeForWeb'), {hasApiToken: true, tokenPreview: '••••', postAuthRequired: true,
     testCaseModeEnabled: true, testSpreadsheetReady: true});
-  const selectedSourceRead = f.pending('getNotificationsForWeb').at(-1);
+  const selectedSourceRead = f.pending('getTaskDisplayPayloadForWeb').at(-1);
   f.reply(selectedSourceRead, [item('SIM-001')]);
   f.reply(boot, [item('OLD-LIVE')]);
   assert.equal(toggle.checked, true);assert.equal(f.document.getElementById('test-mode-status').textContent, 'ON：テストケース用データを表示中');
@@ -513,7 +724,7 @@ test('test date presets stay independent from the data-source toggle and the hea
   assert.deepEqual(f.take('setTestCaseClockForWeb').args, ['2028-02-29T09:00']);
   f.reply(f.take('setTestCaseClockForWeb'), {testCaseModeEnabled: true, testCaseClockDateTime: '2028-02-29T09:00', testCaseClockPresets: presets});
   assert.equal(f.document.getElementById('header-test-clock-current').textContent, '設定中：2028/02/29 09:00（日本時間）');
-  assert.ok(f.pending('getNotificationsForWeb').length > 0);
+  assert.ok(f.pending('getTaskDisplayPayloadForWeb').length > 0);
   assert.equal(f.pending('refreshAndGetNotificationsForWeb').length, 0);
   f.c.renderTestCaseModeSettings({testCaseModeEnabled: false, testSpreadsheetReady: true});
   assert.equal(f.document.getElementById('header-test-clock-button').hidden, true);
@@ -521,14 +732,14 @@ test('test date presets stay independent from the data-source toggle and the hea
 });
 
 test('OFF switch returns to saved data with a read-only request, not a Gmail refresh', () => {
-  const f = fixture(undefined, {holdBoot: true}), boot = f.take('getNotificationsForWeb');f.c.openSecurityModal();
+  const f = fixture(undefined, {holdBoot: true}), boot = f.take('getTaskDisplayPayloadForWeb');f.c.openSecurityModal();
   f.reply(f.take('getSecuritySettingsForWeb'), {hasApiToken: true, postAuthRequired: true,
     testCaseModeEnabled: true, testSpreadsheetReady: true});
   const toggle = f.document.getElementById('test-mode-toggle');toggle.checked = true;
   f.c.toggleTestCaseMode(false);
   f.reply(f.take('setTestCaseModeForWeb'), {hasApiToken: true, postAuthRequired: true,
     testCaseModeEnabled: false, testSpreadsheetReady: true});
-  const savedRead = f.pending('getNotificationsForWeb').at(-1);
+  const savedRead = f.pending('getTaskDisplayPayloadForWeb').at(-1);
   f.reply(savedRead, [item('SAVED-001')]);
   f.reply(boot, [item('OLD-TEST')]);
   assert.equal(toggle.checked, false);
@@ -539,12 +750,12 @@ test('OFF switch returns to saved data with a read-only request, not a Gmail ref
 
 test('startup and 15-minute polling read stored rows; explicit update performs API then Gmail sync', () => {
   const f = fixture(undefined, {holdBoot: true});
-  const boot = f.take('getNotificationsForWeb');
+  const boot = f.take('getTaskDisplayPayloadForWeb');
   assert.equal(f.pending('refreshAndGetNotificationsForWeb').length, 0);
   f.reply(boot, [item('SAVED-001')]);
 
   f.c.refreshNotifications();
-  const polling = f.pending('getNotificationsForWeb').at(-1);
+  const polling = f.pending('getTaskDisplayPayloadForWeb').at(-1);
   assert.equal(f.pending('refreshAndGetNotificationsForWeb').length, 0);
   f.reply(polling, [item('SAVED-002')]);
 
@@ -584,12 +795,12 @@ test('a skipped sync explains the missing watermark in the result toast', () => 
 
 test('source switch invalidates an older university-notice response', () => {
   const f = fixture();f.c.showUniversityNotices();
-  const old = f.take('getUniversityNoticesForWeb');
+  const old = f.take('getUniversityNoticePayloadForWeb');
   const toggle = f.document.getElementById('test-mode-toggle');toggle.dataset.ready = 'true';
   f.c.toggleTestCaseMode(true);
   f.reply(f.take('setTestCaseModeForWeb'), {hasApiToken: true, postAuthRequired: true,
     testCaseModeEnabled: true, testSpreadsheetReady: true});
-  const fresh = f.pending('getUniversityNoticesForWeb').at(-1);
+  const fresh = f.pending('getUniversityNoticePayloadForWeb').at(-1);
   f.reply(fresh, [{messageId: 'SIM-NOTICE', title: '仮想連絡', body: '', source: 'inCampus', receivedAt: '', from: '', read: false, saved: false}]);
   f.reply(old, [{messageId: 'OLD-LIVE', title: '古いデータ', body: '', source: 'inCampus', receivedAt: '', from: '', read: false, saved: false}]);
   assert.deepEqual(f.ids('universityState.items'), ['SIM-NOTICE']);

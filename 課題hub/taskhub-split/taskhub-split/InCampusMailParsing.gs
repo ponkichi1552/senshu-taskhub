@@ -405,12 +405,16 @@ function getLegacyInCampusRecordIndex_(row, records) {
 
 function expandInCampusNotificationRow_(row) {
   if (String(row[2]) !== 'inCampus') return [row];
-  const records = extractInCampusMailRecords_(row[7], row[11], row[9]);
+  const processed = getNotificationProcessedData_(row);
+  const cachedRecords = processed && Array.isArray(processed.records) ? processed.records : null;
+  const records = cachedRecords || extractInCampusMailRecords_(row[7], row[11], row[9]);
   if (!records.length) return [row];
   const states = parseInCampusRawJson_(row[14]);
   const legacyIndex = getLegacyInCampusRecordIndex_(row, records);
   return records.map((record, index) => {
     const child = normalizeNotificationRowWidth_(row);
+    if (row.__taskhubDisableProcessedMetadata) child.__taskhubDisableProcessedMetadata = true;
+    if (cachedRecords) child.__taskhubProcessedRecord = record;
     const key = inCampusStableKey_(inCampusRecordIdentity_(record));
     const state = states[key] || {};
     child[1] = String(row[1]) + ':update:' + key;
@@ -419,10 +423,15 @@ function expandInCampusNotificationRow_(row) {
     child[4] = record.title;
     child[11] = record.body;
     // Update timestamps describe delivery events, not submission deadlines.
-    const explicitDeadline = String(record.body).split('\n').filter(line => /^\s*(?:提出期限|期限|締切|締め切り|しめきり)\s*[:：]/.test(line)).join('\n');
-    const due = extractDueDate_(explicitDeadline, row[9]);
-    child[5] = due.dueDate;
-    child[6] = record.type === 'submission' ? '提出記録' : due.dueStatus;
+    if (cachedRecords) {
+      child[5] = restoreProcessedDueDate_(record);
+      child[6] = record.type === 'submission' ? '提出記録' : record.dueStatus;
+    } else {
+      const explicitDeadline = String(record.body).split('\n').filter(line => /^\s*(?:提出期限|期限|締切|締め切り|しめきり)\s*[:：]/.test(line)).join('\n');
+      const due = extractDueDate_(explicitDeadline, row[9]);
+      child[5] = due.dueDate;
+      child[6] = record.type === 'submission' ? '提出記録' : due.dueStatus;
+    }
     child[12] = state.status || (record.type === 'submission' ? '完了記録' : index === legacyIndex ? row[12] : '未確認');
     child[13] = Object.prototype.hasOwnProperty.call(state, 'completedAt') ? state.completedAt : index === legacyIndex ? row[13] : '';
     return child;

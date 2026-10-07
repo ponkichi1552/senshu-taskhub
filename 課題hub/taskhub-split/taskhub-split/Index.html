@@ -9,7 +9,8 @@
     <?!= include('StylesHome'); ?>
   </head>
 
-  <body>
+  <body data-taskhub-initial-sync="<?!= JSON.stringify(isInitialPersonalDataSyncPendingForWeb_()) ?>" data-taskhub-initial-view="<?= initialView ?>">
+    <script id="taskhub-initial-payload" type="application/json"><?!= initialPayloadJson ?></script>
     <?!= include('Home'); ?>
 
     <section id="assignment-view" class="app-view assignment-view" aria-label="課題通知一覧">

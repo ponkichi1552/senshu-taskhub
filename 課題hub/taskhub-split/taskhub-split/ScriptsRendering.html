@@ -11,79 +11,84 @@
 
   list.innerHTML = '';
 
-  const groups = groupNotificationsByDue(data, viewMode);
+  // Sync already assigned every task a due group and sorted these rows. The
+  // browser only walks that order and emits a heading when the stored key
+  // changes; it does not inspect dates, regroup rows, or sort cards.
   let cardIndex = 0;
-  let renderedCount = 0;
+  let currentGroupKey = '';
+  let groupBody = null;
+  data.forEach(item => {
+    const key = getPreparedTaskGroupKey(item, viewMode);
+    if (key !== currentGroupKey) {
+      currentGroupKey = key;
+      const group = getPreparedTaskGroupInfo(key, viewMode);
+      const groupOpen = isGroupOpen(viewMode, key);
+      const groupButtonId = `group-button-${viewMode}-${key}`;
+      const groupBodyId = `group-body-${viewMode}-${key}`;
+      const groupArrowId = `group-arrow-${viewMode}-${key}`;
+      const groupTitle = document.createElement('button');
+      groupTitle.type = 'button';
+      groupTitle.id = groupButtonId;
+      groupTitle.className = groupOpen ? 'group-title is-open' : 'group-title is-closed';
+      groupTitle.setAttribute('aria-expanded', String(groupOpen));
+      groupTitle.setAttribute('aria-controls', groupBodyId);
+      groupTitle.onclick = () => toggleGroup(viewMode, key);
+      groupTitle.innerHTML = `
+        <span class="group-label">${escapeHtml(group.label)}</span>
+        <span class="group-meta">
+          <span class="group-count">${Number(item.displayDueGroupCount || 0)}件</span>
+          <span class="group-arrow" id="${groupArrowId}">${groupOpen ? '⌃' : '⌄'}</span>
+        </span>
+      `;
+      list.appendChild(groupTitle);
 
-  groups.forEach(group => {
-    if (group.items.length === 0) {
-      return;
+      groupBody = document.createElement('div');
+      groupBody.id = groupBodyId;
+      groupBody.className = 'group-body';
+      groupBody.style.display = groupOpen ? '' : 'none';
+      list.appendChild(groupBody);
     }
 
-    const groupOpen = isGroupOpen(viewMode, group.key);
-    const groupButtonId = `group-button-${viewMode}-${group.key}`;
-    const groupBodyId = `group-body-${viewMode}-${group.key}`;
-    const groupArrowId = `group-arrow-${viewMode}-${group.key}`;
-
-    const groupTitle = document.createElement('button');
-    groupTitle.type = 'button';
-    groupTitle.id = groupButtonId;
-    groupTitle.className = groupOpen ? 'group-title is-open' : 'group-title is-closed';
-    groupTitle.setAttribute('aria-expanded', String(groupOpen));
-    groupTitle.setAttribute('aria-controls', groupBodyId);
-    groupTitle.onclick = () => toggleGroup(viewMode, group.key);
-
-    groupTitle.innerHTML = `
-      <span class="group-label">${escapeHtml(group.label)}</span>
-      <span class="group-meta">
-        <span class="group-count">${group.items.length}件</span>
-        <span class="group-arrow" id="${groupArrowId}">${groupOpen ? '⌃' : '⌄'}</span>
-      </span>
+    const card = document.createElement('div');
+    card.className = `card ${getCardClassByGroupKey(currentGroupKey)}`;
+    const currentIndex = cardIndex++;
+    card.innerHTML = `
+      <div class="source">${escapeHtml(item.source || '')}</div>
+      <div class="course">${escapeHtml(item.courseName || '授業名未抽出')}</div>
+      <div class="title">${escapeHtml(item.title || 'タイトル未抽出')}</div>
+      <div class="due">期限：${escapeHtml(item.dueDate || '未検出')}</div>
+      <div class="status">状態：${escapeHtml(getDisplayDueStatus(item.dueStatus))} / ${escapeHtml(getDisplayStatus(item.status))}</div>
+      <div class="status">メール受信：${escapeHtml(item.receivedAt || '')}</div>
+      ${item.supplementKey ? '<div class="status">inCampusの課題詳細で補足済み</div>' : ''}
+      <div class="button-row">
+        ${getClassroomOpenButtonHtml(item)}
+        ${getGmailOpenButtonHtml(item)}
+        <button onclick="toggleBody(${currentIndex})">詳細</button>
+        ${getStatusActionButtonHtml(item, viewMode)}
+      </div>
+      <div class="body" id="body-${currentIndex}">${escapeHtml(item.body || '')}</div>
     `;
-
-    list.appendChild(groupTitle);
-
-    const groupBody = document.createElement('div');
-    groupBody.id = groupBodyId;
-    groupBody.className = 'group-body';
-    groupBody.style.display = groupOpen ? '' : 'none';
-
-    group.items.forEach(item => {
-      const card = document.createElement('div');
-      card.className = `card ${getCardClassByGroupKey(group.key)}`;
-
-      const currentIndex = cardIndex;
-
-      card.innerHTML = `
-        <div class="source">${escapeHtml(item.source || '')}</div>
-        <div class="course">${escapeHtml(item.courseName || '授業名未抽出')}</div>
-        <div class="title">${escapeHtml(item.title || 'タイトル未抽出')}</div>
-        <div class="due">期限：${escapeHtml(item.dueDate || '未検出')}</div>
-        <div class="status">状態：${escapeHtml(getDisplayDueStatus(item.dueStatus))} / ${escapeHtml(getDisplayStatus(item.status))}</div>
-        <div class="status">メール受信：${escapeHtml(item.receivedAt || '')}</div>
-        ${item.supplementKey ? '<div class="status">inCampusの課題詳細で補足済み</div>' : ''}
-
-        <div class="button-row">
-          ${getClassroomOpenButtonHtml(item)}
-          ${getGmailOpenButtonHtml(item)}
-          <button onclick="toggleBody(${currentIndex})">詳細</button>
-          ${getStatusActionButtonHtml(item, viewMode)}
-        </div>
-
-        <div class="body" id="body-${currentIndex}">${escapeHtml(item.body || '')}</div>
-      `;
-
-      groupBody.appendChild(card);
-      cardIndex++;
-      renderedCount++;
-    });
-
-    list.appendChild(groupBody);
+    groupBody.appendChild(card);
   });
 
-  if (renderedCount === 0) {
-    list.textContent = '表示対象の通知はありません。';
-  }
+  if (!cardIndex) list.textContent = '表示対象の通知はありません。';
+}
+
+function getPreparedTaskGroupKey(item, viewMode) {
+  if (viewMode === 'completed') return 'completed';
+  const key = String(item && item.displayDueGroupKey || 'unknown');
+  return ['expired', 'today', 'tomorrow', 'thisWeek', 'later', 'none', 'unknown'].includes(key)
+    ? key
+    : 'unknown';
+}
+
+function getPreparedTaskGroupInfo(key, viewMode) {
+  if (viewMode === 'completed') return {label: '完了済み'};
+  const labels = {
+    expired: '期限切れ', today: '今日まで', tomorrow: '明日まで',
+    thisWeek: '今週中', later: '来週以降', none: '期限なし', unknown: '期限未検出'
+  };
+  return {label: labels[key] || labels.unknown};
 }
 
   function getClassroomOpenButtonHtml(item) {
@@ -146,251 +151,6 @@
     }
 
     return `<button onclick="markAsDone('${encodedMessageId}')">完了</button>`;
-  }
-
-  function groupNotificationsByDue(data, viewMode = 'active') {
-    if (viewMode === 'completed') {
-      return [
-        {
-          key: 'completed',
-          label: '完了済み',
-          items: data.slice().sort((a, b) => {
-            const completedDiff = (b.completedAtTime || 0) - (a.completedAtTime || 0);
-
-            if (completedDiff !== 0) {
-              return completedDiff;
-            }
-
-            return (b.displayReceivedAtTime || b.receivedAtTime || 0) - (a.displayReceivedAtTime || a.receivedAtTime || 0);
-          })
-        }
-      ];
-    }
-
-    const groupMap = {
-      expired: {
-        key: 'expired',
-        label: '期限切れ',
-        items: []
-      },
-      today: {
-        key: 'today',
-        label: '今日まで',
-        items: []
-      },
-      tomorrow: {
-        key: 'tomorrow',
-        label: '明日まで',
-        items: []
-      },
-      thisWeek: {
-        key: 'thisWeek',
-        label: '今週中',
-        items: []
-      },
-      later: {
-        key: 'later',
-        label: '来週以降',
-        items: []
-      },
-      none: {
-        key: 'none',
-        label: '期限なし',
-        items: []
-      },
-      unknown: {
-        key: 'unknown',
-        label: '期限未検出',
-        items: []
-      }
-    };
-
-    data.forEach(item => {
-      const key = getDueGroupKey(item);
-
-      if (groupMap[key]) {
-        groupMap[key].items.push(item);
-      } else {
-        groupMap.unknown.items.push(item);
-      }
-    });
-
-    Object.values(groupMap).forEach(group => {
-      group.items.sort((a, b) => getDueSortValue(a) - getDueSortValue(b));
-    });
-
-    return [
-      groupMap.expired,
-      groupMap.today,
-      groupMap.tomorrow,
-      groupMap.thisWeek,
-      groupMap.later,
-      groupMap.none,
-      groupMap.unknown
-    ];
-  }
-
-  function getDueGroupKey(item) {
-    if (item.dueType === 'none') {
-      return 'none';
-    }
-
-    if (item.dueType === 'unknown' || !item.dueDateKey) {
-      return 'unknown';
-    }
-
-    const dueDate = parseDateKey(item.dueDateKey);
-
-    if (!dueDate) {
-      return 'unknown';
-    }
-
-    const deadline = getDeadlineDateTime(item);
-
-    if (!deadline) {
-      return 'unknown';
-    }
-
-    const now = getDeadlineReferenceNow();
-
-    if (deadline < now) {
-      return 'expired';
-    }
-
-    const today = getStartOfToday();
-    const tomorrow = addDays(today, 1);
-    const endOfWeek = getEndOfThisWeek(today);
-
-    if (isSameDate(dueDate, today)) {
-      return 'today';
-    }
-
-    if (isSameDate(dueDate, tomorrow)) {
-      return 'tomorrow';
-    }
-
-    if (dueDate <= endOfWeek) {
-      return 'thisWeek';
-    }
-
-    return 'later';
-  }
-
-  function getDeadlineDateTime(item) {
-    const date = parseDateKey(item.dueDateKey);
-
-    if (!date) {
-      return null;
-    }
-
-    let hour = 23;
-    let minute = 59;
-
-    if (item.dueTime) {
-      const parts = String(item.dueTime).split(':');
-
-      if (parts.length === 2) {
-        const parsedHour = Number(parts[0]);
-        const parsedMinute = Number(parts[1]);
-
-        if (
-          Number.isInteger(parsedHour) &&
-          Number.isInteger(parsedMinute) &&
-          parsedHour >= 0 &&
-          parsedHour <= 23 &&
-          parsedMinute >= 0 &&
-          parsedMinute <= 59
-        ) {
-          hour = parsedHour;
-          minute = parsedMinute;
-        }
-      }
-    }
-
-    // Mail and due-time inputs have minute precision. Keep that minute open
-    // through its final millisecond (for example, 23:59 means until midnight).
-    date.setHours(hour, minute, 59, 999);
-
-    return date;
-  }
-
-  function getDeadlineReferenceNow() {
-    if (!testCaseModeEnabled || !testCaseClockDateTime) return new Date();
-    const match = String(testCaseClockDateTime).match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
-    if (!match) return new Date();
-    const date = parseDateKey(`${match[1]}-${match[2]}-${match[3]}`);
-    const hour = Number(match[4]);
-    const minute = Number(match[5]);
-    if (!date || hour > 23 || minute > 59) return new Date();
-    date.setHours(hour, minute, 0, 0);
-    return date;
-  }
-
-  function getDueSortValue(item) {
-    const deadline = getDeadlineDateTime(item);
-
-    if (deadline) {
-      return deadline.getTime();
-    }
-
-    if (item.dueType === 'none') {
-      return Number.MAX_SAFE_INTEGER - 1;
-    }
-
-    return Number.MAX_SAFE_INTEGER;
-  }
-
-  function parseDateKey(dateKey) {
-    const match = String(dateKey || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
-
-    if (!match) {
-      return null;
-    }
-
-    const year = Number(match[1]);
-    const month = Number(match[2]);
-    const day = Number(match[3]);
-
-    const date = new Date(year, month - 1, day);
-
-    if (
-      date.getFullYear() !== year ||
-      date.getMonth() !== month - 1 ||
-      date.getDate() !== day
-    ) {
-      return null;
-    }
-
-    return date;
-  }
-
-  function getStartOfToday() {
-    const today = getDeadlineReferenceNow();
-    today.setHours(0, 0, 0, 0);
-    return today;
-  }
-
-  function addDays(date, days) {
-    const result = new Date(date);
-    result.setDate(result.getDate() + days);
-    return result;
-  }
-
-  function getEndOfThisWeek(today) {
-    const result = new Date(today);
-    const day = result.getDay();
-    const daysUntilSunday = (7 - day) % 7;
-
-    result.setDate(result.getDate() + daysUntilSunday);
-    result.setHours(23, 59, 59, 999);
-
-    return result;
-  }
-
-  function isSameDate(a, b) {
-    return a.getFullYear() === b.getFullYear()
-      && a.getMonth() === b.getMonth()
-      && a.getDate() === b.getDate();
   }
 
   function getCardClassByGroupKey(key) {

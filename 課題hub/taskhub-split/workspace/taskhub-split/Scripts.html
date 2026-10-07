@@ -7,6 +7,7 @@
   let lastUndoMessageId = '';
   let undoToastTimerId = null;
   const notificationData = {active: [], completed: []};
+  const notificationDataLoaded = {active: false, completed: false};
   const notificationRequestIds = {active: 0, completed: 0};
   const notificationRequestsInFlight = {active: null, completed: null};
   const notificationStatusChanges = new Map();

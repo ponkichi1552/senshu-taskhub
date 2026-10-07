@@ -1,4 +1,5 @@
-function saveClassroomMailsToSheet() {
+function saveClassroomMailsToSheet(options) {
+  const syncOptions = options && typeof options === 'object' ? options : {};
   // Collect Gmail data outside the shared sheet lock, then re-check message
   // IDs before committing. A long Gmail scan must never hold the user lock.
   if (userStorageLockDepth_ > 0) {
@@ -115,6 +116,9 @@ function saveClassroomMailsToSheet() {
     });
 
     const autoCompletedCount = applySavedInCampusSubmissionRecordsLocked_(sheetsBySource.inCampus);
+    const displayDataResult = syncOptions.deferDisplayDataRefresh === true
+      ? null
+      : refreshNotificationDisplayDataAfterSyncLocked_(ss, 'gmail-sync');
     SpreadsheetApp.flush();
     const userProperties = PropertiesService.getUserProperties();
     userProperties.deleteProperty(NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY);
@@ -130,6 +134,9 @@ function saveClassroomMailsToSheet() {
       classroomSavedCount: savedCountsBySource['Google Classroom'] || 0,
       inCampusSavedCount: savedCountsBySource.inCampus || 0,
       autoCompletedCount,
+      displayDataReady: syncOptions.deferDisplayDataRefresh === true
+        ? null
+        : Boolean(displayDataResult && displayDataResult.taskCount !== undefined),
       spreadsheetId: ss.getId(),
       spreadsheetUrl: ss.getUrl()
     };
@@ -171,9 +178,10 @@ function collectNewNotificationRows_(storageConfig, savedMessageIds, retentionCu
         if (latestReceivedAt && receivedDate.getTime() < latestReceivedAt.getTime()) return;
 
         const subject = message.getSubject();
-        const body = message.getPlainBody() || '';
+        const rawBody = message.getPlainBody() || '';
+        const body = source === 'inCampus' ? stripInCampusFooterForStorage_(rawBody) : rawBody;
         const extracted = extractNotificationInfo_(source, subject, body, receivedDate);
-        newRows.push(toSafeSpreadsheetRow_([
+        const row = toSafeSpreadsheetRow_([
           new Date(),
           messageId,
           source,
@@ -188,7 +196,8 @@ function collectNewNotificationRows_(storageConfig, savedMessageIds, retentionCu
           body.slice(0, CONFIG.BODY_LIMIT),
           '未確認',
           ''
-        ]));
+        ]);
+        newRows.push(preprocessNotificationRowForStorage_(row));
         savedMessageIds.add(messageId);
       });
     });
@@ -253,6 +262,13 @@ function getOrCreateSpreadsheetLocked_() {
   const ss = SpreadsheetApp.create('課題通知Hub_保存データ');
   props.setProperty(USER_SPREADSHEET_ID_PROPERTY, ss.getId());
   props.setProperty(NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY, 'true');
+  props.setProperty(USER_INITIAL_DATA_SYNC_PENDING_PROPERTY, 'true');
+  props.deleteProperty(USER_INITIAL_DATA_SYNC_IN_PROGRESS_PROPERTY);
+  props.deleteProperty(USER_INITIAL_DATA_SYNC_COMPLETED_AT_PROPERTY);
+  // A newly created workbook must establish fresh watermarks for both sources.
+  props.deleteProperty(NOTIFICATION_LAST_SUCCESSFUL_SYNC_PROPERTY);
+  props.deleteProperty(CLASSROOM_API_LAST_SUCCESS_PROPERTY);
+  props.deleteProperty(CLASSROOM_API_STRUCTURED_SYNC_PROPERTY);
 
   return ss;
 }
@@ -331,10 +347,10 @@ function createNotificationReadContext_(testSpreadsheet, testMode) {
   };
 }
 
-function getSpreadsheetForRead_() {
-  const props = PropertiesService.getUserProperties();
-  const id = getConfiguredSpreadsheetId_() || props.getProperty(USER_SPREADSHEET_ID_PROPERTY) ||
-    props.getProperty(LEGACY_SPREADSHEET_ID_PROPERTY);
+function getSpreadsheetForRead_(userProperties) {
+  const props = userProperties || PropertiesService.getUserProperties().getProperties();
+  const id = getConfiguredSpreadsheetId_() || props[USER_SPREADSHEET_ID_PROPERTY] ||
+    props[LEGACY_SPREADSHEET_ID_PROPERTY];
   // doGet initializes new users before serving the page. Keep first-run callers
   // working while avoiding a shared write lock for ordinary list reads.
   return id ? SpreadsheetApp.openById(id) : getOrCreateSpreadsheet_();
@@ -546,17 +562,32 @@ function appendNotificationRows_(sheet, rows) {
   }
 
   const isUnifiedInCampus = sheet.getName && sheet.getName() === INCAMPUS_SHEET_NAME;
-  const width = isUnifiedInCampus ? Math.max(sheet.getLastColumn(), INCAMPUS_UNIFIED_HEADERS.length) : HEADER_ROW.length;
+  const width = isUnifiedInCampus
+    ? Math.max(sheet.getLastColumn(), getNotificationStorageWidth_('inCampus'))
+    : getNotificationStorageWidth_('Google Classroom');
   const normalizedRows = rows.map(row => {
-    if (!isUnifiedInCampus) return normalizeNotificationRowWidth_(row);
+    if (!isUnifiedInCampus) {
+      const normalized = Array(width).fill('');
+      normalizeNotificationRowWidth_(row).forEach((value, index) => { normalized[index] = value; });
+      const metadataColumn = getNotificationProcessingColumn_(row[2]);
+      normalized[metadataColumn] = row[metadataColumn] || '';
+      return normalized;
+    }
     const unified = Array(width).fill('');
     normalizeNotificationRowWidth_(row).forEach((value, index) => { unified[index] = value; });
     unified[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] = INCAMPUS_GMAIL_RECORD_TYPE;
+    const metadataColumn = getNotificationProcessingColumn_(row[2]);
+    unified[metadataColumn] = row[metadataColumn] || '';
     return unified;
   });
   sheet
     .getRange(sheet.getLastRow() + 1, 1, normalizedRows.length, normalizedRows[0].length)
     .setValues(normalizedRows);
+}
+
+function getNotificationStorageWidth_(source) {
+  const baseWidth = source === 'inCampus' ? INCAMPUS_UNIFIED_HEADERS.length : HEADER_ROW.length;
+  return Math.max(baseWidth, getNotificationProcessingColumn_(source) + 1);
 }
 
 function parseNotificationReceivedDate_(value) {
@@ -588,8 +619,16 @@ function normalizeNotificationRowsForStorage_(rows, storageConfig, referenceDate
   const earliest = getNotificationRetentionCutoff_(now);
   const seenMessageIds = new Set();
 
+  const storageWidth = getNotificationStorageWidth_(storageConfig.source);
+  const metadataColumn = getNotificationProcessingColumn_(storageConfig.source);
   return rows
-    .map(row => normalizeNotificationRowWidth_(row))
+    .map(row => {
+      const normalized = Array(storageWidth).fill('');
+      normalizeNotificationRowWidth_(row).forEach((value, index) => { normalized[index] = value; });
+      normalized[metadataColumn] = row && row[metadataColumn] !== undefined ? row[metadataColumn] : '';
+      if (row && row.__taskhubDisableProcessedMetadata) normalized.__taskhubDisableProcessedMetadata = true;
+      return normalized;
+    })
     .filter(row => String(row[2] || '') === storageConfig.source)
     .filter(row => {
       if (isClassroomApiManagedRow_(row)) return true;
@@ -598,8 +637,12 @@ function normalizeNotificationRowsForStorage_(rows, storageConfig, referenceDate
       // Keep unknown dates: they are not evidence that a message is old.
       if (!receivedDate || receivedDate.getTime() > earliest.getTime()) return true;
       // A dated Classroom announcement must survive storage cleanup until its date.
-      if (storageConfig.source === 'Google Classroom' && getClassroomNotificationType_(row[11]) === 'newAnnouncement') {
-        const expiry = getClassroomNoticeExpiry_(row[11], receivedDate);
+      const processed = getNotificationProcessedData_(row);
+      const notificationType = processed ? processed.category : getClassroomNotificationType_(row[11]);
+      if (storageConfig.source === 'Google Classroom' && notificationType === 'newAnnouncement') {
+        const expiry = processed && Object.prototype.hasOwnProperty.call(processed, 'expiresAt')
+          ? processed.expiresAt
+          : getClassroomNoticeExpiry_(row[11], receivedDate);
         return expiry !== null && now.getTime() < expiry;
       }
       return false;
@@ -628,17 +671,18 @@ function normalizeNotificationRowsForStorage_(rows, storageConfig, referenceDate
 }
 
 function normalizeNotificationSheet_(sheet, storageConfig) {
-  setupHeader_(sheet);
-
   if (storageConfig.source === 'inCampus') {
     normalizeUnifiedInCampusNotificationSheet_(sheet, storageConfig);
     return;
   }
+  setupHeader_(sheet);
+  ensureNotificationProcessingMetadataHeader_(sheet, storageConfig.source);
 
   const currentRows = sheet.getLastRow() >= 2
-    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, HEADER_ROW.length).getValues()
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, HEADER_ROW.length + 1).getValues()
     : [];
-  const normalizedRows = normalizeNotificationRowsForStorage_(currentRows, storageConfig);
+  const normalizedRows = normalizeNotificationRowsForStorage_(currentRows, storageConfig)
+    .map(row => preprocessNotificationRowForStorage_(row));
   const rowsChanged = currentRows.length !== normalizedRows.length || normalizedRows.some((row, rowIndex) => {
     const originalRow = currentRows[rowIndex] || [];
     return row.some((value, columnIndex) => {
@@ -657,7 +701,7 @@ function normalizeNotificationSheet_(sheet, storageConfig) {
   // The header stays in row 1 and the newest received message is in row 2.
   if (normalizedRows.length > 0) {
     sheet
-      .getRange(2, 1, normalizedRows.length, HEADER_ROW.length)
+      .getRange(2, 1, normalizedRows.length, HEADER_ROW.length + 1)
       .setValues(normalizedRows);
   }
 
@@ -675,7 +719,8 @@ function normalizeNotificationSheet_(sheet, storageConfig) {
 
 function normalizeUnifiedInCampusNotificationSheet_(sheet, storageConfig) {
   setupInCampusUnifiedHeader_(sheet);
-  const width = Math.max(sheet.getLastColumn(), INCAMPUS_UNIFIED_HEADERS.length);
+  ensureNotificationProcessingMetadataHeader_(sheet, 'inCampus');
+  const width = Math.max(sheet.getLastColumn(), INCAMPUS_UNIFIED_HEADERS.length + 1);
   const allRows = sheet.getLastRow() >= 2
     ? sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues()
     : [];
@@ -688,14 +733,19 @@ function normalizeUnifiedInCampusNotificationSheet_(sheet, storageConfig) {
       extractRows.push(row);
     } else if (recordType === INCAMPUS_GMAIL_RECORD_TYPE ||
         (!recordType && String(row[2] || '') === 'inCampus')) {
-      gmailRows.push(normalizeNotificationRowWidth_(row));
+      const normalized = Array(INCAMPUS_UNIFIED_HEADERS.length).fill('');
+      normalizeNotificationRowWidth_(row).forEach((value, index) => { normalized[index] = value; });
+      const metadataColumn = getNotificationProcessingColumn_('inCampus');
+      normalized[metadataColumn] = row[metadataColumn] || '';
+      gmailRows.push(normalized);
     } else if (row.some(value => value !== '' && value !== null && value !== undefined)) {
       // A future or malformed record type must never be removed by Gmail retention.
       unclassifiedRows.push(row);
     }
   });
 
-  const retainedGmailRows = normalizeNotificationRowsForStorage_(gmailRows, storageConfig);
+  const retainedGmailRows = normalizeNotificationRowsForStorage_(gmailRows, storageConfig)
+    .map(row => preprocessNotificationRowForStorage_(row));
   const combined = retainedGmailRows.map(row => {
     const unified = Array(width).fill('');
     row.forEach((value, index) => { unified[index] = value; });
@@ -732,6 +782,20 @@ function setupHeader_(sheet) {
     sheet.getRange(1, 1, 1, HEADER_ROW.length).setValues([HEADER_ROW]);
     sheet.setFrozenRows(1);
   }
+}
+
+function ensureNotificationProcessingMetadataHeader_(sheet, source) {
+  const column = getNotificationProcessingColumn_(source) + 1;
+  const header = sheet.getRange(1, column).getValues()[0][0];
+  if (header === NOTICE_PREPROCESSING_METADATA_HEADER) return;
+  const values = sheet.getLastRow() >= 2
+    ? sheet.getRange(2, column, sheet.getLastRow() - 1, 1).getValues().map(row => row[0])
+    : [];
+  if (header || values.some(value => value !== '' && value !== null && value !== undefined &&
+      parseInCampusRawJson_(value)[NOTICE_PREPROCESSING_LEDGER_KEY] === undefined)) {
+    throw new Error('通知シートの解析データ列に既存の見出しまたは値があるため、上書きを中止しました。');
+  }
+  sheet.getRange(1, column).setValue(NOTICE_PREPROCESSING_METADATA_HEADER);
 }
 
 function getSavedMessageIds_(sheet) {

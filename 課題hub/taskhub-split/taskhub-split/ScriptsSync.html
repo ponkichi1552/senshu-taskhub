@@ -1,7 +1,8 @@
 <script>
   function requestNotificationData(viewMode, options = {}) {
-    const method = options.method || (viewMode === 'completed'
-      ? 'getCompletedNotificationsForWeb' : 'getNotificationsForWeb');
+    const method = options.method || 'getTaskDisplayPayloadForWeb';
+    const usesTaskPayload = method === 'getTaskDisplayPayloadForWeb';
+    const expectsStructuredResult = Boolean(options.structuredResult || usesTaskPayload);
     const statusGeneration = notificationStatusGeneration;
     const list = document.getElementById('list');
     const syncText = document.getElementById('home-sync-text');
@@ -40,17 +41,37 @@
       syncText.textContent = options.loadingStatusText || '一覧を読み込み中...';
     }
 
-    const runner = google.script.run
-      .withSuccessHandler(data => {
+    const handleSuccess = data => {
         clearPendingRequest();
         if (!isCurrentRequest()) {
           if (typeof options.onStale === 'function') options.onStale(data, false);
           return;
         }
-        const items = options.structuredResult
-          ? (data && Array.isArray(data.items) ? data.items : [])
+        const isValidResult = expectsStructuredResult
+          ? Boolean((data && typeof data === 'object' && Array.isArray(data.items)) ||
+            (usesTaskPayload && Array.isArray(data)))
+          : Array.isArray(data);
+        if (!isValidResult) {
+          const error = new Error('一覧データの形式を確認できませんでした。時間をおいて再読み込みしてください。');
+          console.error(error);
+          if (options.loadingText && currentScreen === viewMode) list.textContent = error.message;
+          if (viewMode === 'active') updateHomeSyncText('一覧の読み込みに失敗しました');
+          if (typeof options.onFailure === 'function') options.onFailure(error);
+          return;
+        }
+        const items = expectsStructuredResult
+          ? (data && Array.isArray(data.items) ? data.items : usesTaskPayload && Array.isArray(data) ? data : [])
           : data;
+        if (usesTaskPayload && data && data.testCaseClockState) {
+          applyInitialTestCaseClockState(data.testCaseClockState);
+        }
         setNotificationData(items, viewMode);
+        if (usesTaskPayload && data && data.cacheToken) {
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            google.script.run.withFailureHandler(() => {})
+              .cacheTaskDisplayItemsAfterWebDisplay(items, viewMode, data.cacheToken);
+          }));
+        }
         if (options.remember) rememberExistingNotifications(items);
         if (options.notify) notifyNewNotifications(notificationData[viewMode]);
         if (viewMode === 'active') {
@@ -60,8 +81,8 @@
           updateHomeSyncText(syncLabel);
         }
         if (typeof options.onSuccess === 'function') options.onSuccess(data, items);
-      })
-      .withFailureHandler(error => {
+      };
+    const handleFailure = error => {
         clearPendingRequest();
         if (!isCurrentRequest()) {
           if (typeof options.onStale === 'function') options.onStale(error, true);
@@ -73,8 +94,16 @@
         }
         if (viewMode === 'active' && syncText) syncText.textContent = '同期失敗';
         if (typeof options.onFailure === 'function') options.onFailure(error);
-      });
-    runner[method]();
+      };
+    if (Object.prototype.hasOwnProperty.call(options, 'initialData')) {
+      handleSuccess(options.initialData);
+      return;
+    }
+    const runner = google.script.run
+      .withSuccessHandler(handleSuccess)
+      .withFailureHandler(handleFailure);
+    if (usesTaskPayload) runner[method](viewMode);
+    else runner[method]();
   }
 
   function rebuildNotifications() {
@@ -84,17 +113,23 @@
     });
   }
 
-  function loadNotifications() {
+  function loadNotifications(initialData) {
     closeCourseFilterPanel();
     showAssignmentView('active');
     if (notificationSyncInFlight) return;
-    requestNotificationData('active', {loadingText: '読み込み中...', remember: true});
+    const options = notificationDataLoaded.active
+      ? {remember: true}
+      : {loadingText: '読み込み中...', remember: true};
+    if (initialData !== undefined) options.initialData = initialData;
+    requestNotificationData('active', options);
   }
 
   function loadCompletedNotifications() {
     closeCourseFilterPanel();
     showAssignmentView('completed');
-    requestNotificationData('completed', {loadingText: '完了済み一覧を読み込み中...'});
+    requestNotificationData('completed', notificationDataLoaded.completed
+      ? {}
+      : {loadingText: '完了済み一覧を読み込み中...'});
   }
 
   function refreshNotifications() {
@@ -311,6 +346,7 @@
 
   function setNotificationData(data, viewMode = 'active') {
     notificationData[viewMode] = Array.isArray(data) ? data.slice() : [];
+    notificationDataLoaded[viewMode] = true;
     // Reads may finish while a status change is still in flight. Preserve the
     // latest local intent until the serialized writes finish and we read again.
     notificationStatusChanges.forEach((change, messageId) => {
