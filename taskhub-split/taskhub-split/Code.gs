@@ -226,7 +226,7 @@ function doGet(e) {
   template.initialView = initialView;
   template.initialPayloadJson = initialPayloadJson;
   const evaluateStartedAt = Date.now();
-  const output = template.evaluate().setTitle('課題通知Hub');
+  const output = template.evaluate().setTitle('課題通知Hub | TaskHub for Senshu University');
   Logger.log('TASKHUB_WEB_BOOT_TIMING ' + JSON.stringify({
     userStorageEnsureMs,
     initialPayloadGenerationMs,

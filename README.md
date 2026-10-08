@@ -1,6 +1,8 @@
 # 課題通知Hub
 
-[![TaskHub CI](https://github.com/ponkichi1552/taskhub/actions/workflows/ci.yml/badge.svg)](https://github.com/ponkichi1552/taskhub/actions/workflows/ci.yml)
+**TaskHub for Senshu University**
+
+[![TaskHub CI](https://github.com/ponkichi1552/senshu-taskhub/actions/workflows/ci.yml/badge.svg)](https://github.com/ponkichi1552/senshu-taskhub/actions/workflows/ci.yml)
 
 Google Classroom API、Gmail、Chrome拡張機能を組み合わせ、Google Classroomと専修大学inCampusの課題・通知を一元管理するWebアプリです。
 
@@ -433,15 +435,15 @@ Gmailを廃止するのではなく、
 
 ## ファイル構成
 
-- [Apps Script Webアプリ本体](./課題hub/taskhub-split/taskhub-split/)
-- [本体ソースのworkspaceミラー](./課題hub/taskhub-split/workspace/taskhub-split/)
-- [Chrome拡張機能 v2.5.8](./課題hub/taskhub-extension-v2.5/)
-- [Gmail通知と拡張機能データの照合仕様](./課題hub/taskhub-split/taskhub-split/MAIL_LINKING.md)
-- [保存期間・状態管理・表示用データ生成・移行時の注意](./課題hub/taskhub-split/taskhub-split/STORAGE.md)
-- [Classroom API検証プロジェクトと専用テスト](./課題hub/taskhub-split/classroom-api-experiment/README.md)
-- [回帰テスト用Excel](./課題hub/test-fixtures/TaskHub-test-cases.xlsx)
-- [ローカル開発とApps Script更新手順](./課題hub/README.md)
-- [拡張機能の導入・設定方法](./課題hub/taskhub-extension-v2.5/README.md)
+- [Apps Script Webアプリ本体](./taskhub-split/taskhub-split/)
+- [本体ソースのworkspaceミラー](./taskhub-split/workspace/taskhub-split/)
+- [Chrome拡張機能 v2.5.8](./taskhub-extension-v2.5/)
+- [Gmail通知と拡張機能データの照合仕様](./taskhub-split/taskhub-split/MAIL_LINKING.md)
+- [保存期間・状態管理・表示用データ生成・移行時の注意](./taskhub-split/taskhub-split/STORAGE.md)
+- [Classroom API検証プロジェクトと専用テスト](./taskhub-split/classroom-api-experiment/README.md)
+- [回帰テスト用Excel](./test-fixtures/TaskHub-test-cases.xlsx)
+- [ローカル開発とApps Script更新手順](./local-dev/README.md)
+- [拡張機能の導入・設定方法](./taskhub-extension-v2.5/README.md)
 - [開発・改修履歴](./CHANGELOG.md)
 
 Apps Scriptサーバーは `Code.gs` に共有設定と入口を置き、メール同期・通知解析・表示用データ生成・一覧処理・拡張機能連携を機能別の `.gs` ファイルに分けています。
@@ -456,7 +458,7 @@ Apps Scriptサーバーは `Code.gs` に共有設定と入口を置き、メー�
 4. 拡張機能に自分のWebアプリURLと、本体のセキュリティ設定で発行したAPIトークンを設定します。
 5. 各自のGoogleアカウントとClassroom・inCampusへログインし、必要な権限を承認して使用します。
 
-詳しい導入手順と対応範囲は[拡張機能README](./課題hub/taskhub-extension-v2.5/README.md)を参照してください。
+詳しい導入手順と対応範囲は[拡張機能README](./taskhub-extension-v2.5/README.md)を参照してください。
 
 本番同期は利用者本人のアカウントで実行します。
 
@@ -506,7 +508,7 @@ pnpm test
 - 大学通知の全文検索
 - 一時的な読込失敗後の再試行
 
-`課題hub/test-fixtures/TaskHub-test-cases.xlsx` とテストメールの値はすべて架空で、リンクには予約済みの `.invalid` ドメインを使います。
+`test-fixtures/TaskHub-test-cases.xlsx` とテストメールの値はすべて架空で、リンクには予約済みの `.invalid` ドメインを使います。
 
 個人の保存データ、Gmail、Google Drive、本番シートには接続せずに回帰確認できるようにしています。
 
@@ -514,7 +516,7 @@ pnpm test
 
 Excelを実際に読み込む追加スモークテストには `@oai/artifact-tool` が必要です。利用できない環境ではExcelスモークのみスキップされます。
 
-ブラウザーでローカル画面を試す手順は[ローカル起動ガイド](./課題hub/local-dev/README.md)にあります。
+ブラウザーでローカル画面を試す手順は[ローカル起動ガイド](./local-dev/README.md)にあります。
 
 ## 開発・改修履歴
 
