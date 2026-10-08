@@ -29,6 +29,14 @@ Classroomの授業・課題・本人の提出状態はGoogle Classroom APIから
   </tr>
 </table>
 
+## 実行環境
+
+- [TaskHubを開く](https://script.google.com/a/macros/senshu-u.jp/s/AKfycbxhoMvz2hSAAzIwWQ6YSwGWJwvzjRdDYpPxyaKQ2y9Bqigjw6YYwxSwbC6s4iHAaz4Q/exec)
+
+> 現在は専修大学のGoogleアカウント・inCampus環境を前提としています。
+> 初回利用時にはGoogleアカウントでの認証と必要な権限の許可が必要です。
+> 専修大学およびGoogleの公式サービスではありません。
+
 ## 開発背景
 
 課題や大学からの連絡はGoogle Classroom、inCampus、Gmailに分かれて届きます。
