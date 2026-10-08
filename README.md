@@ -253,6 +253,8 @@ GitHub Actions では、push・pull request・手動実行時に固定 lockfile 
 
 CI設定は [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) にあります。
 
+`main`へのpush後は、テスト成功を条件にApps Scriptの本番デプロイが承認待ちになります。GitHubの`production`環境で承認すると、`clasp`でソースを反映し、既存のWebアプリURLを更新します。承認前のジョブには本番用認証情報を渡しません。認証は`CLASPRC_JSON`環境Secret、スクリプトIDと既存デプロイIDは`GAS_SCRIPT_ID`・`GAS_DEPLOYMENT_ID`環境変数に保存します。`.clasp.json`と認証ファイルはリポジトリへ追加しません。
+
 ## ファイル構成
 
 - [Apps Script Webアプリ本体](./taskhub-split/taskhub-split/)
