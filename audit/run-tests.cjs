@@ -24,12 +24,7 @@ function checkSyntax(dir) {
 checkSyntax(path.join(base, 'taskhub-split'));
 checkSyntax(path.join(base, 'taskhub-extension-v2.5'));
 const canonical = path.join(base, 'taskhub-split/taskhub-split');
-const mirror = path.join(base, 'taskhub-split/workspace/taskhub-split');
-for (const name of fs.readdirSync(canonical)) {
-  if (!fs.statSync(path.join(canonical, name)).isFile()) continue;
-  assert.deepEqual(fs.readFileSync(path.join(canonical, name)), fs.readFileSync(path.join(mirror, name)), `Mirror mismatch: ${name}`);
-}
-console.log(`PASS syntax (${scripts} scripts) and canonical/mirror equality`);
+console.log(`PASS syntax (${scripts} scripts)`);
 const indexTemplate = fs.readFileSync(path.join(canonical, 'Index.html'), 'utf8');
 const includedTemplates = [...indexTemplate.matchAll(/include\(['"]([^'"]+)['"]\)/g)].map(match => match[1]);
 for (const name of includedTemplates) assert.ok(fs.existsSync(path.join(canonical, name + '.html')), `Missing HTML include: ${name}`);

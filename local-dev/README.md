@@ -4,7 +4,7 @@ Apps Scriptの画面とサーバー関数を、このフォルダーだけで確
 
 ## ソース構成
 
-サーバー側は `Code.gs` に共有設定とWebアプリの入口を置き、メール同期、inCampus/Classroomの解析、通知一覧、拡張機能APIを機能別の `.gs` ファイルに分けています。画面側は `Scripts*.html` と `Styles*.html` に分け、`Index.html` が読み込み順を管理します。GASへ反映する時は `clasp push` が対象ファイルをまとめて送ります。回帰テストでは `taskhub-split/workspace/taskhub-split/` のミラーと一致することも確認します。
+サーバー側は `Code.gs` に共有設定とWebアプリの入口を置き、メール同期、inCampus/Classroomの解析、通知一覧、拡張機能APIを機能別の `.gs` ファイルに分けています。画面側は `Scripts*.html` と `Styles*.html` に分け、`Index.html` が読み込み順を管理します。GASへ反映する時は `clasp push` が正本のファイルをまとめて送ります。回帰テストも正本を直接検査します。
 
 ## 起動
 

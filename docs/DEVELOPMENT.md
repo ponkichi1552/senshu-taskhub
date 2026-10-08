@@ -1,11 +1,10 @@
 # TaskHub開発とApps Script更新
 
-Apps Script本体、workspaceミラー、Chrome拡張機能、架空データのテストExcel、ローカル検証環境はリポジトリ直下に配置しています。
+Apps Script本体、Chrome拡張機能、架空データのテストExcel、ローカル検証環境はリポジトリ直下に配置しています。
 
 ## ソース構成
 
 - `taskhub-split/taskhub-split/`：Apps Scriptの正本。Gmail同期、Classroom API、通知処理、画面テンプレートを含みます。
-- `taskhub-split/workspace/taskhub-split/`：正本のミラー。回帰テストで一致を確認します。
 - `taskhub-split/classroom-api-experiment/`：APIだけを試す別Apps Scriptプロジェクトと専用テスト。
 - `taskhub-extension-v2.5/`：Chrome拡張機能。
 - `test-fixtures/TaskHub-test-cases.xlsx`：授業・担当者・課題・メール・リンクがすべて架空のテストデータ。
