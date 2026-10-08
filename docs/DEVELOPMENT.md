@@ -20,6 +20,10 @@ pnpm test
 
 テストはApps Scriptの実コード、Chrome拡張機能、画面の期限分類を使います。通常の回帰テストはGoogleアカウントや本番データに接続しません。Excelの取込スモークテストには `@oai/artifact-tool` が必要です。ローカル画面の起動方法とテストケースの使い方は [`local-dev/README.md`](../local-dev/README.md) を参照してください。
 
+## GitHub Actions
+
+`.github/workflows/ci.yml` がすべてのpush、pull request、手動実行で動き、固定したpnpm・Node.jsを使って `pnpm install --frozen-lockfile` と `pnpm test` を実行します。失敗した場合はGitHubのActions画面とコミットのチェック欄に結果が表示されます。GitHubの実行環境にはCodex専用の `@oai/artifact-tool` がないため、Excel取込スモークテストはスキップされます。その他の回帰テストは実行されます。
+
 ## Apps Scriptへの反映
 
 `.clasp.json` はプロジェクトごとのローカル設定として管理し、リポジトリには含めません。OAuth資格情報、APIトークン、実際のメールや課題データもコミットしないでください。

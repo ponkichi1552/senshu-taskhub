@@ -1,5 +1,7 @@
 # 課題通知Hub
 
+[![TaskHub CI](https://github.com/ponkichi1552/taskhub/actions/workflows/ci.yml/badge.svg)](https://github.com/ponkichi1552/taskhub/actions/workflows/ci.yml)
+
 Google Classroom API、Gmail、Chrome拡張機能を組み合わせ、Google Classroomと専修大学inCampusの課題・通知を一元管理するWebアプリです。
 
 Classroomの授業・課題・本人の提出状態はGoogle Classroom APIから取得し、Gmailを15分ごとに同期して新着課題やAPIにない通知を補完します。inCampusはメール通知とChrome拡張機能から取得した情報を照合し、締切順にまとめて表示します。
