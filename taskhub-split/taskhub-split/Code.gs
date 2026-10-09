@@ -250,6 +250,8 @@ function getInitialTaskHubViewForWeb_(event) {
 
 function getInitialTaskHubPayloadForWeb_(view, userPropertiesSnapshot) {
   try {
+    const firstPaint = getFirstPaintPayloadForWeb_(view, userPropertiesSnapshot);
+    if (firstPaint) return {view, payload: firstPaint};
     const payload = view === 'university'
       ? getUniversityNoticePayloadForWeb(false, userPropertiesSnapshot)
       : getTaskDisplayPayloadForWeb('未完了', userPropertiesSnapshot);

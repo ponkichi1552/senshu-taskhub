@@ -269,6 +269,14 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   props.setProperty(NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY, NOTIFICATION_DISPLAY_DATA_REVISION);
   const displayGeneration = String(Date.now()) + ':' + Utilities.getUuid();
   props.setProperty(NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY, displayGeneration);
+  const firstPaintStartedAt = Date.now();
+  const firstPaintProperties = {
+    [NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY]: displayGeneration,
+    [TASK_DISPLAY_STATUS_GENERATION_PROPERTY]: String(props.getProperty(TASK_DISPLAY_STATUS_GENERATION_PROPERTY) || '0')
+  };
+  writeTaskFirstPaintData_(activeTasks, firstPaintProperties, ss.getId());
+  writeUniversityFirstPaintData_(mergedNotices, firstPaintProperties, ss.getId());
+  phaseMs.firstPaintDataWriteMs = Date.now() - firstPaintStartedAt;
   props.deleteProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY);
   recordPhase('displayMetadataCommitMs');
   const displayCacheWarmStartedAt = Date.now();
@@ -537,7 +545,12 @@ function readMaterializedTaskItems_(spreadsheet, status, userProperties) {
     return [];
   }
   const mapStartedAt = Date.now();
-  const items = values.slice(1).map(row => {
+  const items = values.slice(1).map(taskDisplayRowToItem_).filter(item => String(item.messageId || ''));
+  Logger.log('TASKHUB_MATERIALIZED_READ_TIMING ' + JSON.stringify({sheetName, lastRow, columns: TASK_DISPLAY_HEADERS.length, getValuesMs, mapMs: Date.now() - mapStartedAt, itemCount: items.length}));
+  return items;
+}
+
+function taskDisplayRowToItem_(row) {
     const item = {};
     TASK_DISPLAY_FIELDS.forEach((field, index) => { item[field] = row[index] === null ? '' : row[index]; });
     try { item.gmailMessageIds = JSON.parse(String(item.gmailMessageIds || '[]')); }
@@ -553,9 +566,6 @@ function readMaterializedTaskItems_(spreadsheet, status, userProperties) {
     item.dueDateKey = normalizeNotificationDisplayDateKey_(item.dueDateKey);
     item.dueTime = normalizeNotificationDisplayTime_(item.dueTime);
     return toNotificationWebSafeValue_(item);
-  }).filter(item => String(item.messageId || ''));
-  Logger.log('TASKHUB_MATERIALIZED_READ_TIMING ' + JSON.stringify({sheetName, lastRow, columns: TASK_DISPLAY_HEADERS.length, getValuesMs, mapMs: Date.now() - mapStartedAt, itemCount: items.length}));
-  return items;
 }
 
 function readMaterializedUniversityNotices_(spreadsheet, userProperties) {
@@ -633,7 +643,7 @@ function readMaterializedUniversityNoticeList_(spreadsheet, userProperties, noti
       title: String(row[2] || ''),
       courseName: String(row[3] || ''),
       from: String(row[4] || ''),
-      receivedAt: String(row[5] || ''),
+      receivedAt: formatDateForWeb_(row[5]),
       receivedAtTime: Number(row[6] || 0),
       gmailLink: String(row[7] || ''),
       preview: String(row[8] || ''),
@@ -686,11 +696,15 @@ function getTaskDisplayCacheKey_(properties, status) {
     status === '完了' ? 'completed' : 'active', generation, statusGeneration].join(':');
 }
 
-function getTaskDisplayPayloadForWeb(status, userPropertiesSnapshot) {
+function getTaskDisplayPayloadForWeb(status, userPropertiesSnapshot, preferFirstPaint) {
   const startedAt = Date.now();
   const propertiesStartedAt = Date.now();
   const viewStatus = status === '完了' || status === 'completed' ? '完了' : '未完了';
   const properties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  if (preferFirstPaint === true && viewStatus === '未完了') {
+    const firstPaint = getFirstPaintPayloadForWeb_('assignment', properties);
+    if (firstPaint) return firstPaint;
+  }
   const propertiesMs = userPropertiesSnapshot ? 0 : Date.now() - propertiesStartedAt;
   const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
   const candidateCacheToken = testMode || properties[NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY] !== NOTIFICATION_DISPLAY_DATA_REVISION
@@ -925,17 +939,19 @@ function updateMaterializedTaskStatusLocked_(spreadsheet, messageId, status, com
     sourceSheet.deleteRow(sourceRowNumber);
     insertTaskDisplayRowInOrder_(targetSheet, rowValues, status);
   }
-  refreshTaskDisplayGroupSummariesInSheet_(activeSheet, '未完了');
+  const activeRows = refreshTaskDisplayGroupSummariesInSheet_(activeSheet, '未完了');
   refreshTaskDisplayGroupSummariesInSheet_(completedSheet, '完了');
-  PropertiesService.getUserProperties().setProperty(
+  const props = PropertiesService.getUserProperties();
+  props.setProperty(
     TASK_DISPLAY_STATUS_GENERATION_PROPERTY,
     String(Date.now()) + ':' + Utilities.getUuid()
   );
+  writeTaskFirstPaintData_(activeRows.map(taskDisplayRowToItem_), props.getProperties(), spreadsheet.getId());
   return true;
 }
 
 function refreshTaskDisplayGroupSummariesInSheet_(sheet, status) {
-  if (!sheet || sheet.getLastRow() < 2) return;
+  if (!sheet || sheet.getLastRow() < 2) return [];
   const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, TASK_DISPLAY_HEADERS.length).getValues();
   const groupIndex = TASK_DISPLAY_FIELDS.indexOf('displayDueGroupKey');
   const courseIndex = TASK_DISPLAY_FIELDS.indexOf('courseName');
@@ -961,6 +977,11 @@ function refreshTaskDisplayGroupSummariesInSheet_(sheet, status) {
     ) : ''];
   });
   sheet.getRange(2, countIndex + 1, metadata.length, 2).setValues(metadata);
+  values.forEach((row, index) => {
+    row[countIndex] = metadata[index][0];
+    row[courseCountsIndex] = metadata[index][1];
+  });
+  return values;
 }
 
 function findTaskDisplayRowNumber_(sheet, messageId, idColumn) {

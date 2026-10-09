@@ -1,7 +1,7 @@
 <script>
 const universityState = {items: [], selected: null, filter: 'all', loading: false, loaded: false, requestId: 0,
  bodySearchQuery: '', bodySearchMessageIds: null, bodySearchRequestId: 0, bodySearchTimer: 0,
- bodySearchLoading: false, bodySearchFailed: false, cacheToken: ''};
+ bodySearchLoading: false, bodySearchFailed: false, cacheToken: '', partial: false, totalCount: 0};
 function showUniversityNotices(initialData) {
  currentScreen = 'university'; closeCourseFilterPanel(); setAppView('university'); updateBottomNavState();
  loadUniversityNotices(undefined, undefined, false, isUniversityNoticePayloadValid_(initialData) ? initialData : undefined);
@@ -9,7 +9,7 @@ function showUniversityNotices(initialData) {
 function isUniversityNoticePayloadValid_(payload) {
  return Array.isArray(payload) || Boolean(payload && Array.isArray(payload.items));
 }
-function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData) {
+function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, fullRead = false) {
  if (universityState.loading) return;
  const keepCurrentItems = universityState.loaded;
  const requestId = ++universityState.requestId;
@@ -40,6 +40,7 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData) 
   const cacheToken = payload && !Array.isArray(payload) ? String(payload.cacheToken || '') : '';
   const keepLoadedBodies = Boolean(cacheToken && cacheToken === universityState.cacheToken);
   const previousById = new Map(universityState.items.map(item => [String(item.messageId || ''), item]));
+  const previousItems = universityState.items.map(item => Object.assign({}, item));
   const displayItems = items.map(item => {
    const previous = previousById.get(String(item && item.messageId || ''));
    const sourceBody = String(item && item.body || '');
@@ -50,27 +51,37 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData) 
     title: String(item && item.title || ''), courseName: String(item && item.courseName || ''),
     from: String(item && item.from || ''), receivedAt: String(item && item.receivedAt || ''),
     receivedAtTime: Number(item && item.receivedAtTime || 0), gmailLink: String(item && item.gmailLink || ''),
-    preview: bodyPreview, read: Boolean(item && item.read), saved: Boolean(item && item.saved),
+    preview: bodyPreview, read: previous && previous.pending ? previous.read : Boolean(item && item.read),
+    saved: previous && previous.pending ? previous.saved : Boolean(item && item.saved),
+    pending: Boolean(previous && previous.pending),
     bodyLoaded: Boolean(keepLoadedBodies && previous && previous.bodyLoaded),
-    bodyLoading: false, bodyLoadFailed: false
+    bodyLoading: Boolean(keepLoadedBodies && previous && previous.bodyLoading), bodyLoadFailed: false
    };
    if (next.bodyLoaded) next.body = String(previous.body || '');
    if (keepLoadedBodies && previous) next.bodyLoadFailed = Boolean(previous.bodyLoadFailed);
-   return next;
+   return previous ? Object.assign(previous, next) : next;
   });
-  const listChanged = !universityState.loaded || !areUniversityNoticeCollectionsEqual_(universityState.items, displayItems);
+  const listChanged = !universityState.loaded || !areUniversityNoticeCollectionsEqual_(previousItems, displayItems);
   universityState.items = displayItems;
+  universityState.partial = Boolean(payload && payload.partial === true);
+  universityState.totalCount = universityState.partial ? Number(payload.totalCount || displayItems.length) : displayItems.length;
   universityState.loaded = true;
   universityState.cacheToken = cacheToken;
   universityState.selected = items.some(item => item.messageId === previousSelected) ? previousSelected : null;
   if (!universityState.selected) document.getElementById('un-shell').classList.remove('is-reading');
-  document.getElementById('un-status').textContent = '未読・保存状態はアカウントごとに保存されます。';
+  document.getElementById('un-status').textContent = universityState.partial
+   ? `全${universityState.totalCount}件のうち先頭${displayItems.length}件を表示。残りを読み込み中…`
+   : '未読・保存状態はアカウントごとに保存されます。';
   const selectionChanged = previousSelected !== universityState.selected;
   if (listChanged || selectionChanged) renderUniversityNotices();
   if (listChanged || selectionChanged) renderUniversityDetail();
   if (typeof onSuccess === 'function') onSuccess(universityState.items);
   const currentQuery = document.getElementById('un-search').value.trim();
   if (currentQuery) handleUniversitySearchInput();
+  if (universityState.partial) requestAnimationFrame(() => requestAnimationFrame(() => {
+   if (requestId !== universityState.requestId || !universityState.partial || universityState.loading) return;
+   loadUniversityNotices(onSuccess, onFailure, false, undefined, true);
+  }));
  };
  const handleFailure = error => {
   if (requestId !== universityState.requestId) return;
@@ -86,13 +97,15 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData) 
   }
   universityState.loading = false; document.getElementById('un-refresh').disabled = false;
   if (!keepCurrentItems) document.getElementById('un-status').textContent = '読み込めませんでした。「更新」で再試行してください。';
+  else if (universityState.partial) document.getElementById('un-status').textContent = '先頭のお知らせを表示しています。残りを読み込めませんでした。大学からのお知らせを開き直すと再試行します。';
   if (typeof onFailure === 'function') onFailure(new Error('大学のお知らせを読み込めませんでした。'));
  };
  if (isUniversityNoticePayloadValid_(initialData)) {
   handleSuccess(initialData);
  } else {
-  google.script.run.withSuccessHandler(handleSuccess).withFailureHandler(handleFailure)
-   .getUniversityNoticePayloadForWeb(Boolean(forceRefresh));
+  const runner = google.script.run.withSuccessHandler(handleSuccess).withFailureHandler(handleFailure);
+  if (!fullRead && !forceRefresh && !universityState.loaded) runner.getUniversityNoticePayloadForWeb(false, null, true);
+  else runner.getUniversityNoticePayloadForWeb(Boolean(forceRefresh));
  }
 }
 function refreshUniversityNotices() { loadUniversityNotices(undefined, undefined, true); }
@@ -158,10 +171,12 @@ function renderUniversityNotices() {
    ? universityState.bodySearchMessageIds.has(String(n.messageId))
    : universityNoticeSearchText_(n).includes(normalizedQuery))));
  const list=document.getElementById('un-list');const fragment=document.createDocumentFragment();
- document.getElementById('un-count').textContent=items.length+'件のお知らせ · 新しい順';
+ document.getElementById('un-count').textContent=universityState.partial
+  ? `全${universityState.totalCount}件中${items.length}件を表示 · 新しい順` : items.length+'件のお知らせ · 新しい順';
  if(!items.length)fragment.append(unElement('p','un-empty',universityState.items.length?'該当するお知らせはありません。':'お知らせはまだありません。'));
  items.forEach(n=>{const b=unElement('button','un-item');b.type='button';b.setAttribute('aria-current',n.messageId===universityState.selected);const preview=String(n.preview||'');b.setAttribute('aria-label',[n.read?'既読':'未読',n.source,n.receivedAt,n.title||'件名なし',preview].filter(Boolean).join('　'));b.append(unElement('div','un-meta',(n.read?'':'● 未読　')+n.source+'　'+n.receivedAt),unElement('div','un-title',n.title||'件名なし'),unElement('div','un-excerpt',preview));b.onclick=()=>{universityState.selected=n.messageId;document.getElementById('un-shell').classList.add('is-reading');if(!n.read)updateUniversityNotice(n,{read:true});renderUniversityNotices();renderUniversityDetail()};fragment.appendChild(b)});
  list.replaceChildren(fragment);
+ if (items.length) markTaskHubFirstContent_('university');
 }
 function updateUniversityNotice(n, change) {
  if(n.pending)return;

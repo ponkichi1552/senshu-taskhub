@@ -79,8 +79,14 @@
         if (usesTaskPayload && data && data.testCaseClockState) {
           applyInitialTestCaseClockState(data.testCaseClockState);
         }
-        setNotificationData(items, viewMode);
-        if (usesTaskPayload && data && data.cacheToken) {
+        const partial = Boolean(data && data.partial === true);
+        setNotificationData(items, viewMode, partial ? data : null);
+        const loadStatus = document.getElementById('assignment-load-status');
+        if (viewMode === 'active' && loadStatus) {
+          loadStatus.hidden = !partial;
+          loadStatus.textContent = partial ? `全${Number(data.totalCount || 0)}件のうち先頭${items.length}件を表示。残りを読み込み中…` : '';
+        }
+        if (usesTaskPayload && data && data.cacheToken && !partial) {
           requestAnimationFrame(() => requestAnimationFrame(() => {
             google.script.run.withFailureHandler(() => {})
               .cacheTaskDisplayItemsAfterWebDisplay(items, viewMode, data.cacheToken);
@@ -92,9 +98,19 @@
           const syncLabel = typeof options.syncLabelForResult === 'function'
             ? options.syncLabelForResult(data)
             : options.syncLabel || '一覧更新';
-          updateHomeSyncText(syncLabel);
+          updateHomeSyncText(partial ? '残りの課題を読み込み中…' : syncLabel);
         }
         if (typeof options.onSuccess === 'function') options.onSuccess(data, items);
+        if (partial) {
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (!isCurrentRequest() || notificationDataLoaded[viewMode] || notificationRequestsInFlight[viewMode]) return;
+            const fullOptions = Object.assign({}, options, {fullRead: true});
+            delete fullOptions.initialData;
+            delete fullOptions.loadingText;
+            delete fullOptions.loadingStatusText;
+            requestNotificationData(viewMode, fullOptions);
+          }));
+        }
       };
     const handleFailure = error => {
         clearPendingRequest();
@@ -118,6 +134,11 @@
           list.textContent = 'エラーが発生しました：' + getErrorMessage(error);
         }
         if (viewMode === 'active' && syncText) syncText.textContent = '同期失敗';
+        if (viewMode === 'active' && notificationData.active.length && !notificationDataLoaded.active) {
+          const loadStatus = document.getElementById('assignment-load-status');
+          if (loadStatus) {loadStatus.hidden = false; loadStatus.textContent = '先頭の課題を表示しています。残りを読み込めませんでした。課題通知を開き直すと再試行します。';}
+          if (syncText) syncText.textContent = '残りの課題を読み込めませんでした';
+        }
         if (typeof options.onFailure === 'function') options.onFailure(error);
       };
     if (Object.prototype.hasOwnProperty.call(options, 'initialData')) {
@@ -127,7 +148,10 @@
     const runner = google.script.run
       .withSuccessHandler(handleSuccess)
       .withFailureHandler(handleFailure);
-    if (usesTaskPayload) runner[method](viewMode === 'completed' ? '完了' : '未完了');
+    if (usesTaskPayload && viewMode === 'active' && !options.fullRead &&
+        !notificationDataLoaded.active && notificationData.active.length === 0) {
+      runner[method]('未完了', null, true);
+    } else if (usesTaskPayload) runner[method](viewMode === 'completed' ? '完了' : '未完了');
     else runner[method]();
   }
 
@@ -143,7 +167,7 @@
     const hasEmbeddedItems = Boolean(initialData && Array.isArray(initialData.items));
     showAssignmentView('active', {deferRender: hasEmbeddedItems});
     if (notificationSyncInFlight) return;
-    const options = notificationDataLoaded.active
+    const options = notificationDataLoaded.active || notificationData.active.length
       ? {remember: true}
       : {loadingText: '読み込み中...', remember: true};
     if (initialData !== undefined) options.initialData = initialData;
@@ -370,9 +394,11 @@
     updateBottomNavState();
   }
 
-  function setNotificationData(data, viewMode = 'active') {
+  function setNotificationData(data, viewMode = 'active', partialPayload = null) {
     notificationData[viewMode] = Array.isArray(data) ? data.slice() : [];
-    notificationDataLoaded[viewMode] = true;
+    notificationDataLoaded[viewMode] = !partialPayload;
+    if (viewMode === 'active') homeFirstPaintSummary = partialPayload && Array.isArray(partialPayload.homeSummary)
+      ? partialPayload.homeSummary : null;
     // Reads may finish while a status change is still in flight. Preserve the
     // latest local intent until the serialized writes finish and we read again.
     notificationStatusChanges.forEach((change, messageId) => {

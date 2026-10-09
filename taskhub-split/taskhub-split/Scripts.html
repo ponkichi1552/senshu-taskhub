@@ -15,6 +15,8 @@
   let currentViewMode = 'active';
   let currentRawData = [];
   let homeRawData = [];
+  let homeFirstPaintSummary = null;
+  const firstContentMarkedViews = new Set();
   let selectedCourseName = 'すべて';
   let currentScreen = 'home';
   let expandedHomeDueGroup = null;
@@ -25,4 +27,17 @@
   let testCaseModeEnabled = false;
   let testCaseClockDateTime = '';
   let testCaseClockPresets = [];
+
+  function markTaskHubFirstContent_(view) {
+    if (firstContentMarkedViews.has(view)) return;
+    firstContentMarkedViews.add(view);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      document.body.dataset.taskhubFirstContentView = view;
+      document.body.dataset.taskhubFirstContentAt = String(Date.now());
+      if (typeof performance !== 'undefined') {
+        performance.mark('taskhub-first-content-' + view);
+        console.info('TASKHUB_BROWSER_FIRST_CONTENT', {view, frameMs: performance.now()});
+      }
+    }));
+  }
 </script>

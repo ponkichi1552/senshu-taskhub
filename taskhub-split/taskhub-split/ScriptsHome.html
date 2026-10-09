@@ -52,6 +52,7 @@
     notificationDataLoaded.active = false;
     notificationDataLoaded.completed = false;
     homeRawData = [];
+    homeFirstPaintSummary = null;
     currentRawData = [];
     universityState.items = [];
     universityState.selected = null;
@@ -137,7 +138,7 @@
       {key: 'thisWeek', label: '今週中', count: 0, courseCounts: new Map()}
     ];
     homeGroups.forEach(group => {
-      const summaryItem = homeRawData.find(item =>
+      const summaryItem = (homeFirstPaintSummary || homeRawData).find(item =>
         String(item.displayDueGroupKey || '') === group.key && item.displayDueGroupCourseCountsJson
       );
       if (!summaryItem) return;
@@ -151,6 +152,7 @@
     });
 
     container.innerHTML = homeGroups.map(group => getHomeDueGroupHtml(group)).join('');
+    if (notificationDataLoaded.active || homeFirstPaintSummary) markTaskHubFirstContent_('home');
   }
 
   function getHomeDueGroupHtml(group) {

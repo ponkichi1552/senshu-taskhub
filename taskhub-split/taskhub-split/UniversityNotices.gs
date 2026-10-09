@@ -2,10 +2,14 @@ function getUniversityNoticesForWeb(forceRefresh) {
   return getUniversityNoticesForWebLocked_(Boolean(forceRefresh));
 }
 
-function getUniversityNoticePayloadForWeb(forceRefresh, userPropertiesSnapshot) {
+function getUniversityNoticePayloadForWeb(forceRefresh, userPropertiesSnapshot, preferFirstPaint) {
   const startedAt = Date.now();
   const propertiesStartedAt = Date.now();
   const properties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  if (preferFirstPaint === true && !forceRefresh) {
+    const firstPaint = getFirstPaintPayloadForWeb_('university', properties);
+    if (firstPaint) return firstPaint;
+  }
   const propertiesMs = userPropertiesSnapshot ? 0 : Date.now() - propertiesStartedAt;
   const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
   const now = testMode ? getTestCaseReferenceNowFromProperties_(properties) : new Date();

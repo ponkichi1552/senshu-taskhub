@@ -933,4 +933,63 @@ test('unavailable test sheet keeps OFF and a failed toggle restores the previous
   assert.equal(f.pending('getSecuritySettingsForWeb').length, 1);
 });
 
+test('initial task cards paint before the full RPC and Home totals do not count only the preview rows',()=>{
+  const first=item('first-task');first.firstPaintOnly=true;
+  const payload={items:[first],partial:true,totalCount:9,cacheToken:'must-not-cache-partial',
+    homeSummary:[{displayDueGroupKey:'today',displayDueGroupCount:7,displayDueGroupCourseCountsJson:'[["仮想情報演習",7]]'}]};
+  const f=fixture(undefined,{holdBoot:true,initialPayload:{view:'home',payload}});
+  assert.deepEqual(f.ids('notificationData.active'),['first-task']);
+  assert.equal(f.read('notificationDataLoaded.active'),false);
+  assert.match(f.document.getElementById('home-due-card').innerHTML,/7件/,'Home totals represent all tasks, not one preview row');
+  assert.equal(f.calls.length,0,'rendering precedes all background data requests');
+  f.flushAnimationFrame();assert.equal(f.calls.length,0);
+  f.flushAnimationFrame();
+  const full=f.take('getTaskDisplayPayloadForWeb');
+  assert.equal(full.args.length,1,'the follow-up bypasses the first-card endpoint path');
+  assert.equal(f.pending('cacheTaskDisplayItemsAfterWebDisplay').length,0);
+  f.reply(full,{items:[item('first-task'),item('last-task')]});
+  assert.deepEqual(f.ids('notificationData.active'),['first-task','last-task']);
+  assert.equal(f.read('notificationDataLoaded.active'),true);
+  assert.equal(f.read('homeFirstPaintSummary'),null);
+});
+test('a failed full task read keeps the painted cards and opening the view retries the full list',()=>{
+  const f=fixture(undefined,{holdBoot:true,initialRoute:'assignment',initialPayload:{view:'assignment',
+    payload:{items:[item('visible-task')],partial:true,totalCount:10}}});
+  f.flushAnimationFrame();f.flushAnimationFrame();f.fail(f.take('getTaskDisplayPayloadForWeb'));
+  assert.deepEqual(f.ids('notificationData.active'),['visible-task']);
+  assert.match(f.document.getElementById('assignment-load-status').textContent,/残りを読み込めません/);
+  f.c.loadNotifications();assert.equal(f.take('getTaskDisplayPayloadForWeb').args.length,1);
+});
+test('first university cards remain selected and preserve an in-flight read/save change when the full list arrives',()=>{
+  const notice={messageId:'preview-notice',title:'最初のお知らせ',preview:'抜粋',source:'inCampus',receivedAt:'2099/10/01 10:00'};
+  const f=fixture(undefined,{holdBoot:true,initialRoute:'university',initialPayload:{view:'university',
+    payload:{items:[notice],partial:true,totalCount:89,cacheToken:'generation-1'}}});
+  assert.equal(f.document.getElementById('un-list').children.length,1);
+  assert.match(f.document.getElementById('un-count').textContent,/全89件中1件/);
+  assert.equal(f.calls.length,0);f.flushAnimationFrame();f.flushAnimationFrame();
+  const full=f.take('getUniversityNoticePayloadForWeb');
+  vm.runInContext("universityState.selected='preview-notice';updateUniversityNotice(universityState.items[0],{read:true})",f.c);
+  const stateWrite=f.take('setUniversityNoticeState');
+  f.reply(full,{items:[notice,{...notice,messageId:'last-notice'}],cacheToken:'generation-1'});
+  assert.equal(f.read('universityState.selected'),'preview-notice');
+  assert.equal(f.read('universityState.items[0].read'),true,'the full read cannot undo a pending user action');
+  assert.equal(f.read('universityState.partial'),false);
+  f.reply(stateWrite,true);assert.equal(f.read('universityState.items[0].pending'),false);
+});
+test('a failed full university read keeps the first notice and allows a complete-list retry',()=>{
+  const notice={messageId:'first',title:'保存された最初の通知',source:'inCampus'};
+  const f=fixture(undefined,{holdBoot:true,initialRoute:'university',initialPayload:{view:'university',
+    payload:{items:[notice],partial:true,totalCount:20}}});
+  f.flushAnimationFrame();f.flushAnimationFrame();f.fail(f.take('getUniversityNoticePayloadForWeb'));
+  assert.equal(f.read('universityState.items[0].messageId'),'first');
+  assert.match(f.document.getElementById('un-status').textContent,/残りを読み込めません/);
+  f.c.showUniversityNotices();assert.equal(f.take('getUniversityNoticePayloadForWeb').args.length,1);
+});
+test('initial read-only RPC requests prefer the saved first cards; full follow-ups and completion reads do not',()=>{
+  const task=fixture(undefined,{holdBoot:true,initialRoute:'assignment'});
+  assert.deepEqual(task.take('getTaskDisplayPayloadForWeb').args,['未完了',null,true]);
+  const university=fixture(undefined,{holdBoot:true,initialRoute:'university'});
+  assert.deepEqual(university.take('getUniversityNoticePayloadForWeb').args,[false,null,true]);
+  task.c.loadCompletedNotifications();assert.deepEqual(task.take('getTaskDisplayPayloadForWeb','完了').args,['完了']);
+});
 console.log(`${passed} UI regression tests passed.`);

@@ -1575,5 +1575,96 @@ check('Test university notices are materialized from immutable fixtures with pro
   assert.equal(afterExpiry.length,0,'changing the selected virtual date rebuilds the projection and applies the same expiry boundary');
   assert.equal(fixture.rows[1][9].getTime(),new Date(2026,8,10,9).getTime(),'virtual dates are applied only to in-memory copies');
 });
+function firstPaintEnvironment() {
+  const e=environment();
+  const tasks=Array.from({length:4},(_,i)=>row('FIRST-TASK-'+i,'仮想課題'+i,body('仮想課題'+i),
+    {due:'2099/10/25',received:new Date(Date.now()-i*1000)}));
+  const notices=Array.from({length:5},(_,i)=>row('FIRST-NOTICE-'+i,'仮想案内'+i,'大学からのお知らせです。',
+    {received:new Date(Date.now()-i*1000)}));
+  notices.forEach((notice,i)=>{notice[7]='仮想案内'+i;});
+  putMail(e,tasks.concat(notices));
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  markUserStorageWarm(e);
+  return e;
+}
+check('Sync prepares small real first-card projections; cold HTML uses them without CacheService or Sheets',()=>{
+  const e=firstPaintEnvironment();
+  const fullTasks=e.c.getTaskDisplayPayloadForWeb('未完了').items;
+  const fullNotices=e.c.getUniversityNoticePayloadForWeb().items;
+  assert.equal(fullTasks.length,4);assert.equal(fullNotices.length,5);
+  e.state.cache={};e.state.cacheGetCalls=0;e.state.spreadsheetOpenCalls={};
+  e.c.getTaskDisplayPayloadForWeb=()=>{throw new Error('the first cards must not read the full task list');};
+  e.c.getUniversityNoticePayloadForWeb=()=>{throw new Error('the first cards must not read the full notice list');};
+  const task=e.c.getInitialTaskHubPayloadForWeb_('assignment',e.state.props).payload;
+  const home=e.c.getInitialTaskHubPayloadForWeb_('home',e.state.props).payload;
+  const notice=e.c.getInitialTaskHubPayloadForWeb_('university',e.state.props).payload;
+  assert.equal(task.partial,true);assert.equal(task.totalCount,4);assert.equal(task.items.length,2);
+  assert.deepEqual(Array.from(task.items,x=>x.messageId),Array.from(fullTasks.slice(0,2),x=>x.messageId));
+  assert.ok(task.items.every(x=>x.firstPaintOnly&&!Object.hasOwn(x,'body')&&!Object.hasOwn(x,'gmailBody')));
+  assert.equal(task.cacheToken,'','a partial task list is never written into the complete-list cache');
+  assert.equal(home.homeSummary.length,3);
+  assert.equal(notice.partial,true);assert.equal(notice.totalCount,5);assert.equal(notice.items.length,3);
+  assert.deepEqual(Array.from(notice.items,x=>x.messageId),Array.from(fullNotices.slice(0,3),x=>x.messageId));
+  assert.ok(notice.items.every(x=>!Object.hasOwn(x,'body')));
+  assert.equal(e.state.cacheGetCalls,0);assert.deepEqual(e.state.spreadsheetOpenCalls,{});
+  for(const key of ['TASKHUB_TASK_FIRST_PAINT_DATA','TASKHUB_UNIVERSITY_FIRST_PAINT_DATA']) {
+    assert.ok(Buffer.byteLength(e.state.props[key],'utf8')<=8000,'stored projections fit the per-property byte limit');
+  }
+});
+check('A task status mutation republishes the first cards and a committed projection remains safe during sheet replacement',()=>{
+  const e=firstPaintEnvironment();
+  const first=e.c.getFirstPaintPayloadForWeb_('assignment',e.state.props);
+  const completedId=first.items[0].messageId;
+  assert.equal(e.c.updateMaterializedTaskStatusLocked_(e.ss,completedId,'完了',new Date()),true);
+  const next=e.c.getFirstPaintPayloadForWeb_('assignment',e.state.props);
+  assert.equal(next.totalCount,3);assert.ok(next.items.every(x=>x.messageId!==completedId));
+  e.state.props.TASKHUB_NOTIFICATION_DISPLAY_DATA_BUILDING=String(Date.now());
+  assert.equal(e.c.getFirstPaintPayloadForWeb_('assignment',e.state.props).totalCount,3,
+    'self-contained last committed cards remain valid while sheet cells are being replaced');
+});
+check('First-card notices overlay the latest user read/save state without rewriting the projection',()=>{
+  const e=firstPaintEnvironment();
+  const initial=e.c.getFirstPaintPayloadForWeb_('university',e.state.props);
+  const saved=e.state.props.TASKHUB_UNIVERSITY_FIRST_PAINT_DATA;
+  e.c.setUniversityNoticeState(initial.items[0].messageId,{read:true,saved:true});
+  e.state.spreadsheetOpenCalls={};
+  const updated=e.c.getFirstPaintPayloadForWeb_('university',e.state.props);
+  assert.equal(updated.items[0].read,true);assert.equal(updated.items[0].saved,true);
+  assert.equal(e.state.props.TASKHUB_UNIVERSITY_FIRST_PAINT_DATA,saved);
+  assert.deepEqual(e.state.spreadsheetOpenCalls,{});
+});
+check('Wrong generation, workbook, corrupt projection and test mode fall back instead of showing stale first cards',()=>{
+  const e=firstPaintEnvironment(),key='TASKHUB_TASK_FIRST_PAINT_DATA',saved=e.state.props[key];
+  e.state.props[key]='gz:broken';assert.equal(e.c.getFirstPaintPayloadForWeb_('home',e.state.props),null);
+  e.c.getTaskDisplayPayloadForWeb=()=>({items:[{messageId:'fallback'}]});
+  assert.equal(e.c.getInitialTaskHubPayloadForWeb_('assignment',e.state.props).payload.items[0].messageId,'fallback');
+  e.state.props[key]=saved;
+  const generation=e.state.props.TASKHUB_NOTIFICATION_DISPLAY_DATA_GENERATION;
+  e.state.props.TASKHUB_NOTIFICATION_DISPLAY_DATA_GENERATION='new-generation';
+  assert.equal(e.c.getFirstPaintPayloadForWeb_('home',e.state.props),null);
+  e.state.props.TASKHUB_NOTIFICATION_DISPLAY_DATA_GENERATION=generation;
+  e.state.props.TASKHUB_TASK_DISPLAY_STATUS_GENERATION='new-status';
+  assert.equal(e.c.getFirstPaintPayloadForWeb_('home',e.state.props),null);
+  delete e.state.props.TASKHUB_TASK_DISPLAY_STATUS_GENERATION;
+  e.state.props.TASKHUB_SPREADSHEET_ID='another-sheet';assert.equal(e.c.getFirstPaintPayloadForWeb_('home',e.state.props),null);
+  e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';e.state.props.TASKHUB_TEST_CASE_MODE='true';
+  assert.equal(e.c.getFirstPaintPayloadForWeb_('home',e.state.props),null,'a production preview never leaks into virtual-date tests');
+});
+check('Oversized startup projections safely fall back and measurement clearing preserves all saved display data',()=>{
+  const e=firstPaintEnvironment();
+  const oversized=crypto.randomBytes(20000).toString('base64');
+  assert.equal(e.c.writeTaskFirstPaintData_([{messageId:'huge',title:oversized}],e.state.props,'test-sheet'),false);
+  assert.equal(e.state.props.TASKHUB_TASK_FIRST_PAINT_DATA,undefined);
+  const before=JSON.stringify(e.state.props);e.state.spreadsheetOpenCalls={};
+  const result=e.c.taskhubClearDisplayCachesForMeasurement();
+  assert.equal(result.ok,true);assert.equal(JSON.stringify(e.state.props),before);
+  assert.deepEqual(e.state.spreadsheetOpenCalls,{});assert.equal(Object.keys(e.state.cache).length,0);
+});
+check('A Sheets date cell keeps the Japanese display format when the full university list replaces its first cards',()=>{
+  const e=firstPaintEnvironment();
+  e.state.sheets['大学通知表示データ'].rows[1][5]=new Date(2026,9,9,10,24);
+  const value=e.c.getUniversityNoticePayloadForWeb().items[0].receivedAt;
+  assert.match(value,/^2026\/10\/09 10:24/);assert.doesNotMatch(value,/GMT|Fri/);
+});
 console.log(JSON.stringify({passed:results.filter(r=>r.passed).length,total:results.length,results},null,2));
 if(results.some(r=>!r.passed))process.exitCode=1;
