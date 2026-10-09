@@ -11,8 +11,18 @@ function doPost(e) {
       validateAssignment_(assignment);
 
       const spreadsheet = getOrCreateSpreadsheetLocked_();
-      const result = upsertInCampusAssignmentLocked_(assignment, spreadsheet);
-      if (result.changed) refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, 'extension-incampus-upsert');
+      const inCampusUnifiedSheet = getOrCreateInCampusUnifiedSheetLocked_(spreadsheet);
+      const inCampusExtractSheet = createInCampusExtractSheetAdapter_(inCampusUnifiedSheet);
+      const batchResult = upsertInCampusAssignmentsLocked_([assignment], spreadsheet, inCampusExtractSheet);
+      const result = batchResult.results[0];
+      if (result.changed) {
+        const storage = getNotificationStorageForExtensionLocked_(spreadsheet, inCampusUnifiedSheet);
+        refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, 'extension-incampus-upsert', {
+          sheetsBySource: storage.sheetsBySource,
+          preloadedRowsBySource: {inCampus: inCampusExtractSheet.getUnifiedRowsSnapshot().slice(1)},
+          reuseUnchangedDisplaySheets: true
+        });
+      }
 
       return jsonResponse_({
         ok: true,
@@ -42,15 +52,19 @@ function doPost(e) {
       const upsertMs = Date.now() - upsertStartedAt;
       let storageSetupMs = 0;
       let displayBuildMs = 0;
+      let storageReused = false;
       if (result.changedCount > 0) {
         const storageSetupStartedAt = Date.now();
-        const sheetsBySource = ensureNotificationStorageLocked_(spreadsheet, {inCampusSheet: inCampusUnifiedSheet});
+        const storage = getNotificationStorageForExtensionLocked_(spreadsheet, inCampusUnifiedSheet);
+        const sheetsBySource = storage.sheetsBySource;
+        storageReused = storage.reused;
         storageSetupMs = Date.now() - storageSetupStartedAt;
         const preloadedInCampusRows = inCampusExtractSheet.getUnifiedRowsSnapshot().slice(1);
         const displayBuildStartedAt = Date.now();
         refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, 'extension-incampus-batch-upsert', {
           sheetsBySource,
-          preloadedRowsBySource: {inCampus: preloadedInCampusRows}
+          preloadedRowsBySource: {inCampus: preloadedInCampusRows},
+          reuseUnchangedDisplaySheets: true
         });
         displayBuildMs = Date.now() - displayBuildStartedAt;
       }
@@ -60,6 +74,7 @@ function doPost(e) {
         inCampusSheetSetupMs,
         upsertMs,
         storageSetupMs,
+        storageReused,
         displayBuildMs,
         totalBeforeResponseMs: Date.now() - requestStartedAt,
         assignmentCount: assignments.length,

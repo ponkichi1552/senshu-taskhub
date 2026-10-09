@@ -180,6 +180,7 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   const referenceNow = new Date();
   const ss = spreadsheet || getOrCreateSpreadsheetLocked_();
   const props = PropertiesService.getUserProperties();
+  const properties = props.getProperties();
   const validateDisplaySheetSchemas = shouldValidateNotificationDisplaySheets_(ss, props);
   // Keep an interrupted writer's marker until this rebuild commits. That older
   // execution may have stopped partway through replacing the prepared sheets.
@@ -244,28 +245,28 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   // source scan and projection. Readers pause only while these three prepared
   // sheets are actually being replaced.
   props.setProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY, String(Date.now()));
-  const taskSheet = getOrCreateDisplaySheetLocked_(ss, TASK_DISPLAY_SHEET_NAME, TASK_DISPLAY_HEADERS, !validateDisplaySheetSchemas);
-  const completedTaskSheet = getOrCreateDisplaySheetLocked_(ss, COMPLETED_TASK_DISPLAY_SHEET_NAME, TASK_DISPLAY_HEADERS, !validateDisplaySheetSchemas);
-  const noticeSheet = getOrCreateDisplaySheetLocked_(ss, UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME, UNIVERSITY_NOTICE_DISPLAY_HEADERS, !validateDisplaySheetSchemas);
+  const writePlan = prepareDisplaySheetWritePlans_(ss, [
+    {name: TASK_DISPLAY_SHEET_NAME, headers: TASK_DISPLAY_HEADERS, rows: taskRows, timingKey: 'taskSheetWriteMs'},
+    {name: COMPLETED_TASK_DISPLAY_SHEET_NAME, headers: TASK_DISPLAY_HEADERS, rows: completedTaskRows, timingKey: 'completedTaskSheetWriteMs'},
+    {name: UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME, headers: UNIVERSITY_NOTICE_DISPLAY_HEADERS, rows: noticeRows, timingKey: 'noticeSheetWriteMs'}
+  ], properties, validateDisplaySheetSchemas, options.reuseUnchangedDisplaySheets,
+  options.forceWriteDisplaySheetNames);
+  const preparedSnapshotWrite = prepareCompleteDisplaySnapshotWriteLocked_(ss, props, properties, !validateDisplaySheetSchemas);
   if (validateDisplaySheetSchemas) {
     props.setProperty(NOTIFICATION_DISPLAY_SCHEMA_CACHE_PROPERTY,
       `${Date.now()}|${getNotificationDisplaySchemaCacheKey_(ss)}`);
   }
   recordPhase('displaySheetPrepareMs');
 
-  let phaseWriteStartedAt = Date.now();
-  replaceDisplaySheetRows_(taskSheet, TASK_DISPLAY_HEADERS, taskRows);
-  phaseMs.taskSheetWriteMs = Date.now() - phaseWriteStartedAt;
-  phaseWriteStartedAt = Date.now();
-  replaceDisplaySheetRows_(completedTaskSheet, TASK_DISPLAY_HEADERS, completedTaskRows);
-  phaseMs.completedTaskSheetWriteMs = Date.now() - phaseWriteStartedAt;
-  phaseWriteStartedAt = Date.now();
-  replaceDisplaySheetRows_(noticeSheet, UNIVERSITY_NOTICE_DISPLAY_HEADERS, noticeRows);
-  phaseMs.noticeSheetWriteMs = Date.now() - phaseWriteStartedAt;
+  writePlan.plans.forEach(plan => {
+    const phaseWriteStartedAt = Date.now();
+    if (!plan.unchanged) replaceDisplaySheetRows_(plan.sheet, plan.headers, plan.rows, plan.oldCount);
+    phaseMs[plan.timingKey] = Date.now() - phaseWriteStartedAt;
+  });
   phaseStartedAt = Date.now();
   const displayGeneration = String(Date.now()) + ':' + Utilities.getUuid();
   const completeSnapshot = stageCompleteDisplaySnapshotLocked_(ss, activeTasks, completedTasks,
-    mergedNotices, displayGeneration, String(props.getProperty(TASK_DISPLAY_STATUS_GENERATION_PROPERTY) || '0'));
+    mergedNotices, displayGeneration, String(properties[TASK_DISPLAY_STATUS_GENERATION_PROPERTY] || '0'), preparedSnapshotWrite);
   recordPhase('completeSnapshotStageMs');
   SpreadsheetApp.flush();
   recordPhase('flushMs');
@@ -281,6 +282,7 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   writeUniversityFirstPaintData_(mergedNotices, firstPaintProperties, ss.getId());
   phaseMs.firstPaintDataWriteMs = Date.now() - firstPaintStartedAt;
   publishCompleteDisplaySnapshotLocked_(completeSnapshot);
+  props.setProperty(DISPLAY_WRITE_FINGERPRINTS_PROPERTY, JSON.stringify(writePlan.fingerprints));
   props.deleteProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY);
   recordPhase('displayMetadataCommitMs');
   const displayCacheWarmStartedAt = Date.now();
@@ -303,6 +305,7 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
     activeTaskCount: taskRows.length,
     completedTaskCount: completedTaskRows.length,
     noticeCount: noticeRows.length,
+    skippedDisplaySheetWrites: writePlan.plans.filter(plan => plan.unchanged).map(plan => plan.name),
     taskDisplayCacheEntryCount: displayCacheEntryCount
   };
   Logger.log('TASKHUB_DISPLAY_DATA_BUILD ' + JSON.stringify({
@@ -483,11 +486,12 @@ function getOrCreateDisplaySheetLocked_(spreadsheet, name, headers, skipSchemaVa
   return sheet;
 }
 
-function replaceDisplaySheetRows_(sheet, headers, rows) {
+function replaceDisplaySheetRows_(sheet, headers, rows, previousRowCount) {
   if (!rows.every(row => Array.isArray(row) && row.length === headers.length)) {
     throw new Error(`表示データシート「${sheet.getName()}」の保存列数が見出しと一致しません。`);
   }
-  const oldCount = Math.max(0, sheet.getLastRow() - 1);
+  const oldCount = Number.isSafeInteger(previousRowCount) && previousRowCount >= 0
+    ? previousRowCount : Math.max(0, sheet.getLastRow() - 1);
   if (rows.length) {
     sheet.getRange(2, 1, rows.length, headers.length).setValues(rows.map(row => toSafeSpreadsheetRow_(row)));
   }

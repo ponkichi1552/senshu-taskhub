@@ -91,12 +91,21 @@ function readCompleteDisplaySnapshot_(properties, propertiesOnly) {
   }
 }
 
-/** Caller holds the user lock; publishing the manifest is a separate final step. */
-function stageCompleteDisplaySnapshotLocked_(spreadsheet, active, completed, notices, displayGeneration, statusGeneration) {
-  const props = PropertiesService.getUserProperties();
-  const values = props.getProperties();
-  const previous = getCompleteDisplayManifest_(Object.assign({}, values, {[TEST_CASE_MODE_PROPERTY]: 'false'}));
+function prepareCompleteDisplaySnapshotWriteLocked_(spreadsheet, props, values, skipSchemaValidation) {
+  const properties = props || PropertiesService.getUserProperties();
+  const savedValues = values || properties.getProperties();
+  const previous = getCompleteDisplayManifest_(Object.assign({}, savedValues, {[TEST_CASE_MODE_PROPERTY]: 'false'}));
   const slot = previous && previous.slot === 'a' ? 'b' : 'a';
+  const sheet = getOrCreateDisplaySheetLocked_(spreadsheet, completeDisplaySnapshotSheetName_(slot),
+    ['完成済み一覧（圧縮）'], skipSchemaValidation === true);
+  return {props: properties, values: savedValues, slot, sheet,
+    oldCount: Math.max(0, sheet.getLastRow() - 1)};
+}
+
+/** Caller holds the user lock; publishing the manifest is a separate final step. */
+function stageCompleteDisplaySnapshotLocked_(spreadsheet, active, completed, notices, displayGeneration, statusGeneration, preparedWrite) {
+  const prepared = preparedWrite || prepareCompleteDisplaySnapshotWriteLocked_(spreadsheet);
+  const {props, values, slot, sheet, oldCount} = prepared;
   const id = String(Date.now()) + ':' + Utilities.getUuid();
   const bundle = {id,
     active: active.map(compactCompleteTaskListItem_),
@@ -111,8 +120,7 @@ function stageCompleteDisplaySnapshotLocked_(spreadsheet, active, completed, not
   for (let start = 0; start < encoded.length; start += COMPLETE_DISPLAY_SHEET_CHUNK_LENGTH) {
     sheetRows.push(['chunk:' + encoded.slice(start, start + COMPLETE_DISPLAY_SHEET_CHUNK_LENGTH)]);
   }
-  const sheet = getOrCreateDisplaySheetLocked_(spreadsheet, completeDisplaySnapshotSheetName_(slot), ['完成済み一覧（圧縮）']);
-  replaceDisplaySheetRows_(sheet, ['完成済み一覧（圧縮）'], sheetRows);
+  replaceDisplaySheetRows_(sheet, ['完成済み一覧（圧縮）'], sheetRows, oldCount);
 
   const prefix = COMPLETE_DISPLAY_CHUNK_PREFIX + slot + '_';
   const remainingBytes = Object.keys(values).reduce((total, key) => key.startsWith(prefix)

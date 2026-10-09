@@ -1882,5 +1882,109 @@ check('Many completed tasks do not disable a small active Home initial payload',
   const initial=e.c.getCompleteInitialDisplayPayloadForWeb_('home',e.state.props);
   assert.equal(initial.payload.items.length,4);assert.equal(initial.universityPayload.items.length,5);
 });
+check('Extension storage reuses initialized personal sheets, including during test mode, and repairs missing storage',()=>{
+  const e=firstPaintEnvironment(true),inCampus=e.state.sheets['inCampus通知'];
+  const ensure=e.c.ensureNotificationStorageLocked_;
+  e.c.ensureNotificationStorageLocked_=()=>{throw new Error('initialized storage must not be prepared again');};
+  e.state.props.TASKHUB_TEST_CASE_MODE='true';
+  const reused=e.c.getNotificationStorageForExtensionLocked_(e.ss,inCampus);
+  assert.equal(reused.reused,true);assert.equal(reused.sheetsBySource.inCampus,inCampus);
+  assert.equal(reused.sheetsBySource['Google Classroom'],e.state.sheets['補足通知']);
+  e.c.ensureNotificationStorageLocked_=ensure;
+  delete e.state.sheets['提出状況'];
+  const repaired=e.c.getNotificationStorageForExtensionLocked_(e.ss,inCampus);
+  assert.equal(repaired.reused,false);assert.ok(e.state.sheets['提出状況']);
+  e.state.props.TASKHUB_USER_STORAGE_INITIALIZATION_LAST_RUN_AT='invalid';
+  assert.equal(e.c.getNotificationStorageForExtensionLocked_(e.ss,inCampus).reused,false);
+});
+check('Changed task bodies update the prepared task sheet and cold full list while identical notices and completed tasks are not rewritten',()=>{
+  for(const cached of [false,true]) {
+    const e=firstPaintEnvironment(true);
+    const assignment={source:'inCampus',type:'assignment',title:'仮想課題0',body:'以前の仮想詳細',
+      courseName:'仮想情報演習',weekdayPeriod:'火曜5限',dueAt:'2099/10/25 23:59',
+      pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/virtual-changed-body',assignmentKey:'virtual-changed-body'};
+    e.c.upsertInCampusAssignment_(assignment);
+    e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+    if(!cached)e.state.cache={};
+    const task=e.state.sheets['課題表示データ'],completed=e.state.sheets['完了課題表示データ'],notices=e.state.sheets['大学通知表示データ'];
+    const writes=[task.writes,completed.writes,notices.writes];
+    e.c.upsertInCampusAssignment_({...assignment,body:'保存された新しい仮想本文'});
+    const result=e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseUnchangedDisplaySheets:true});
+    assert.deepEqual(Array.from(result.skippedDisplaySheetWrites),['完了課題表示データ','大学通知表示データ']);
+    assert.equal(task.writes,writes[0]+1);assert.equal(completed.writes,writes[1]);assert.equal(notices.writes,writes[2]);
+    const payload=e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true);
+    assert.equal(payload.items.length,4);
+    assert.match(e.c.getTaskNotificationBodyForWeb(payload.items[0].messageId,'未確認',payload.dataGeneration).body,/保存された新しい仮想本文/);
+    assert.equal(e.c.getUniversityNoticePayloadForWeb(false,null,false,true).items.length,5);
+    assert.equal(e.state.gmailSearches,0);
+  }
+});
+check('Unchanged extension projections skip all prepared-sheet rewrites; changed notices and stale row counts still write',()=>{
+  const e=firstPaintEnvironment(true);
+  const result=e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseUnchangedDisplaySheets:true});
+  assert.equal(result.skippedDisplaySheetWrites.length,3);
+  e.state.sheets['大学通知表示データ'].rows.push(Array(14).fill('stale-derived-value'));
+  const repaired=e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseUnchangedDisplaySheets:true});
+  assert.ok(!repaired.skippedDisplaySheetWrites.includes('大学通知表示データ'));
+  assert.equal(e.state.sheets['大学通知表示データ'].getLastRow(),6);
+  e.state.sheets['inCampus通知'].rows[5][11]+='\n新しいお知らせの本文';
+  const noticeChanged=e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseUnchangedDisplaySheets:true});
+  assert.ok(!noticeChanged.skippedDisplaySheetWrites.includes('大学通知表示データ'));
+  const fields=Array.from(vm.runInContext('UNIVERSITY_NOTICE_DISPLAY_FIELDS',e.c));
+  assert.match(e.state.sheets['大学通知表示データ'].rows[1][fields.indexOf('body')],/新しいお知らせの本文/);
+});
+check('Display and inactive snapshot row counts are collected before any prepared-data writes',()=>{
+  const e=firstPaintEnvironment(true);
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  let writing=false;
+  for(const sheet of Object.values(e.state.sheets)) {
+    if(!['課題表示データ','完了課題表示データ','大学通知表示データ','表示一覧保存_A','表示一覧保存_B'].includes(sheet.name))continue;
+    const last=sheet.getLastRow.bind(sheet);
+    sheet.getLastRow=()=>{assert.equal(writing,false,'no read/write alternation for '+sheet.name);return last();};
+  }
+  const replace=e.c.replaceDisplaySheetRows_;
+  e.c.replaceDisplaySheetRows_=(...args)=>{writing=true;return replace(...args);};
+  assert.equal(e.c.rebuildNotificationDisplayDataLocked_(e.ss).activeTaskCount,4);
+});
+check('Status changes, expired schema checks and interrupted display writes prevent fingerprint reuse',()=>{
+  for(const reason of ['status','schema','interrupted']) {
+    const e=firstPaintEnvironment(true);
+    if(reason==='status')e.state.props.TASKHUB_TASK_DISPLAY_STATUS_GENERATION='new-status';
+    if(reason==='schema')delete e.state.props.TASKHUB_NOTIFICATION_DISPLAY_SCHEMA_CACHE;
+    if(reason==='interrupted')e.state.props.TASKHUB_NOTIFICATION_DISPLAY_DATA_BUILDING=String(Date.now()-6*60*1000);
+    const result=e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseUnchangedDisplaySheets:true});
+    assert.equal(result.skippedDisplaySheetWrites.length,0,reason+' cannot reuse possibly stale display rows');
+    assert.equal(e.state.props.TASKHUB_NOTIFICATION_DISPLAY_DATA_BUILDING,undefined);
+  }
+});
+check('A changed extension projection preserves the prior published list on write failure and recovers on the next save',()=>{
+  const e=firstPaintEnvironment(true),pointer=e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT;
+  const fingerprints=e.state.props.TASKHUB_DISPLAY_WRITE_FINGERPRINTS;
+  e.c.upsertInCampusAssignment_({source:'inCampus',type:'assignment',title:'仮想課題0',body:'更新された仮想詳細',
+    courseName:'仮想情報演習',weekdayPeriod:'火曜5限',dueAt:'2099/10/25 23:59',
+    pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/virtual-recovery',assignmentKey:'virtual-recovery'});
+  const replace=e.c.replaceDisplaySheetRows_;
+  e.c.replaceDisplaySheetRows_=()=>{throw new Error('simulated write failure');};
+  const failed=e.c.refreshNotificationDisplayDataAfterSyncLocked_(e.ss,'extension',{reuseUnchangedDisplaySheets:true});
+  assert.equal(failed.ok,false);assert.equal(e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT,pointer);
+  assert.equal(e.state.props.TASKHUB_DISPLAY_WRITE_FINGERPRINTS,fingerprints);
+  assert.equal(e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true).items.length,4);
+  e.c.replaceDisplaySheetRows_=replace;
+  const recovered=e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseUnchangedDisplaySheets:true});
+  assert.equal(recovered.skippedDisplaySheetWrites.length,0);
+  assert.notEqual(e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT,pointer);
+});
+check('The changed-task measurement uses the real display write path without changing source or test data or invoking Gmail/API',()=>{
+  const e=firstPaintEnvironment(true);prepareTestSpreadsheet(e);e.state.props.TASKHUB_TEST_CASE_MODE='true';
+  const sourceBefore=JSON.stringify(e.state.sheets['inCampus通知'].rows);
+  const testBefore=JSON.stringify(Object.fromEntries(Object.entries(e.state.testSheets).map(([key,sheet])=>[key,sheet.rows])));
+  const result=e.c.taskhubMeasureInCampusDisplayRefresh();
+  assert.equal(result.activeTaskCount,4);assert.equal(result.noticeCount,5);
+  assert.deepEqual(Array.from(result.skippedDisplaySheetWrites),['完了課題表示データ','大学通知表示データ']);
+  assert.equal(JSON.stringify(e.state.sheets['inCampus通知'].rows),sourceBefore);
+  assert.equal(JSON.stringify(Object.fromEntries(Object.entries(e.state.testSheets).map(([key,sheet])=>[key,sheet.rows]))),testBefore);
+  assert.equal(e.state.gmailSearches,0);
+  assert.ok(e.state.logs.some(message=>message.includes('"sourceDataChanged":false')&&message.includes('"forcedTaskDisplayWrite":true')));
+});
 console.log(JSON.stringify({passed:results.filter(r=>r.passed).length,total:results.length,results},null,2));
 if(results.some(r=>!r.passed))process.exitCode=1;
