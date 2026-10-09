@@ -581,7 +581,9 @@ sendButton.addEventListener("click", async () => {
       return;
     }
 
-    setStatus(response.result?.updated ? "Hubへ更新しました。" : "Hubへ送信しました。");
+    setStatus(response.result?.unchanged
+      ? "保存済みデータと同じ内容でした。変更はありません。"
+      : response.result?.updated ? "Hubへ更新しました。" : "Hubへ送信しました。");
   } catch (error) {
     setStatus(normalizeText(error?.message || error), true);
   }

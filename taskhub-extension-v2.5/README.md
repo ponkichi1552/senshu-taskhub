@@ -1,4 +1,4 @@
-# 課題通知Hub連携 拡張機能 v2.5.14
+# 課題通知Hub連携 拡張機能 v2.5.15
 
 専修大学のinCampusから課題・お知らせ・提出通知を抽出し、課題通知Hubへ送るChrome拡張機能です。Google Classroomのページは読み取りません。Classroomの課題・提出状況は、課題通知Hub本体のGmail同期・Classroom API同期が扱います。
 
