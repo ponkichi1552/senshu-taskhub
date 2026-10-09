@@ -4,16 +4,12 @@ const sendButton = document.getElementById("send");
 const clearButton = document.getElementById("clear");
 const syncNowButton = document.getElementById("syncNow");
 const reloadStatusButton = document.getElementById("reloadStatus");
-const classroomSyncButton = document.getElementById("classroomSync");
-const classroomDueSyncButton = document.getElementById("classroomDueSync");
 const incampusDebugButton = document.getElementById("incampusDebug");
-const classroomDebugButton = document.getElementById("classroomDebug");
 const checkSetupButton = document.getElementById("checkSetup");
 const webAppUrlInput = document.getElementById("webAppUrl");
 const apiTokenInput = document.getElementById("apiToken");
 const toggleApiTokenButton = document.getElementById("toggleApiToken");
 const autoSyncEnabledInput = document.getElementById("autoSyncEnabled");
-const classroomAutoSyncEnabledInput = document.getElementById("classroomAutoSyncEnabled");
 const syncLimitSelect = document.getElementById("syncLimit");
 const previewOnlyInput = document.getElementById("previewOnly");
 const statusEl = document.getElementById("status");
@@ -21,7 +17,6 @@ const syncSummaryEl = document.getElementById("syncSummary");
 const outputEl = document.getElementById("output");
 
 const INCAMPUS_HOST = "ic.ss.senshu-u.ac.jp";
-const CLASSROOM_HOST = "classroom.google.com";
 const ALLOWED_HUB_WEB_APP_HOSTS = new Set([
   "script.google.com",
   "script.googleusercontent.com"
@@ -29,14 +24,14 @@ const ALLOWED_HUB_WEB_APP_HOSTS = new Set([
 const ALLOWED_SYNC_LIMITS = new Set([10, 25, 50]);
 const DEFAULT_SYNC_LIMIT = 25;
 const HUB_API_TOKEN_MIN_LENGTH = 48;
-const CLASSROOM_AUTO_SYNC_STORAGE_KEYS = [
-  "lastClassroomCompletionAutoSyncAt",
-  "lastClassroomDueTimeAutoSyncAt",
-  "lastClassroomHomeAutoSyncAt"
-];
 
 let latestJson = "";
 let latestAssignment = null;
+let settingsReady = Promise.resolve();
+
+function syncTimestampReset() {
+  return {lastInCampusAutoSyncAt: 0, lastInCampusSyncAttemptAt: 0, lastInCampusPreviewSyncAt: 0};
+}
 
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
@@ -113,18 +108,6 @@ function isInCampusTab(tab) {
   }
 }
 
-function isClassroomTab(tab) {
-  if (!tab?.url) {
-    return false;
-  }
-
-  try {
-    return new URL(tab.url).hostname === CLASSROOM_HOST;
-  } catch (_) {
-    return false;
-  }
-}
-
 function isMissingContentScriptError(error) {
   const message = String(error?.message || error || "");
 
@@ -144,11 +127,10 @@ async function getActiveTab() {
 }
 
 async function restoreSettings() {
-  const { webAppUrl, apiToken, autoSyncEnabled, classroomAutoSyncEnabled, syncLimit, previewOnly } = await chrome.storage.local.get([
+  const { webAppUrl, apiToken, autoSyncEnabled, syncLimit, previewOnly } = await chrome.storage.local.get([
     "webAppUrl",
     "apiToken",
     "autoSyncEnabled",
-    "classroomAutoSyncEnabled",
     "syncLimit",
     "previewOnly"
   ]);
@@ -156,7 +138,6 @@ async function restoreSettings() {
   webAppUrlInput.value = webAppUrl || "";
   apiTokenInput.value = apiToken || "";
   autoSyncEnabledInput.checked = autoSyncEnabled !== false;
-  classroomAutoSyncEnabledInput.checked = classroomAutoSyncEnabled !== false;
   syncLimitSelect.value = String(normalizeSyncLimit(syncLimit));
   previewOnlyInput.checked = Boolean(previewOnly);
 }
@@ -170,10 +151,7 @@ async function saveWebAppUrl(options = {}) {
   const updates = { webAppUrl };
 
   if (String(previousWebAppUrl || "") !== webAppUrl) {
-    updates.lastInCampusAutoSyncAt = 0;
-    CLASSROOM_AUTO_SYNC_STORAGE_KEYS.forEach((key) => {
-      updates[key] = 0;
-    });
+    Object.assign(updates, syncTimestampReset());
   }
 
   await chrome.storage.local.set(updates);
@@ -194,10 +172,7 @@ async function saveApiToken(options = {}) {
   const updates = { apiToken };
 
   if (String(previousApiToken || "") !== apiToken) {
-    updates.lastInCampusAutoSyncAt = 0;
-    CLASSROOM_AUTO_SYNC_STORAGE_KEYS.forEach((key) => {
-      updates[key] = 0;
-    });
+    Object.assign(updates, syncTimestampReset());
   }
 
   await chrome.storage.local.set(updates);
@@ -222,29 +197,12 @@ async function saveHubConnectionSettings(options = {}) {
 async function saveAutoSyncEnabled() {
   await chrome.storage.local.set({
     autoSyncEnabled: autoSyncEnabledInput.checked,
-    lastInCampusAutoSyncAt: 0
+    ...syncTimestampReset()
   });
 
   setStatus(autoSyncEnabledInput.checked
     ? "inCampus自動同期をONにしました。"
     : "inCampus自動同期をOFFにしました。手動同期は使えます。"
-  );
-}
-
-async function saveClassroomAutoSyncEnabled() {
-  const updates = {
-    classroomAutoSyncEnabled: classroomAutoSyncEnabledInput.checked
-  };
-
-  CLASSROOM_AUTO_SYNC_STORAGE_KEYS.forEach((key) => {
-    updates[key] = 0;
-  });
-
-  await chrome.storage.local.set(updates);
-
-  setStatus(classroomAutoSyncEnabledInput.checked
-    ? "Classroom自動同期をONにしました。"
-    : "Classroom自動同期をOFFにしました。手動同期は使えます。"
   );
 }
 
@@ -254,7 +212,7 @@ async function saveSyncLimit() {
   syncLimitSelect.value = String(syncLimit);
   await chrome.storage.local.set({
     syncLimit,
-    lastInCampusAutoSyncAt: 0
+    ...syncTimestampReset()
   });
   setStatus(`同期対象件数を${syncLimit}件にしました。`);
 }
@@ -262,8 +220,7 @@ async function saveSyncLimit() {
 async function savePreviewOnly() {
   await chrome.storage.local.set({
     previewOnly: previewOnlyInput.checked,
-    lastInCampusAutoSyncAt: 0,
-    ...Object.fromEntries(CLASSROOM_AUTO_SYNC_STORAGE_KEYS.map((key) => [key, 0]))
+    ...syncTimestampReset(),
   });
   updateActionButtons();
 
@@ -311,33 +268,13 @@ function getSyncStatusBadge(status) {
 function buildSyncSummaryHtml(status) {
   const badge = getSyncStatusBadge(status);
   const errorCount = Array.isArray(status?.errors) ? status.errors.length : 0;
-  const stats = status?.mode === "classroomCompletion"
-    ? [
-      ["検出", status?.foundCount || 0],
-      [status?.dryRun ? "確認" : "完了", status?.dryRun ? status?.previewCount || 0 : status?.matchedCount || 0],
-      ["未一致", status?.unmatchedCount || 0],
-      ["失敗", errorCount]
-    ]
-    : status?.mode === "classroomHome"
-      ? [
-        ["検出", status?.foundCount || 0],
-        ["期限", status?.dueTimeCount || 0],
-        ["更新", status?.matchedCount || 0],
-        ["未一致", status?.unmatchedCount || 0]
-      ]
-    : status?.mode === "classroomDueTime"
-      ? [
-        ["検出", status?.foundCount || 0],
-        ["時刻", status?.dueTimeCount || 0],
-        [status?.dryRun ? "確認" : "更新", status?.dryRun ? status?.previewCount || 0 : status?.matchedCount || 0],
-        ["未一致", status?.unmatchedCount || 0]
-      ]
-    : [
-      ["検出", status?.foundCount || 0],
-      [status?.dryRun ? "確認" : "新規", status?.dryRun ? status?.previewCount || 0 : status?.newCount || 0],
-      ["更新", status?.updatedCount || 0],
-      ["失敗", errorCount]
-    ];
+  const stats = [
+    ["検出", status?.foundCount || 0],
+    [status?.dryRun ? "確認" : "新規", status?.dryRun ? status?.previewCount || 0 : status?.newCount || 0],
+    ["更新", status?.updatedCount || 0],
+    ["変更なし", status?.unchangedCount || 0],
+    ["失敗", errorCount]
+  ];
 
   return `
     <div class="summary-head">
@@ -356,111 +293,51 @@ function buildSyncSummaryHtml(status) {
 }
 
 function buildSyncDetailText(status) {
-  if (!status) {
-    return "まだ同期結果はありません。";
-  }
+  if (!status) return "まだ同期結果はありません。";
 
   const lines = [];
   const startedAt = formatSyncDateTime(status.startedAt);
   const finishedAt = formatSyncDateTime(status.finishedAt || status.savedAt);
-
-  if (status.skipped) {
-    lines.push(status.reason || "同期をスキップしました。");
-  } else if (status.ok) {
-    lines.push(status.dryRun
-      ? "プレビューが完了しました。Hubへは送信していません。"
-      : "同期は正常に完了しました。"
-    );
-  } else {
-    lines.push(status.error || "同期結果に確認が必要です。");
+  if (status.skipped) lines.push(status.reason || "同期をスキップしました。");
+  else if (status.ok) lines.push(status.dryRun ? "プレビューが完了しました。Hubへは送信していません。" : "同期は正常に完了しました。");
+  else lines.push(status.error || "同期結果に確認が必要です。");
+  if (status.limit) lines.push(`同期対象上限: ${status.limit}件`);
+  if (status.skippedByLimitCount) lines.push(`対象は全${status.eligibleCount}件です。上限により残り${status.skippedByLimitCount}件は未取得です。同期対象件数を増やしてください。`);
+  lines.push(`課題: ${status.assignmentCount || 0}件 / お知らせ: ${status.announcementCount || 0}件 / 提出: ${status.submissionRecordCount || 0}件`);
+  lines.push(`新規: ${status.newCount || 0}件 / 更新: ${status.updatedCount || 0}件 / 変更なし: ${status.unchangedCount || 0}件 / 確認: ${status.previewCount || 0}件 / 送信: ${status.sentCount || 0}件`);
+  if (startedAt) lines.push(`開始: ${startedAt}`);
+  if (finishedAt) lines.push(`終了: ${finishedAt}`);
+  const formatDuration = value => Number(value) < 1000
+    ? `${Math.round(Number(value))}ms`
+    : `${(Number(value) / 1000).toFixed(1)}秒`;
+  if (Number.isFinite(Number(status.elapsedMs))) {
+    lines.push(`処理時間: ${formatDuration(status.elapsedMs)}`);
+    const phases = [
+      ["一覧取得", status.updateListFetchMs],
+      ["詳細取得・解析", status.detailExtractionMs],
+      ["Hub保存", status.hubSaveMs]
+    ].filter(([, value]) => Number.isFinite(Number(value)));
+    if (phases.length) lines.push(`時間内訳: ${phases.map(([label, value]) => `${label} ${formatDuration(value)}`).join(" / ")}`);
   }
+  if (Number(status.detailPageCount) > 0) lines.push(`課題詳細ページ取得: ${Number(status.detailPageCount)}件`);
 
-  if (status.limit) {
-    lines.push(`同期対象上限: ${status.limit}件`);
+  if (Array.isArray(status.errors) && status.errors.length) {
+    lines.push("", "エラー:");
+    status.errors.slice(0, 8).forEach((error, index) => lines.push(`${index + 1}. ${error}`));
+    if (status.errors.length > 8) lines.push(`...ほか${status.errors.length - 8}件`);
   }
-
-  if (status.expandedSectionCount) {
-    lines.push(`展開した見出し: ${status.expandedSectionCount}件`);
-  }
-
-  if (status.mode === "classroomCompletion") {
-    lines.push(`Classroom完了候補: ${status.completedCount || 0}件`);
-    lines.push(`反映: ${status.matchedCount || 0}件 / 新規: ${status.createdCount || 0}件 / 未一致: ${status.unmatchedCount || 0}件 / 確認: ${status.previewCount || 0}件 / 送信: ${status.sentCount || 0}件`);
-  } else if (status.mode === "classroomHome") {
-    lines.push(`Classroomホーム自動同期: 検出 ${status.foundCount || 0}件`);
-    lines.push(`期限時刻あり: ${status.dueTimeCount || 0}件 / 完了候補: ${status.completedCount || 0}件`);
-    lines.push(`反映: ${status.matchedCount || 0}件 / 新規: ${status.createdCount || 0}件 / 未一致: ${status.unmatchedCount || 0}件 / 送信: ${status.sentCount || 0}件`);
-  } else if (status.mode === "classroomDueTime") {
-    lines.push(`Classroom期限候補: ${status.foundCount || 0}件 / 時刻あり: ${status.dueTimeCount || 0}件`);
-    lines.push(`反映: ${status.matchedCount || 0}件 / 新規: ${status.createdCount || 0}件 / 未一致: ${status.unmatchedCount || 0}件 / 確認: ${status.previewCount || 0}件 / 送信: ${status.sentCount || 0}件`);
-  } else {
-    lines.push(`課題: ${status.assignmentCount || 0}件 / お知らせ: ${status.announcementCount || 0}件 / 提出: ${status.submissionRecordCount || 0}件`);
-    lines.push(`新規: ${status.newCount || 0}件 / 更新: ${status.updatedCount || 0}件 / 確認: ${status.previewCount || 0}件 / 送信: ${status.sentCount || 0}件`);
-  }
-
-  if (startedAt) {
-    lines.push(`開始: ${startedAt}`);
-  }
-
-  if (finishedAt) {
-    lines.push(`終了: ${finishedAt}`);
-  }
-
-  if (Array.isArray(status.errors) && status.errors.length > 0) {
-    lines.push("");
-    lines.push("エラー:");
-    status.errors.slice(0, 8).forEach((error, index) => {
-      lines.push(`${index + 1}. ${error}`);
-    });
-
-    if (status.errors.length > 8) {
-      lines.push(`...ほか${status.errors.length - 8}件`);
-    }
-  }
-
-  if (Array.isArray(status.items) && status.items.length > 0) {
-    const actionLabels = {
-      created: "新規",
-      updated: "更新",
-      preview: "確認",
-      completed: "完了",
-      dueTime: "期限",
-      unmatched: "未一致",
-      failed: "失敗"
-    };
-    const formatItemLine = (item, index) => {
-      const actionLabel = actionLabels[item.action] || item.action || "不明";
-      const typeLabel = item.type === "submissionRecord"
-        ? "提出"
-        : item.type === "classroomCompletion"
-          ? "Classroom"
-          : item.type === "classroomDueTime"
-            ? "期限"
-            : item.type === "announcement" ? "お知らせ" : "課題";
-      const courseName = item.courseName ? `${item.courseName} / ` : "";
-      const title = item.title || item.pageUrl || "タイトル未取得";
-      const suffix = item.dueText || item.dueTime ? ` (${item.dueText || item.dueTime})` : "";
-      const reason = item.reason ? ` / ${item.reason}` : "";
-
-      return `${index + 1}. [${actionLabel}/${typeLabel}] ${courseName}${title}${suffix}${reason}`;
-    };
-    const unmatchedItems = status.items.filter((item) => item.action === "unmatched");
-
-    if (unmatchedItems.length > 0) {
-      lines.push("");
-      lines.push(`未一致 (${unmatchedItems.length}件):`);
-      unmatchedItems.forEach((item, index) => {
-        lines.push(formatItemLine(item, index));
-      });
-    }
-
-    lines.push("");
-    lines.push(`内訳 (${status.items.length}件):`);
+  if (Array.isArray(status.items) && status.items.length) {
+    const actionLabels = {created: "新規", updated: "更新", unchanged: "変更なし", preview: "確認", failed: "失敗"};
+    lines.push("", `内訳 (${status.items.length}件):`);
     status.items.forEach((item, index) => {
-      lines.push(formatItemLine(item, index));
+      const action = actionLabels[item.action] || item.action || "不明";
+      const type = item.type === "submissionRecord" ? "提出" : item.type === "announcement" ? "お知らせ" : "課題";
+      const course = item.courseName ? `${item.courseName} / ` : "";
+      const title = item.title || item.pageUrl || "タイトル未取得";
+      const reason = item.reason ? ` / ${item.reason}` : "";
+      lines.push(`${index + 1}. [${action}/${type}] ${course}${title}${reason}`);
     });
   }
-
   return lines.join("\n");
 }
 
@@ -468,14 +345,6 @@ function renderSyncStatus(status) {
   syncSummaryEl.innerHTML = buildSyncSummaryHtml(status || {});
   syncSummaryEl.className = "sync-summary visible";
   outputEl.textContent = buildSyncDetailText(status);
-}
-
-function renderClassroomDebugPayload(payload) {
-  clearSyncSummary();
-  latestAssignment = null;
-  latestJson = JSON.stringify(payload || {}, null, 2);
-  outputEl.textContent = latestJson;
-  updateActionButtons();
 }
 
 function renderInCampusDebugPayload(payload) {
@@ -509,6 +378,7 @@ function renderSetupCheck(items) {
 }
 
 async function runSetupCheck() {
+  await settingsReady;
   setStatus("設定を確認中...");
   const items = [];
   const rawUrl = webAppUrlInput.value.trim();
@@ -561,33 +431,19 @@ async function runSetupCheck() {
   try {
     const tab = await getActiveTab();
     const inCampus = isInCampusTab(tab);
-    const classroom = isClassroomTab(tab);
     items.push({
-      ok: inCampus || classroom,
+      ok: inCampus,
       label: "現在のタブ",
-      detail: inCampus
-        ? "inCampusページです。"
-        : classroom
-          ? "Google Classroomページです。"
-          : "inCampusまたはGoogle Classroomページを開いてください。"
+      detail: inCampus ? "inCampusページです。" : "inCampusページを開いてください。"
     });
 
-    if (inCampus || classroom) {
-      const ping = await chrome.tabs.sendMessage(tab.id, {
-        type: "PING_INCAMPUS_CONTENT"
-      });
+    if (inCampus) {
+      const ping = await chrome.tabs.sendMessage(tab.id, {type: "PING_INCAMPUS_CONTENT"});
       items.push({
         ok: Boolean(ping?.ok),
         label: "content.js",
         detail: ping?.ok
-          ? [
-            "注入済みです。",
-            ping.isHomePage ? "inCampusホーム画面です。" : "",
-            ping.isClassroomHomePage ? "Classroomホーム画面です。" : "",
-            ping.isClassroomTurnedInPage ? "Classroom完了ページです。" : "",
-            ping.isClassroomNotTurnedInPage ? "Classroom未提出ページです。" : "",
-            ping.isClassroomPage && !ping.isClassroomHomePage && !ping.isClassroomTurnedInPage && !ping.isClassroomNotTurnedInPage ? "Classroom同期対象ページ以外です。" : ""
-          ].filter(Boolean).join(" ")
+          ? `注入済みです。${ping.isHomePage ? "inCampusホーム画面です。" : ""}`
           : "応答がありません。ページ再読み込みを試してください。"
       });
     }
@@ -691,6 +547,7 @@ copyButton.addEventListener("click", async () => {
 });
 
 sendButton.addEventListener("click", async () => {
+  await settingsReady;
   if (!latestAssignment) return;
   if (previewOnlyInput.checked) {
     setStatus("プレビューのみがONのため、Hubへは送信しません。");
@@ -740,6 +597,7 @@ clearButton.addEventListener("click", () => {
 });
 
 syncNowButton.addEventListener("click", async () => {
+  await settingsReady;
   const dryRun = previewOnlyInput.checked;
 
   setStatus(dryRun ? "更新一覧をプレビュー中..." : "更新一覧から同期中...");
@@ -812,148 +670,6 @@ syncNowButton.addEventListener("click", async () => {
   }
 });
 
-classroomSyncButton.addEventListener("click", async () => {
-  const dryRun = previewOnlyInput.checked;
-
-  setStatus(dryRun ? "Classroom完了情報をプレビュー中..." : "Classroom完了情報を同期中...");
-  clearSyncSummary();
-  outputEl.textContent = "";
-
-  try {
-    const settings = dryRun
-      ? {
-        webAppUrl: webAppUrlInput.value.trim(),
-        apiToken: apiTokenInput.value.trim()
-      }
-      : await saveHubConnectionSettings({ validate: true });
-
-    if (!dryRun && !settings.webAppUrl) {
-      setStatus("GAS WebアプリURLを入力してください。", true);
-      return;
-    }
-
-    if (!dryRun && !settings.apiToken) {
-      setStatus("APIトークンを入力してください。", true);
-      return;
-    }
-
-    const tab = await getActiveTab();
-
-    if (!isClassroomTab(tab)) {
-      setStatus("Google Classroomの完了ページを開いてから実行してください。", true);
-      return;
-    }
-
-    const result = await chrome.tabs.sendMessage(tab.id, {
-      type: "RUN_CLASSROOM_COMPLETION_SYNC",
-      dryRun
-    });
-
-    renderSyncStatus(result || {});
-
-    if (!result?.ok && result?.errors?.length) {
-      setStatus("Classroom完了同期は完了しましたが、エラーがあります。", true);
-      return;
-    }
-
-    if (!result?.ok && result?.error) {
-      setStatus(result.error, true);
-      return;
-    }
-
-    setStatus(dryRun || result?.dryRun || result?.previewOnly
-      ? `プレビュー完了: ${result?.previewCount || 0}件確認`
-      : `Classroom完了同期: ${result?.matchedCount || 0}件完了`
-    );
-  } catch (error) {
-    if (isMissingContentScriptError(error)) {
-      setStatus("Classroomページを再読み込みしてから、もう一度押してください。", true);
-      outputEl.textContent = [
-        "拡張機能を読み込んだ後に開いていたページには、同期用スクリプトがまだ入っていない可能性があります。",
-        "",
-        "1. Google Classroomの完了ページを再読み込み",
-        "2. もう一度「Classroom完了同期」を押す",
-        "",
-        "それでも直らない場合は、chrome://extensions/ で拡張機能を再読み込みしてください。"
-      ].join("\n");
-      return;
-    }
-
-    setStatus(normalizeText(error?.message || error), true);
-  }
-});
-
-classroomDueSyncButton.addEventListener("click", async () => {
-  const dryRun = previewOnlyInput.checked;
-
-  setStatus(dryRun ? "Classroom期限情報をプレビュー中..." : "Classroom期限情報を同期中...");
-  clearSyncSummary();
-  outputEl.textContent = "";
-
-  try {
-    const settings = dryRun
-      ? {
-        webAppUrl: webAppUrlInput.value.trim(),
-        apiToken: apiTokenInput.value.trim()
-      }
-      : await saveHubConnectionSettings({ validate: true });
-
-    if (!dryRun && !settings.webAppUrl) {
-      setStatus("GAS WebアプリURLを入力してください。", true);
-      return;
-    }
-
-    if (!dryRun && !settings.apiToken) {
-      setStatus("APIトークンを入力してください。", true);
-      return;
-    }
-
-    const tab = await getActiveTab();
-
-    if (!isClassroomTab(tab)) {
-      setStatus("Google Classroomの未提出ページを開いてから実行してください。", true);
-      return;
-    }
-
-    const result = await chrome.tabs.sendMessage(tab.id, {
-      type: "RUN_CLASSROOM_DUE_TIME_SYNC",
-      dryRun
-    });
-
-    renderSyncStatus(result || {});
-
-    if (!result?.ok && result?.errors?.length) {
-      setStatus("Classroom期限同期は完了しましたが、エラーがあります。", true);
-      return;
-    }
-
-    if (!result?.ok && result?.error) {
-      setStatus(result.error, true);
-      return;
-    }
-
-    setStatus(dryRun || result?.dryRun || result?.previewOnly
-      ? `プレビュー完了: ${result?.previewCount || 0}件確認`
-      : `Classroom期限同期: ${result?.matchedCount || 0}件更新`
-    );
-  } catch (error) {
-    if (isMissingContentScriptError(error)) {
-      setStatus("Classroomページを再読み込みしてから、もう一度押してください。", true);
-      outputEl.textContent = [
-        "拡張機能を読み込んだ後に開いていたページには、同期用スクリプトがまだ入っていない可能性があります。",
-        "",
-        "1. Google Classroomの未提出ページを再読み込み",
-        "2. もう一度「Classroom期限同期」を押す",
-        "",
-        "それでも直らない場合は、chrome://extensions/ で拡張機能を再読み込みしてください。"
-      ].join("\n");
-      return;
-    }
-
-    setStatus(normalizeText(error?.message || error), true);
-  }
-});
-
 incampusDebugButton.addEventListener("click", async () => {
   setStatus("inCampus送信予定データを抽出中...");
   clearSyncSummary();
@@ -1005,63 +721,6 @@ incampusDebugButton.addEventListener("click", async () => {
   }
 });
 
-classroomDebugButton.addEventListener("click", async () => {
-  setStatus("Classroom送信予定データを抽出中...");
-  clearSyncSummary();
-  outputEl.textContent = "";
-  latestJson = "";
-  latestAssignment = null;
-  updateActionButtons();
-
-  try {
-    const tab = await getActiveTab();
-
-    if (!isClassroomTab(tab)) {
-      setStatus("Google Classroomのページを開いてから実行してください。", true);
-      outputEl.textContent = JSON.stringify({
-        ok: false,
-        pageUrl: tab.url || "",
-        error: "Google Classroomのページではありません。"
-      }, null, 2);
-      return;
-    }
-
-    const payload = await chrome.tabs.sendMessage(tab.id, {
-      type: "DEBUG_EXTRACT_CLASSROOM_PAYLOAD"
-    });
-
-    renderClassroomDebugPayload(payload || {});
-
-    const payloads = Array.isArray(payload?.payloads) ? payload.payloads : [];
-    const completionCount = payloads
-      .filter((item) => item.mode === "completion")
-      .reduce((sum, item) => sum + Number(item.foundCount || 0), 0);
-    const dueTimeCount = payloads
-      .filter((item) => item.mode === "dueTime")
-      .reduce((sum, item) => sum + Number(item.foundCount || 0), 0);
-    const hasErrors = Array.isArray(payload?.errors) && payload.errors.length > 0;
-
-    setStatus(
-      `送信予定を表示しました。完了${completionCount}件 / 期限${dueTimeCount}件`,
-      !payload?.ok || hasErrors
-    );
-  } catch (error) {
-    if (isMissingContentScriptError(error)) {
-      setStatus("Classroomページを再読み込みしてから、もう一度押してください。", true);
-      outputEl.textContent = [
-        "拡張機能を読み込んだ後に開いていたページには、抽出用スクリプトがまだ入っていない可能性があります。",
-        "",
-        "1. Google Classroomページを再読み込み",
-        "2. もう一度「Classroom送信予定を見る」を押す"
-      ].join("\n");
-      return;
-    }
-
-    setStatus("Classroom送信予定データの抽出中にエラーが発生しました。", true);
-    outputEl.textContent = normalizeText(error?.message || error);
-  }
-});
-
 reloadStatusButton.addEventListener("click", async () => {
   await showLastSyncStatus();
   setStatus("直近の同期結果を表示しました。");
@@ -1090,19 +749,23 @@ toggleApiTokenButton.addEventListener("click", () => {
 });
 
 autoSyncEnabledInput.addEventListener("change", saveAutoSyncEnabled);
-classroomAutoSyncEnabledInput.addEventListener("change", saveClassroomAutoSyncEnabled);
 syncLimitSelect.addEventListener("change", saveSyncLimit);
 previewOnlyInput.addEventListener("change", savePreviewOnly);
 
-restoreSettings()
-  .then(updateActionButtons)
+settingsReady = restoreSettings()
+  .then(() => {
+    updateActionButtons();
+    return true;
+  })
   .catch((error) => {
     setStatus(normalizeText(error?.message || error), true);
+    return false;
   });
 
 // Open the notice screen without including the API token in the URL.
 document.getElementById("openUniversityNotices").addEventListener("click", async () => {
   try {
+    await settingsReady;
     const value = normalizeHubWebAppUrl(webAppUrlInput.value);
     if (!value) { setStatus("GAS WebアプリURLを入力してください。", true); return; }
     const url = new URL(value);

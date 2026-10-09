@@ -771,6 +771,13 @@ check('Deadline minute remains valid through its last millisecond in server expi
 check('Date-only values preserve their original day and unknown time', () => {
   const {c}=environment();for(const input of ['2026/09/20',new Date(2026,8,20)]) {const out=c.normalizeDueInfoForWeb_(input,'抽出成功');assert.equal(out.dueDateKey,'2026-09-20');assert.equal(out.dueTime,'');}
 });
+check('inCampus 24:00 means 23:59 on the stated date, while 00:00 uses the previous date',()=>{
+  const {c}=environment();
+  for(const [text,date] of [['2026/07/19 24:00','2026-07-19'],['2026/12/31 24:00','2026-12-31'],['2028/02/29 24:00','2028-02-29']]) {
+    const result=c.normalizeDueInfoForWeb_(text,'拡張機能で抽出');assert.equal(result.dueDateKey,date);assert.equal(result.dueTime,'23:59');
+  }
+  assert.equal(c.normalizeDueInfoForWeb_('2027/01/01 00:00','拡張機能で抽出').dueDateKey,'2026-12-31');
+});
 check('Latest valid dueAt/dueDate wins and missing date preserves stored date', () => {
   const {c}=environment();
   expectDate(c.buildClassroomDueDateValue_({dueAt:'2026-09-20T23:59:00+09:00',dueTime:'23:59'},'2026/09/15'),2026,9,20,23,59);
@@ -828,6 +835,19 @@ check('inCampus batch upsert reads the sheet once, appends together, and skips u
   assert.equal(updatedSnapshotRows[0][extractStart+2],'仮想課題A（再更新）');
   assert.equal(updatedSnapshotRows[1][extractStart+2],'仮想課題B（更新）');
 });
+check('Sheets date coercion does not rewrite an unchanged inCampus deadline or rebuild display data',()=>{
+  const e=environment();e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';e.state.props.TASKHUB_API_TOKEN='x'.repeat(48);
+  e.c.getOrCreateSpreadsheetLocked_=()=>e.ss;
+  let refreshes=0;e.c.refreshNotificationDisplayDataAfterSyncLocked_=()=>{refreshes++;};
+  const assignment={source:'inCampus',type:'assignment',title:'仮想日時課題',body:'本文',courseName:'仮想情報演習',pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/virtual-date',assignmentKey:'virtual-date',startAt:'2026/12/30 09:00',dueAt:'2027/01/05 24:00',extractedAt:'2026-10-09T01:00:00.000Z'};
+  const post=a=>JSON.parse(e.c.doPost({postData:{contents:JSON.stringify({apiToken:'x'.repeat(48),action:'upsertInCampusAssignments',assignments:[a]})}}).value);
+  assert.equal(post(assignment).newCount,1);
+  const physical=e.state.sheets['inCampus通知'];const offset=vm.runInContext('INCAMPUS_UNIFIED_EXTRACT_START_COLUMN',e.c);
+  physical.rows[1][offset+4]=new Date(assignment.startAt);physical.rows[1][offset+5]=new Date(assignment.dueAt);physical.writes=0;
+  const repeat=post({...assignment,extractedAt:'2026-10-09T02:00:00.000Z'});
+  assert.equal(repeat.unchangedCount,1);assert.equal(physical.writes,0);assert.equal(refreshes,1);
+  const changed=post({...assignment,dueAt:'2027/01/06 12:30'});assert.equal(changed.updatedCount,1);assert.equal(refreshes,2);
+});
 check('inCampus batch endpoint rebuilds display data once only when a saved row changes',()=>{
   const e=environment();e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';e.state.props.TASKHUB_API_TOKEN='x'.repeat(48);
   e.c.getOrCreateSpreadsheetLocked_=()=>e.ss;
@@ -855,6 +875,25 @@ check('Repeated submission markers use stable notification time instead of extra
   const saved=e.c.getOrCreateInCampusSheet_().getDataRange().getValues();
   assert.equal(saved.length,2,'the same submission mail cannot create a second marker');
   assert.equal(saved[1][15],'2026/10/09 08:15');
+});
+check('inCampus POST saves to the personal sheet with or without display caches and while test mode is enabled',()=>{
+  for(const cached of [false,true]) {
+    const e=environment();prepareTestSpreadsheet(e);
+    e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';e.state.props.TASKHUB_API_TOKEN='x'.repeat(48);
+    e.state.props.TASKHUB_TEST_CASE_MODE='true';
+    const testDataBefore=JSON.stringify(Object.fromEntries(Object.entries(e.state.testSheets).map(([key,sheet])=>[key,sheet.rows])));
+    if(cached) {
+      e.state.cache[e.c.getTaskDisplayCacheKey_(e.state.props,'未完了')]='cached';
+      e.state.cache[e.c.getTaskDisplayCacheKey_(e.state.props,'完了')]='cached';
+      e.state.cache[e.c.getUniversityNoticeCacheKey_(e.state.props,false)]='cached';
+    }
+    const assignment={source:'inCampus',type:'assignment',title:'仮想キャッシュ独立課題',body:'仮想本文',courseName:'仮想情報演習',pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/virtual-cache',assignmentKey:'virtual-cache'};
+    const response=JSON.parse(e.c.doPost({postData:{contents:JSON.stringify({apiToken:'x'.repeat(48),action:'upsertInCampusAssignments',assignments:[assignment]})}}).value);
+    assert.equal(response.ok,true);assert.equal(response.newCount,1);
+    const records=e.c.getOrCreateInCampusSheet_().getDataRange().getValues();
+    assert.equal(records[1][2],assignment.title);
+    assert.equal(JSON.stringify(Object.fromEntries(Object.entries(e.state.testSheets).map(([key,sheet])=>[key,sheet.rows]))),testDataBefore,'shared test data must never be modified by an extension save');
+  }
 });
 check('Manual page extraction preserves course and update identity plus completed state',()=>{
   const {c}=environment(),url='https://ic.ss.senshu-u.ac.jp/lms/course/report/A';

@@ -114,7 +114,9 @@ function buildNormalizedDueInfo_(year, month, day, timeText) {
     };
   }
 
-  let time = normalizeTimeText_(timeText);
+  // inCampus uses 24:00 for the end of the stated day. This is distinct from
+  // 00:00, whose existing rule displays the previous day's 23:59.
+  let time = /^24:00$/.test(String(timeText || '').trim()) ? '23:59' : normalizeTimeText_(timeText);
   if (time === '00:00') {
     const priorDay = new Date(yearNum, monthNum - 1, dayNum - 1);
     yearNum = priorDay.getFullYear(); monthNum = priorDay.getMonth() + 1; dayNum = priorDay.getDate();

@@ -3,20 +3,49 @@ const HUB_DIAGNOSE_TIMEOUT_MS = 12000;
 const HUB_MAX_POST_BODY_LENGTH = 190000;
 const HUB_MAX_POST_RECORDS = 100;
 const HUB_API_TOKEN_MIN_LENGTH = 48;
+const INCAMPUS_SYNC_LEASE_MS = 5 * 60 * 1000;
+const INCAMPUS_AUTO_SYNC_INTERVAL_MS = 10 * 60 * 1000;
+const INCAMPUS_RETRY_INTERVAL_MS = 60 * 1000;
+let inCampusLeaseQueue = Promise.resolve();
+
+function withInCampusLeaseLock(operation) {
+  const result = inCampusLeaseQueue.then(operation);
+  inCampusLeaseQueue = result.catch(() => {});
+  return result;
+}
+
+function acquireInCampusSync(message) {
+  return withInCampusLeaseLock(async () => {
+    const settings = await chrome.storage.local.get(['inCampusSyncLease', 'lastInCampusAutoSyncAt', 'lastInCampusSyncAttemptAt', 'lastInCampusPreviewSyncAt']);
+    const now = Date.now();
+    if (Number(settings.inCampusSyncLease?.expiresAt || 0) > now) {
+      return {ok: true, skipped: true, reason: '別のinCampusタブですでに同期中のためスキップしました。'};
+    }
+    const succeededAt = Number(message.dryRun ? settings.lastInCampusPreviewSyncAt : settings.lastInCampusAutoSyncAt) || 0;
+    if (!message.force && succeededAt > 0 && now - succeededAt < INCAMPUS_AUTO_SYNC_INTERVAL_MS) {
+      return {ok: true, skipped: true, reason: '短時間の連続同期を避けるためスキップしました。'};
+    }
+    const attemptedAt = Number(settings.lastInCampusSyncAttemptAt || 0);
+    if (!message.force && attemptedAt > 0 && now - attemptedAt < INCAMPUS_RETRY_INTERVAL_MS) {
+      return {ok: true, skipped: true, reason: '直前の読み取りから1分以内のためスキップしました。'};
+    }
+    const token = `${now}:${Math.random().toString(36).slice(2)}`;
+    await chrome.storage.local.set({inCampusSyncLease: {token, expiresAt: now + INCAMPUS_SYNC_LEASE_MS}});
+    return {ok: true, token};
+  });
+}
+
+function releaseInCampusSync(token) {
+  return withInCampusLeaseLock(async () => {
+    const {inCampusSyncLease} = await chrome.storage.local.get('inCampusSyncLease');
+    if (inCampusSyncLease?.token === token) await chrome.storage.local.set({inCampusSyncLease: null});
+    return {ok: true};
+  });
+}
 const ALLOWED_HUB_WEB_APP_HOSTS = new Set([
   "script.google.com",
   "script.googleusercontent.com"
 ]);
-
-async function getStoredWebAppUrl() {
-  const { webAppUrl } = await chrome.storage.local.get("webAppUrl");
-  return String(webAppUrl || "").trim();
-}
-
-async function getStoredApiToken() {
-  const { apiToken } = await chrome.storage.local.get("apiToken");
-  return String(apiToken || "").trim();
-}
 
 function normalizeHubWebAppUrl(value) {
   const text = String(value || "").trim();
@@ -56,15 +85,19 @@ function normalizeHubApiToken(value) {
 }
 
 async function getHubConnectionSettings() {
+  const { webAppUrl, apiToken, previewOnly } = await chrome.storage.local.get(["webAppUrl", "apiToken", "previewOnly"]);
   return {
-    webAppUrl: normalizeHubWebAppUrl(await getStoredWebAppUrl()),
-    apiToken: normalizeHubApiToken(await getStoredApiToken())
+    webAppUrl: String(webAppUrl || "").trim(),
+    apiToken: String(apiToken || "").trim(),
+    previewOnly: Boolean(previewOnly)
   };
 }
 
 async function getHubConnectionStatus() {
   try {
-    const { webAppUrl, apiToken } = await getHubConnectionSettings();
+    const settings = await getHubConnectionSettings();
+    const webAppUrl = normalizeHubWebAppUrl(settings.webAppUrl);
+    const apiToken = normalizeHubApiToken(settings.apiToken);
 
     return {
       ok: Boolean(webAppUrl && apiToken),
@@ -141,7 +174,7 @@ async function parseHubResponse(response) {
     throw new Error("GASから不正なJSONレスポンスが返りました。");
   }
 
-  if (!response.ok || result.ok === false) {
+  if (!response.ok || result.ok !== true) {
     throw new Error(result.error || `送信に失敗しました。status=${response.status}`);
   }
 
@@ -188,13 +221,12 @@ async function postJsonToHub(webAppUrl, payload) {
 }
 
 async function postAssignmentToHub(assignment) {
-  const { previewOnly } = await chrome.storage.local.get("previewOnly");
-  if (previewOnly) {
+  const settings = await getHubConnectionSettings();
+  if (settings.previewOnly) {
     return { ok: true, dryRun: true, skipped: true, previewOnly: true };
   }
-  const { webAppUrl, apiToken } = await getHubConnectionSettings();
 
-  if (!webAppUrl) {
+  if (!settings.webAppUrl) {
     return {
       ok: false,
       missingWebAppUrl: true,
@@ -202,125 +234,155 @@ async function postAssignmentToHub(assignment) {
     };
   }
 
-  return postJsonToHub(webAppUrl, buildAuthenticatedPayload({
+  const webAppUrl = normalizeHubWebAppUrl(settings.webAppUrl);
+  const apiToken = normalizeHubApiToken(settings.apiToken);
+  const result = await postJsonToHub(webAppUrl, buildAuthenticatedPayload({
     action: "upsertInCampusAssignment",
     assignment
   }, apiToken));
+  if (!result.dryRun && (!Number.isInteger(Number(result.row)) || Number(result.row) < 2 || typeof result.updated !== 'boolean')) {
+    throw new Error('GASの保存結果に有効な保存行がありません。');
+  }
+  return result;
 }
 
-function buildClassroomRecordOutcome(record, index, extra) {
-  return {
-    title: record?.title || "",
-    courseName: record?.courseName || "",
-    classroomUrl: record?.classroomUrl || record?.pageUrl || "",
-    courseId: record?.courseId || "",
-    streamItemId: record?.streamItemId || "",
-    recordIndex: index,
-    ...extra
-  };
-}
-
-async function postClassroomRecordsToHub(action, records) {
-  if (!Array.isArray(records)) {
-    throw new Error("recordsが配列ではありません。");
-  }
-  const aggregate = {
-    ok: true, foundCount: records.length, sentCount: 0, matchedCount: 0,
-    createdCount: 0, unmatchedCount: 0, failedCount: 0, previewCount: 0,
-    batchCount: 0, results: [], errors: []
-  };
-  const { previewOnly } = await chrome.storage.local.get("previewOnly");
-  if (previewOnly) {
-    return {
-      ...aggregate, dryRun: true, previewOnly: true, previewCount: records.length,
-      results: records.map((record, index) => buildClassroomRecordOutcome(record, index, { preview: true }))
-    };
-  }
-  const { webAppUrl, apiToken } = await getHubConnectionSettings();
-
-  if (!webAppUrl) {
-    return {
-      ok: false,
-      missingWebAppUrl: true,
-      error: "GAS WebアプリURLが未設定です。"
-    };
-  }
+function buildInCampusAssignmentBatches(assignments, apiToken) {
+  if (!Array.isArray(assignments)) throw new Error("送信する課題データの形式が正しくありません。");
+  if (assignments.length > HUB_MAX_POST_RECORDS) throw new Error("一度に送信できる課題データが多すぎます。");
 
   const batches = [];
-  let batch = [];
-  const payloadFor = (entries) => buildAuthenticatedPayload({
-    action, records: entries.map((entry) => entry.record)
-  }, apiToken);
-  const failEntries = (entries, error) => {
-    const reason = String(error?.message || error);
-    aggregate.errors.push(reason);
-    aggregate.failedCount += entries.length;
-    entries.forEach(({ record, index }) => aggregate.results.push(
-      buildClassroomRecordOutcome(record, index, { failed: true, matched: false, reason })
-    ));
-  };
+  let current = [];
+  const getBodyLength = records => JSON.stringify(buildAuthenticatedPayload({
+    action: "upsertInCampusAssignments",
+    assignments: records
+  }, apiToken)).length;
 
-  records.forEach((record, index) => {
-    const entry = { record, index };
-    if (JSON.stringify(payloadFor([entry])).length > HUB_MAX_POST_BODY_LENGTH) {
-      failEntries([entry], `${record?.title || `課題${index + 1}`}: 1件の送信データが大きすぎます。`);
-      return;
+  for (const assignment of assignments) {
+    const candidate = [...current, assignment];
+    if (getBodyLength(candidate) <= HUB_MAX_POST_BODY_LENGTH) {
+      current = candidate;
+      continue;
     }
-    if (batch.length >= HUB_MAX_POST_RECORDS ||
-        JSON.stringify(payloadFor(batch.concat(entry))).length > HUB_MAX_POST_BODY_LENGTH) {
-      batches.push(batch);
-      batch = [];
-    }
-    batch.push(entry);
-  });
-  if (batch.length) batches.push(batch);
 
-  for (const entries of batches) {
-    try {
-      const result = await postJsonToHub(webAppUrl, payloadFor(entries));
-      if (result.dryRun) {
-        aggregate.previewOnly = true;
-        aggregate.previewCount += entries.length;
-        entries.forEach(({ record, index }) => aggregate.results.push(
-          buildClassroomRecordOutcome(record, index, { preview: true })
-        ));
-        continue;
-      }
-      if (!Array.isArray(result.results) || result.results.length !== entries.length ||
-          result.results.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
-        throw new Error("Classroom同期結果の件数が送信件数と一致しません。反映状態を確認してください。");
-      }
-      aggregate.batchCount++;
-      aggregate.sentCount += entries.length;
-      result.results.forEach((item, resultIndex) => {
-        const { record, index } = entries[resultIndex];
-        aggregate.results.push(buildClassroomRecordOutcome(record, index, { ...item, recordIndex: index }));
-        if (item.failed) {
-          aggregate.failedCount++;
-          aggregate.errors.push(item.reason || "課題の同期に失敗しました。");
-        } else if (item.matched) {
-          aggregate.matchedCount++;
-        } else {
-          aggregate.unmatchedCount++;
-        }
-        if (item.created) aggregate.createdCount++;
-      });
-    } catch (error) {
-      failEntries(entries, error);
-    }
+    if (current.length === 0) throw new Error("課題データ1件が送信上限を超えています。");
+    batches.push(current);
+    current = [assignment];
+    if (getBodyLength(current) > HUB_MAX_POST_BODY_LENGTH) throw new Error("課題データ1件が送信上限を超えています。");
   }
-  aggregate.results.sort((left, right) => left.recordIndex - right.recordIndex);
-  aggregate.ok = aggregate.errors.length === 0;
-  aggregate.dryRun = Boolean(aggregate.previewOnly && aggregate.sentCount === 0);
-  return aggregate;
+
+  if (current.length > 0) batches.push(current);
+  return batches;
 }
 
-async function postClassroomCompletionRecordsToHub(records) {
-  return postClassroomRecordsToHub("completeClassroomAssignments", records);
-}
+async function postAssignmentsToHub(assignments) {
+  if (!Array.isArray(assignments)) return {ok: false, error: "送信する課題データの形式が正しくありません。"};
+  if (assignments.length === 0) return {ok: true, result: {results: []}};
 
-async function postClassroomDueTimeRecordsToHub(records) {
-  return postClassroomRecordsToHub("updateClassroomDueTimes", records);
+  try {
+    const settings = await getHubConnectionSettings();
+    if (settings.previewOnly) {
+      return {
+        ok: true,
+        result: {
+          dryRun: true,
+          skipped: true,
+          previewOnly: true,
+          results: assignments.map(() => ({dryRun: true, skipped: true}))
+        }
+      };
+    }
+    const webAppUrl = normalizeHubWebAppUrl(settings.webAppUrl);
+    const apiToken = normalizeHubApiToken(settings.apiToken);
+    if (!webAppUrl) return {ok: false, error: "GAS WebアプリURLが未設定です。"};
+    if (!apiToken) return {ok: false, error: "APIトークンが未設定です。"};
+
+    const batches = buildInCampusAssignmentBatches(assignments, apiToken);
+    const results = [];
+    const errors = [];
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      const batch = batches[batchIndex];
+      try {
+        const response = await postJsonToHub(webAppUrl, buildAuthenticatedPayload({
+          action: "upsertInCampusAssignments",
+          assignments: batch
+        }, apiToken));
+
+        if (response?.dryRun || response?.previewOnly) {
+          const remaining = assignments.length - results.length;
+          for (let index = 0; index < remaining; index++) {
+            results.push({dryRun: true, skipped: true});
+          }
+          errors.push("プレビュー設定がONになったため、残りの課題データは送信しませんでした。");
+          break;
+        }
+
+        if (!Array.isArray(response?.results) || response.results.length !== batch.length) {
+          throw new Error("GASから課題ごとの同期結果が返りませんでした。");
+        }
+
+        response.results.forEach(item => {
+          const row = Number(item?.row || 0);
+          if (item?.ok === false || !Number.isInteger(row) || row < 2 || typeof item?.updated !== 'boolean') {
+            const error = item?.error || 'GASの保存結果に有効な保存行がありません。';
+            results.push({ok: false, error});
+            errors.push(error);
+          } else {
+            results.push({updated: item.updated, unchanged: Boolean(item.unchanged), row});
+          }
+        });
+      } catch (error) {
+        const message = String(error?.message || error);
+
+        // Older deployed Hub scripts may still expose only the single-row
+        // endpoint. The failed batch action is rejected before any rows are
+        // written, so retry this batch through the compatible legacy action.
+        if (/未対応のactionです:\s*upsertInCampusAssignments/.test(message)) {
+          let stoppedByPreview = false;
+          for (const assignment of batch) {
+            try {
+              const item = await postAssignmentToHub(assignment);
+              if (item?.dryRun || item?.previewOnly) {
+                results.push({dryRun: true, skipped: true});
+                const remaining = assignments.length - results.length;
+                for (let index = 0; index < remaining; index++) {
+                  results.push({dryRun: true, skipped: true});
+                }
+                errors.push("プレビュー設定がONになったため、残りの課題データは送信しませんでした。");
+                stoppedByPreview = true;
+                break;
+              }
+              if (item?.ok === false || !Number.isInteger(Number(item?.row)) || Number(item.row) < 2 || typeof item?.updated !== 'boolean') {
+                throw new Error(item.error || 'GASの保存結果に有効な保存行がありません。');
+              }
+              results.push({
+                updated: Boolean(item?.updated),
+                unchanged: Boolean(item?.unchanged),
+                row: Number(item?.row || 0)
+              });
+            } catch (fallbackError) {
+              const fallbackMessage = String(fallbackError?.message || fallbackError);
+              results.push({ok: false, error: fallbackMessage});
+              errors.push(fallbackMessage);
+            }
+          }
+          if (stoppedByPreview) break;
+          continue;
+        }
+
+        batch.forEach(() => results.push({ok: false, error: message}));
+        errors.push(message);
+      }
+    }
+
+    return {
+      ok: errors.length === 0,
+      result: {results},
+      error: errors.join(" / ")
+    };
+  } catch (error) {
+    return {ok: false, error: String(error?.message || error)};
+  }
 }
 
 async function diagnoseHubWebAppUrl(webAppUrl) {
@@ -384,6 +446,11 @@ async function diagnoseHubWebAppUrl(webAppUrl) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'ACQUIRE_INCAMPUS_SYNC' || message?.type === 'RELEASE_INCAMPUS_SYNC') {
+    const work = message.type === 'ACQUIRE_INCAMPUS_SYNC' ? acquireInCampusSync(message) : releaseInCampusSync(message.token);
+    work.then(sendResponse).catch(error => sendResponse({ok: false, error: String(error?.message || error)}));
+    return true;
+  }
   if (message?.type === "POST_INCAMPUS_ASSIGNMENT") {
     postAssignmentToHub(message.assignment)
       .then((result) => sendResponse({ ok: result.ok !== false, result, error: result.error || "" }))
@@ -395,27 +462,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === "POST_CLASSROOM_COMPLETION_RECORDS") {
-    postClassroomCompletionRecordsToHub(message.records || [])
-      .then((result) => sendResponse({ ok: result.ok !== false, result, error: result.error || "" }))
-      .catch((error) => sendResponse({
-        ok: false,
-        error: String(error?.message || error)
-      }));
+  if (message?.type === "POST_INCAMPUS_ASSIGNMENTS") {
+    postAssignmentsToHub(message.assignments)
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ok: false, error: String(error?.message || error)}));
 
     return true;
   }
 
-  if (message?.type === "POST_CLASSROOM_DUE_TIME_RECORDS") {
-    postClassroomDueTimeRecordsToHub(message.records || [])
-      .then((result) => sendResponse({ ok: result.ok !== false, result, error: result.error || "" }))
-      .catch((error) => sendResponse({
-        ok: false,
-        error: String(error?.message || error)
-      }));
-
-    return true;
-  }
 
   if (message?.type === "DIAGNOSE_HUB_WEB_APP_URL") {
     diagnoseHubWebAppUrl(message.webAppUrl)

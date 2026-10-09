@@ -277,8 +277,20 @@ function areInCampusAssignmentRowsEquivalent_(existingRow, nextRow) {
 
     const existingValue = existingRow[index];
     const nextValue = nextRow[index];
-    const normalizedExisting = existingValue instanceof Date ? `date:${existingValue.getTime()}` : String(existingValue ?? '');
-    const normalizedNext = nextValue instanceof Date ? `date:${nextValue.getTime()}` : String(nextValue ?? '');
+    // Sheets coerces date-shaped input strings to Date cells. Compare their
+    // value, so an identical deadline does not rewrite rows and all displays.
+    const normalizeCell = value => {
+      if ([4, 5, 15].includes(index)) {
+        if (value instanceof Date && !Number.isNaN(value.getTime())) return `date:${value.getTime()}`;
+        if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+Z|Z)?$/.test(String(value || ''))) {
+          const date = new Date(value);
+          if (!Number.isNaN(date.getTime())) return `date:${date.getTime()}`;
+        }
+      }
+      return value instanceof Date ? `date:${value.getTime()}` : String(value ?? '');
+    };
+    const normalizedExisting = normalizeCell(existingValue);
+    const normalizedNext = normalizeCell(nextValue);
     if (normalizedExisting !== normalizedNext) return false;
   }
 

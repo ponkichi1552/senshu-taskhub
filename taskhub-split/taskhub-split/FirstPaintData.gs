@@ -148,6 +148,10 @@ function taskhubClearDisplayCachesForMeasurement() {
   const cache = CacheService.getUserCache();
   const keys = [getTaskDisplayCacheKey_(properties, '未完了'),
     getTaskDisplayCacheKey_(properties, '完了'), getUniversityNoticeCacheKey_(properties, false)];
+  const cachedBeforeCount = keys.filter(key => cache.get(key) !== null).length;
   keys.forEach(key => cache.remove(key));
-  return {ok: true, removedCount: keys.length};
+  const cachedAfterCount = keys.filter(key => cache.get(key) !== null).length;
+  const result = {ok: cachedAfterCount === 0, removedCount: keys.length, cachedBeforeCount, cachedAfterCount};
+  Logger.log('TASKHUB_DISPLAY_CACHE_CLEAR ' + JSON.stringify(result));
+  return result;
 }

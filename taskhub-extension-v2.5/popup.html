@@ -250,7 +250,7 @@
 
       .summary-grid {
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(5, 1fr);
         gap: 6px;
       }
 
@@ -279,7 +279,7 @@
     <main>
       <button id="openUniversityNotices" class="secondary" style="width:100%;margin-bottom:12px">大学からのお知らせを開く ↗</button>
       <p class="hint">
-        inCampusの課題抽出と、Google Classroomの完了状態同期を行います。ID/パスワードは読み取りません。
+        inCampusの課題・お知らせ・提出通知を課題通知Hubへ送信します。ID/パスワードは読み取りません。
       </p>
       <button id="extract" class="primary" type="button">inCampusこのページから抽出</button>
       <label for="webAppUrl">GAS WebアプリURL</label>
@@ -296,16 +296,6 @@
         </div>
         <label class="switch" for="autoSyncEnabled" aria-label="inCampus自動同期">
           <input id="autoSyncEnabled" type="checkbox">
-          <span class="slider"></span>
-        </label>
-      </div>
-      <div class="setting-row">
-        <div>
-          <div class="setting-title">Classroom自動同期</div>
-          <div class="setting-sub">Classroomホーム・未提出・完了で自動同期</div>
-        </div>
-        <label class="switch" for="classroomAutoSyncEnabled" aria-label="Classroom自動同期">
-          <input id="classroomAutoSyncEnabled" type="checkbox">
           <span class="slider"></span>
         </label>
       </div>
@@ -340,12 +330,7 @@
         <button id="reloadStatus" class="secondary" type="button">直近結果</button>
       </div>
       <div class="row">
-        <button id="classroomSync" class="secondary" type="button">Classroom完了同期</button>
-        <button id="classroomDueSync" class="secondary" type="button">Classroom期限同期</button>
-      </div>
-      <div class="row">
         <button id="incampusDebug" class="secondary" type="button">inCampus送信予定を見る</button>
-        <button id="classroomDebug" class="secondary" type="button">Classroom送信予定を見る</button>
       </div>
       <div class="row">
         <button id="checkSetup" class="secondary" type="button">設定チェック</button>
