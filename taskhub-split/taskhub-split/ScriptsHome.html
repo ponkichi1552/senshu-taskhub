@@ -43,6 +43,8 @@
   }
 
   function invalidateClientNotificationData_() {
+    clientViewDataGeneration++;
+    homeViewPrefetchScheduled = false;
     notificationRequestIds.active++;
     notificationRequestIds.completed++;
     notificationRequestsInFlight.active = null;
@@ -59,6 +61,10 @@
     universityState.requestId++;
     universityState.loading = false;
     universityState.loaded = false;
+    universityState.partial = false;
+    universityState.totalCount = 0;
+    universityState.prefetchedAt = 0;
+    universityState.prefetchInFlight = false;
   }
 
   function loadHomeNotifications(initialData) {
@@ -82,6 +88,7 @@
     if (!notificationDataLoaded.active && !notificationRequestsInFlight.active && !notificationSyncInFlight) {
       loadHomeNotifications();
     }
+    scheduleHomeViewPrefetch_();
   }
 
   function showAssignmentView(viewMode = 'active', options = {}) {

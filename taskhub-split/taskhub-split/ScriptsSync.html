@@ -228,6 +228,7 @@
         : 'Classroom API・Gmail同期済み',
       onSuccess: result => {
         finishManualSync();
+        invalidateUniversityNoticePrefetchAfterSync_();
         const failures = [];
         if (result && result.apiError) failures.push(`Classroom API失敗：${result.apiError}`);
         if (result && result.gmailError) failures.push(`Gmail失敗：${result.gmailError}`);
@@ -408,5 +409,6 @@
     if (currentScreen === viewMode || (viewMode === 'active' && currentScreen === 'home')) {
       refreshCurrentView();
     }
+    if (viewMode === 'active' && currentScreen === 'home') scheduleHomeViewPrefetch_();
   }
 </script>

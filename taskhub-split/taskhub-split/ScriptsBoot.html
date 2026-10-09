@@ -15,6 +15,23 @@
     }
   }
 
+  // Home and assignments share the same active task read. Start the independent
+  // notice-list read after Home has painted, without navigating or reading bodies.
+  function scheduleHomeViewPrefetch_() {
+    if (currentScreen !== 'home' || homeViewPrefetchScheduled ||
+        (!notificationDataLoaded.active && !homeFirstPaintSummary) ||
+        universityState.loading || universityState.loaded) return;
+    const generation = clientViewDataGeneration;
+    homeViewPrefetchScheduled = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (generation !== clientViewDataGeneration) return;
+      homeViewPrefetchScheduled = false;
+      if (currentScreen !== 'home' || notificationSyncInFlight ||
+          universityState.loading || universityState.loaded) return;
+      loadUniversityNotices(undefined, undefined, false, undefined, true, true);
+    }));
+  }
+
   function loadInitialTaskHubView(view, initialData) {
     const initialPayload = initialData && initialData.view === view ? initialData.payload : null;
     const hasInitialPayload = view === 'university'

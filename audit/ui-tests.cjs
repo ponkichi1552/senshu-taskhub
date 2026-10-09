@@ -434,7 +434,8 @@ test('a sync-warmed task cache response skips the redundant post-display cache R
   f.reply(initial, {items: [item('SYNC-WARMED-TASK')], cacheToken: ''});
   f.flushAnimationFrame();
   f.flushAnimationFrame();
-  assert.deepEqual(f.calls.map(call => call.method), ['getTaskDisplayPayloadForWeb']);
+  assert.deepEqual(f.calls.map(call => call.method), ['getTaskDisplayPayloadForWeb', 'getUniversityNoticePayloadForWeb']);
+  assert.equal(f.pending('cacheTaskDisplayItemsAfterWebDisplay').length, 0);
 });
 
 test('discovering test mode invalidates old client data and rejects the old source reply', () => {
@@ -991,5 +992,98 @@ test('initial read-only RPC requests prefer the saved first cards; full follow-u
   const university=fixture(undefined,{holdBoot:true,initialRoute:'university'});
   assert.deepEqual(university.take('getUniversityNoticePayloadForWeb').args,[false,null,true]);
   task.c.loadCompletedNotifications();assert.deepEqual(task.take('getTaskDisplayPayloadForWeb','完了').args,['完了']);
+});
+function homePrefetchFixture(partial = false) {
+  return fixture(undefined, {holdBoot:true,initialPayload:{view:'home',payload:{
+    items:[item('HOME-SHARED-TASK')],partial,totalCount:4,cacheToken:'',
+    homeSummary:partial ? [{displayDueGroupKey:'today',displayDueGroupCount:4,
+      displayDueGroupCourseCountsJson:'[["仮想情報演習",4]]'}] : undefined
+  }}});
+}
+const prefetchedNotice = {messageId:'HOME-PREFETCH-NOTICE',title:'先読みする仮想お知らせ',
+  source:'inCampus',preview:'架空の抜粋',receivedAt:'2026/10/09 10:00',read:false,saved:false};
+
+test('Home paints before parallel task and notice reads; assignment navigation shares its pending full task read',()=>{
+  const f=homePrefetchFixture(true);
+  assert.equal(f.read('currentScreen'),'home');assert.equal(f.calls.length,0);
+  f.flushAnimationFrame();assert.equal(f.calls.length,0);
+  f.flushAnimationFrame();
+  const task=f.take('getTaskDisplayPayloadForWeb'),notice=f.take('getUniversityNoticePayloadForWeb');
+  assert.deepEqual(task.args,['未完了']);assert.deepEqual(notice.args,[false]);
+  assert.deepEqual(f.calls.map(c=>c.method).sort(),['getTaskDisplayPayloadForWeb','getUniversityNoticePayloadForWeb']);
+  f.c.loadNotifications();
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb').length,1,'the assignment view reuses the active Home read');
+  f.reply(notice,{items:[prefetchedNotice],cacheToken:'notice-generation'});
+  assert.equal(f.read('currentScreen'),'active','the hidden notice response cannot navigate');
+  assert.equal(f.pending('getUniversityNoticeBodyForWeb').length,0);
+  f.reply(task,{items:[item('HOME-SHARED-TASK'),item('SECOND-TASK')],cacheToken:''});
+  assert.deepEqual(f.ids('currentRawData'),['HOME-SHARED-TASK','SECOND-TASK']);
+});
+test('fresh Home-prefetched notices are already rendered and first navigation sends no duplicate list read',()=>{
+  const f=homePrefetchFixture();f.flushAnimationFrame();f.flushAnimationFrame();
+  f.reply(f.take('getUniversityNoticePayloadForWeb'),{items:[prefetchedNotice],cacheToken:'notice-generation'});
+  assert.equal(f.read('currentScreen'),'home');
+  assert.equal(f.document.getElementById('un-list').children.length,1);
+  f.flushAnimationFrame();f.flushAnimationFrame();
+  assert.equal(f.read("firstContentMarkedViews.has('university')"),false,'hidden preparation is not a visible-card timestamp');
+  const count=f.calls.length;f.c.showUniversityNotices();
+  assert.equal(f.calls.length,count,'the first visit uses the fresh prepared list');
+  assert.equal(f.read('currentScreen'),'university');
+  f.flushAnimationFrame();f.flushAnimationFrame();
+  assert.equal(f.read("firstContentMarkedViews.has('university')"),true);
+});
+test('entering notices during Home prefetch keeps exactly one read and its reply does not switch the page',()=>{
+  const f=homePrefetchFixture();f.flushAnimationFrame();f.flushAnimationFrame();
+  const read=f.take('getUniversityNoticePayloadForWeb');f.c.showUniversityNotices();
+  assert.equal(f.pending('getUniversityNoticePayloadForWeb').length,1);
+  f.reply(read,{items:[prefetchedNotice],cacheToken:'notice-generation'});
+  assert.equal(f.read('currentScreen'),'university');assert.equal(f.read('universityState.loaded'),true);
+  assert.equal(f.document.getElementById('un-list').children.length,1);
+});
+test('failed hidden prefetch leaves Home intact and entering notices retries; a queued prefetch is cancelled on navigation',()=>{
+  const f=homePrefetchFixture();f.flushAnimationFrame();f.flushAnimationFrame();
+  const label=f.document.getElementById('home-sync-text').textContent;
+  f.fail(f.take('getUniversityNoticePayloadForWeb'));
+  assert.equal(f.read('currentScreen'),'home');assert.equal(f.document.getElementById('home-sync-text').textContent,label);
+  f.c.showUniversityNotices();assert.equal(f.pending('getUniversityNoticePayloadForWeb').length,1);
+  const early=homePrefetchFixture();early.c.showUniversityNotices();
+  early.flushAnimationFrame();early.flushAnimationFrame();
+  assert.equal(early.pending('getUniversityNoticePayloadForWeb').length,1,'navigating before paint cannot add a second notice read');
+  assert.equal(early.read("firstContentMarkedViews.has('home')"),false,'a cancelled Home paint is not reported as visible');
+});
+test('source and virtual-date changes discard old notice prefetch replies and regenerate both views from the selected source',()=>{
+  const f=homePrefetchFixture();f.flushAnimationFrame();f.flushAnimationFrame();
+  const old=f.take('getUniversityNoticePayloadForWeb');
+  f.c.applyTestCaseClockState({testCaseModeEnabled:true,testCaseClockDateTime:'2026-12-31T23:58'});
+  f.reply(old,{items:[prefetchedNotice],testCaseClockState:{testCaseModeEnabled:false}});
+  assert.equal(f.read('testCaseModeEnabled'),true);assert.deepEqual(f.ids('universityState.items'),[]);
+  f.reply(f.take('getTaskDisplayPayloadForWeb'),{items:[item('SIM-TASK')],cacheToken:'',
+    testCaseClockState:{testCaseModeEnabled:true,testCaseClockDateTime:'2026-12-31T23:58'}});
+  f.flushAnimationFrame();f.flushAnimationFrame();
+  f.reply(f.take('getUniversityNoticePayloadForWeb'),{items:[{...prefetchedNotice,messageId:'SIM-NOTICE'}]});
+  assert.deepEqual(f.ids('universityState.items'),['SIM-NOTICE']);
+  assert.equal(f.read('currentScreen'),'home');
+});
+test('expired prefetch and an explicit sync force a fresh notice read instead of trusting the earlier snapshot',()=>{
+  const f=homePrefetchFixture();f.flushAnimationFrame();f.flushAnimationFrame();
+  f.reply(f.take('getUniversityNoticePayloadForWeb'),{items:[prefetchedNotice]});
+  vm.runInContext('universityState.prefetchedAt = Date.now() - AUTO_REFRESH_INTERVAL - 1',f.c);
+  f.c.showUniversityNotices();assert.equal(f.pending('getUniversityNoticePayloadForWeb').length,1);
+  const synced=homePrefetchFixture();synced.flushAnimationFrame();synced.flushAnimationFrame();
+  synced.reply(synced.take('getUniversityNoticePayloadForWeb'),{items:[prefetchedNotice]});
+  synced.c.manualRefreshNotifications();
+  synced.reply(synced.take('syncAndGetNotificationsForWeb'),{items:[item('AFTER-SYNC')],apiSuccess:true,gmailSuccess:true});
+  synced.c.showUniversityNotices();assert.equal(synced.pending('getUniversityNoticePayloadForWeb').length,1);
+});
+test('a pre-sync notice prefetch cannot be accepted after manual sync completes',()=>{
+  const f=homePrefetchFixture();f.flushAnimationFrame();f.flushAnimationFrame();
+  const old=f.take('getUniversityNoticePayloadForWeb');
+  f.c.manualRefreshNotifications();
+  f.reply(f.take('syncAndGetNotificationsForWeb'),{items:[item('NEW-TASK')],apiSuccess:true,gmailSuccess:true});
+  f.reply(old,{items:[prefetchedNotice]});
+  assert.deepEqual(f.ids('universityState.items'),[]);
+  f.flushAnimationFrame();f.flushAnimationFrame();
+  f.reply(f.take('getUniversityNoticePayloadForWeb'),{items:[{...prefetchedNotice,messageId:'POST-SYNC-NOTICE'}]});
+  assert.deepEqual(f.ids('universityState.items'),['POST-SYNC-NOTICE']);
 });
 console.log(`${passed} UI regression tests passed.`);

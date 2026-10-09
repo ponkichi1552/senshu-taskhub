@@ -1,19 +1,27 @@
 <script>
 const universityState = {items: [], selected: null, filter: 'all', loading: false, loaded: false, requestId: 0,
  bodySearchQuery: '', bodySearchMessageIds: null, bodySearchRequestId: 0, bodySearchTimer: 0,
- bodySearchLoading: false, bodySearchFailed: false, cacheToken: '', partial: false, totalCount: 0};
+ bodySearchLoading: false, bodySearchFailed: false, cacheToken: '', partial: false, totalCount: 0,
+ prefetchedAt: 0, prefetchInFlight: false};
 function showUniversityNotices(initialData) {
  currentScreen = 'university'; closeCourseFilterPanel(); setAppView('university'); updateBottomNavState();
+ if (universityState.loaded) markTaskHubFirstContent_('university');
+ if (!isUniversityNoticePayloadValid_(initialData) && universityState.loaded && !universityState.partial &&
+     universityState.prefetchedAt > 0 && Date.now() - universityState.prefetchedAt < AUTO_REFRESH_INTERVAL) {
+  universityState.prefetchedAt = 0;
+  return;
+ }
  loadUniversityNotices(undefined, undefined, false, isUniversityNoticePayloadValid_(initialData) ? initialData : undefined);
 }
 function isUniversityNoticePayloadValid_(payload) {
  return Array.isArray(payload) || Boolean(payload && Array.isArray(payload.items));
 }
-function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, fullRead = false) {
+function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, fullRead = false, backgroundPrefetch = false) {
  if (universityState.loading) return;
  const keepCurrentItems = universityState.loaded;
  const requestId = ++universityState.requestId;
  universityState.loading = true;
+ universityState.prefetchInFlight = backgroundPrefetch;
  document.getElementById('un-refresh').disabled = true;
  if (!keepCurrentItems || forceRefresh) document.getElementById('un-status').textContent = 'お知らせを読み込み中…';
  let compatibilityFallbackStarted = false;
@@ -29,12 +37,14 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, 
      .getUniversityNoticesForWeb(Boolean(forceRefresh));
     return;
    }
-   universityState.loading = false; document.getElementById('un-refresh').disabled = false;
+   universityState.loading = false; universityState.prefetchInFlight = false;
+   document.getElementById('un-refresh').disabled = false;
    document.getElementById('un-status').textContent = '一覧データの形式を確認できませんでした。更新で再読み込みしてください。';
    if (typeof onFailure === 'function') onFailure(new Error('大学のお知らせの形式を確認できませんでした。'));
    return;
   }
-  universityState.loading = false; document.getElementById('un-refresh').disabled = false;
+  universityState.loading = false; universityState.prefetchInFlight = false;
+  document.getElementById('un-refresh').disabled = false;
   if (payload && !Array.isArray(payload) && payload.testCaseClockState) applyInitialTestCaseClockState(payload.testCaseClockState);
   const previousSelected = universityState.selected;
   const cacheToken = payload && !Array.isArray(payload) ? String(payload.cacheToken || '') : '';
@@ -66,6 +76,8 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, 
   universityState.partial = Boolean(payload && payload.partial === true);
   universityState.totalCount = universityState.partial ? Number(payload.totalCount || displayItems.length) : displayItems.length;
   universityState.loaded = true;
+  universityState.prefetchedAt = backgroundPrefetch && !universityState.partial && currentScreen !== 'university'
+   ? Date.now() : 0;
   universityState.cacheToken = cacheToken;
   universityState.selected = items.some(item => item.messageId === previousSelected) ? previousSelected : null;
   if (!universityState.selected) document.getElementById('un-shell').classList.remove('is-reading');
@@ -80,7 +92,7 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, 
   if (currentQuery) handleUniversitySearchInput();
   if (universityState.partial) requestAnimationFrame(() => requestAnimationFrame(() => {
    if (requestId !== universityState.requestId || !universityState.partial || universityState.loading) return;
-   loadUniversityNotices(onSuccess, onFailure, false, undefined, true);
+   loadUniversityNotices(onSuccess, onFailure, false, undefined, true, backgroundPrefetch);
   }));
  };
  const handleFailure = error => {
@@ -95,7 +107,8 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, 
    }, delay);
    return;
   }
-  universityState.loading = false; document.getElementById('un-refresh').disabled = false;
+  universityState.loading = false; universityState.prefetchInFlight = false;
+  document.getElementById('un-refresh').disabled = false;
   if (!keepCurrentItems) document.getElementById('un-status').textContent = '読み込めませんでした。「更新」で再試行してください。';
   else if (universityState.partial) document.getElementById('un-status').textContent = '先頭のお知らせを表示しています。残りを読み込めませんでした。大学からのお知らせを開き直すと再試行します。';
   if (typeof onFailure === 'function') onFailure(new Error('大学のお知らせを読み込めませんでした。'));
@@ -107,6 +120,16 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, 
   if (!fullRead && !forceRefresh && !universityState.loaded) runner.getUniversityNoticePayloadForWeb(false, null, true);
   else runner.getUniversityNoticePayloadForWeb(Boolean(forceRefresh));
  }
+}
+function invalidateUniversityNoticePrefetchAfterSync_() {
+ universityState.prefetchedAt = 0;
+ if (!universityState.prefetchInFlight) return;
+ universityState.requestId++;
+ universityState.loading = false;
+ universityState.prefetchInFlight = false;
+ document.getElementById('un-refresh').disabled = false;
+ if (currentScreen === 'university') loadUniversityNotices();
+ else if (currentScreen === 'home') scheduleHomeViewPrefetch_();
 }
 function refreshUniversityNotices() { loadUniversityNotices(undefined, undefined, true); }
 function areUniversityNoticeCollectionsEqual_(previousItems, nextItems) {
