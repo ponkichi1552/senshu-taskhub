@@ -20,7 +20,8 @@ function doPost(e) {
         refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, 'extension-incampus-upsert', {
           sheetsBySource: storage.sheetsBySource,
           preloadedRowsBySource: {inCampus: inCampusExtractSheet.getUnifiedRowsSnapshot().slice(1)},
-          reuseUnchangedDisplaySheets: true
+          reuseUnchangedDisplaySheets: true,
+          reuseClassroomDisplayInputs: true
         });
       }
 
@@ -64,7 +65,8 @@ function doPost(e) {
         refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, 'extension-incampus-batch-upsert', {
           sheetsBySource,
           preloadedRowsBySource: {inCampus: preloadedInCampusRows},
-          reuseUnchangedDisplaySheets: true
+          reuseUnchangedDisplaySheets: true,
+          reuseClassroomDisplayInputs: true
         });
         displayBuildMs = Date.now() - displayBuildStartedAt;
       }

@@ -1986,5 +1986,116 @@ check('The changed-task measurement uses the real display write path without cha
   assert.equal(e.state.gmailSearches,0);
   assert.ok(e.state.logs.some(message=>message.includes('"sourceDataChanged":false')&&message.includes('"forcedTaskDisplayWrite":true')));
 });
+function classroomInputEnvironment() {
+  const e=firstPaintEnvironment(true);
+  const record={courseId:'SIM-COURSE',courseName:'仮想API授業',topicNames:{},
+    item:{id:'SIM-API-TASK',title:'仮想API課題',description:'仮想API詳細',
+      creationTime:'2026-10-09T00:00:00Z',dueDate:{year:2099,month:10,day:25},
+      dueTime:{hours:14,minutes:59},alternateLink:'https://classroom.example.invalid/virtual/task'},submission:{state:'NEW'}};
+  const status={status:'未確認',completedAt:'',stateSource:'classroom-api-submission'};
+  const future={...record,item:{...record.item,id:'SIM-FUTURE',title:'将来公開される仮想課題',scheduledTime:'2099-10-23T00:00:00Z'}};
+  e.state.sheets['Classroom課題'].rows=[Array.from(vm.runInContext('CLASSROOM_COURSEWORK_HEADERS',e.c)),
+    Array.from(e.c.buildClassroomApiCourseworkStorageRow_(record,new Date(),status)),
+    Array.from(e.c.buildClassroomApiCourseworkStorageRow_(future,new Date(),status))];
+  e.state.sheets['提出状況'].rows=[Array.from(vm.runInContext('CLASSROOM_SUBMISSION_HEADERS',e.c)),
+    Array.from(e.c.buildClassroomApiSubmissionStorageRow_(record,new Date()))];
+  e.state.sheets['補足通知'].rows.push(row('SIM-CLASSROOM-NOTICE','仮想Classroom案内',
+    '新しいお知らせ\n仮想案内の全文\nhttps://classroom.example.invalid/virtual/notice',
+    {source:'Google Classroom',received:new Date()}));
+  e.state.props.TASKHUB_CLASSROOM_API_STRUCTURED_SYNC_AT=new Date().toISOString();
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  return e;
+}
+check('Extension display rebuild reuses all prepared Classroom inputs without rereading any Classroom source sheet',()=>{
+  const e=classroomInputEnvironment();e.state.cache={};
+  const before=e.c.readCompleteDisplaySnapshot_(e.state.props,true).bundle;
+  const sheets={inCampus:e.state.sheets['inCampus通知'],'Google Classroom':e.state.sheets['補足通知']};
+  for(const name of ['補足通知','Classroom課題','提出状況']) {
+    e.state.sheets[name].onRead=()=>{throw new Error('must reuse Classroom inputs: '+name);};
+  }
+  const result=e.c.rebuildNotificationDisplayDataLocked_(e.ss,{sheetsBySource:sheets,reuseClassroomDisplayInputs:true,reuseUnchangedDisplaySheets:true});
+  assert.equal(result.classroomDisplayInputsReused,true);
+  const after=e.c.readCompleteDisplaySnapshot_(e.state.props,true).bundle;
+  for(const view of ['active','completed','notices'])assert.deepEqual(JSON.parse(JSON.stringify(after[view])),JSON.parse(JSON.stringify(before[view])));
+  assert.ok(after.active.some(item=>item.messageId==='classroom-api:SIM-COURSE:SIM-API-TASK'));
+  assert.ok(after.notices.some(item=>item.messageId==='SIM-CLASSROOM-NOTICE'));
+  assert.equal(e.state.gmailSearches,0);
+});
+check('Saved Classroom inputs retain future assignments and use the current clock instead of freezing prior visibility',()=>{
+  const e=classroomInputEnvironment();
+  const data=e.c.readClassroomDisplayInputsForExtension_(e.ss,e.state.props);
+  assert.ok(data.tasks.some(item=>item.messageId==='classroom-api:SIM-COURSE:SIM-FUTURE'));
+  assert.ok(!e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true).items.some(item=>item.messageId==='classroom-api:SIM-COURSE:SIM-FUTURE'));
+  const time=Date.parse('2099-10-24T01:00:00+09:00');
+  e.c.Date=class extends Date {constructor(...args){super(...(args.length?args:[time]));}static now(){return time;}static [Symbol.hasInstance](value){return value instanceof Date;}};
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseClassroomDisplayInputs:true});
+  const fast=e.c.readCompleteDisplaySnapshot_(e.state.props,true).bundle;
+  assert.ok(fast.active.some(item=>item.messageId==='classroom-api:SIM-COURSE:SIM-FUTURE'));
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  const full=e.c.readCompleteDisplaySnapshot_(e.state.props,true).bundle;
+  for(const view of ['active','completed','notices'])assert.deepEqual(JSON.parse(JSON.stringify(fast[view])),JSON.parse(JSON.stringify(full[view])));
+});
+check('Missing, corrupt, different-workbook and stale status Classroom inputs safely fall back to saved source sheets',()=>{
+  for(const reason of ['missing','corrupt','workbook','status','in-progress']) {
+    const e=classroomInputEnvironment();
+    if(reason==='missing')e.c.invalidateClassroomDisplayInputs_();
+    if(reason==='corrupt')e.state.props.TASKHUB_CLASSROOM_DISPLAY_INPUT_CHUNK_0='corrupt';
+    if(reason==='workbook') {
+      const manifest=JSON.parse(e.state.props.TASKHUB_CLASSROOM_DISPLAY_INPUT_MANIFEST);manifest.spreadsheetId='wrong-sheet';
+      e.state.props.TASKHUB_CLASSROOM_DISPLAY_INPUT_MANIFEST=JSON.stringify(manifest);
+    }
+    if(reason==='status')e.state.props.TASKHUB_TASK_DISPLAY_STATUS_GENERATION='next-status';
+    if(reason==='in-progress')e.state.props.TASKHUB_CLASSROOM_API_STRUCTURED_SYNC_IN_PROGRESS='true';
+    assert.equal(e.c.readClassroomDisplayInputsForExtension_(e.ss,e.state.props),null,reason);
+    if(reason==='in-progress') {
+      // An active writer owns the user lock. After it finishes, reuse is valid
+      // again only if it made no writes; source writers invalidate the pointer.
+      e.c.invalidateClassroomDisplayInputs_();
+      delete e.state.props.TASKHUB_CLASSROOM_API_STRUCTURED_SYNC_IN_PROGRESS;
+    }
+    const read=e.state.sheets['Classroom課題'].dataRangeCalls;
+    const result=e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseClassroomDisplayInputs:true});
+    assert.equal(result.classroomDisplayInputsReused,false,reason);
+    assert.ok(e.state.sheets['Classroom課題'].dataRangeCalls>read);
+    assert.ok(e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true).items.some(item=>item.messageId==='classroom-api:SIM-COURSE:SIM-API-TASK'));
+  }
+});
+check('Gmail invalidates the Classroom input pointer before source changes, including a deferred combined sync',()=>{
+  const e=classroomInputEnvironment();
+  e.state.props.TASKHUB_NOTIFICATION_INITIAL_BACKFILL_PENDING='true';
+  const original=e.c.normalizeNotificationSheet_;
+  let checked=0;
+  e.c.normalizeNotificationSheet_=(...args)=>{
+    assert.equal(e.state.props.TASKHUB_CLASSROOM_DISPLAY_INPUT_MANIFEST,undefined);checked++;
+    return original(...args);
+  };
+  e.c.saveClassroomMailsToSheet({deferDisplayDataRefresh:true});
+  assert.equal(checked,2);assert.equal(e.state.props.TASKHUB_CLASSROOM_DISPLAY_INPUT_MANIFEST,undefined);
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  assert.ok(e.state.props.TASKHUB_CLASSROOM_DISPLAY_INPUT_MANIFEST);
+});
+check('Full sync refreshes Classroom inputs after real source changes; status updates cannot resurrect a completed task',()=>{
+  const e=classroomInputEnvironment();
+  const task=e.state.sheets['Classroom課題'].rows[1];
+  const col=key=>e.c.getClassroomCourseworkColumn_(key);
+  task[col('タイトル')]='更新された仮想API課題';task[col('TaskHub確認状態')]='完了';task[col('TaskHub完了日時')]=new Date();
+  e.state.props.TASKHUB_TASK_DISPLAY_STATUS_GENERATION='changed-status';
+  const result=e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseClassroomDisplayInputs:true});
+  assert.equal(result.classroomDisplayInputsReused,false);
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss,{reuseClassroomDisplayInputs:true});
+  const snapshot=e.c.readCompleteDisplaySnapshot_(e.state.props,true).bundle;
+  assert.ok(!snapshot.active.some(item=>item.messageId==='classroom-api:SIM-COURSE:SIM-API-TASK'));
+  assert.ok(snapshot.completed.some(item=>item.title==='更新された仮想API課題'));
+});
+check('Classroom input property quota failures and over-budget data retain the normal Sheet rebuild path',()=>{
+  const e=classroomInputEnvironment(),props=e.c.PropertiesService.getUserProperties(),set=props.setProperty;
+  props.setProperty=(key,value)=>{if(key.startsWith('TASKHUB_CLASSROOM_DISPLAY_INPUT_'))throw new Error('simulated input quota');return set(key,value);};
+  assert.equal(e.c.writeClassroomDisplayInputsAfterSync_(e.ss,{tasks:[],notices:[]},'generation','0'),false);
+  assert.equal(e.state.props.TASKHUB_CLASSROOM_DISPLAY_INPUT_MANIFEST,undefined);
+  props.setProperty=set;
+  e.state.props['simulated-other-property']='x'.repeat(150000);
+  assert.equal(e.c.writeClassroomDisplayInputsAfterSync_(e.ss,{tasks:[],notices:[]},'generation','0'),false);
+  assert.equal(e.state.props.TASKHUB_CLASSROOM_DISPLAY_INPUT_MANIFEST,undefined);
+});
 console.log(JSON.stringify({passed:results.filter(r=>r.passed).length,total:results.length,results},null,2));
 if(results.some(r=>!r.passed))process.exitCode=1;

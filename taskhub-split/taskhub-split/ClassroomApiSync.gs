@@ -138,6 +138,7 @@ function syncClassroomApiCourseworkToSpreadsheet_(options) {
 
       const userProperties = PropertiesService.getUserProperties();
       const priorWriteWasIncomplete = userProperties.getProperty(CLASSROOM_API_STRUCTURED_SYNC_IN_PROGRESS_PROPERTY) === 'true';
+      invalidateClassroomDisplayInputs_();
       userProperties.setProperty(CLASSROOM_API_STRUCTURED_SYNC_IN_PROGRESS_PROPERTY, 'true');
       let retainedAssignmentEmailCount = 0;
       try {

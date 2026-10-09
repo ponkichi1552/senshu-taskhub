@@ -60,6 +60,7 @@ function taskhubMeasureInCampusDisplayRefresh() {
       sheetsBySource: storage.sheetsBySource,
       preloadedRowsBySource: {inCampus: sourceRows},
       reuseUnchangedDisplaySheets: true,
+      reuseClassroomDisplayInputs: true,
       // An identical task projection is deliberately rewritten to measure the
       // same publication path as a changed task. Gmail/API/source rows stay intact.
       forceWriteDisplaySheetNames: [TASK_DISPLAY_SHEET_NAME]

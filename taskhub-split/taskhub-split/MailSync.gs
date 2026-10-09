@@ -95,6 +95,9 @@ function saveClassroomMailsToSheet(options) {
         autoCompletedCount: 0
       };
     }
+    // Clear the input pointer before any source mutation, including deferred
+    // combined syncs. An interrupted writer cannot leave reusable stale inputs.
+    invalidateClassroomDisplayInputs_();
     const sheetsBySource = ensureNotificationStorageLocked_(ss);
     const savedCountsBySource = {};
     let savedCount = 0;

@@ -181,6 +181,8 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   const ss = spreadsheet || getOrCreateSpreadsheetLocked_();
   const props = PropertiesService.getUserProperties();
   const properties = props.getProperties();
+  const savedClassroomInputs = options.reuseClassroomDisplayInputs === true
+    ? readClassroomDisplayInputsForExtension_(ss, properties) : null;
   const validateDisplaySheetSchemas = shouldValidateNotificationDisplaySheets_(ss, props);
   // Keep an interrupted writer's marker until this rebuild commits. That older
   // execution may have stopped partway through replacing the prepared sheets.
@@ -188,29 +190,34 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   // remains readable during the source scan and projection below.
 
   const sheetsBySource = options.sheetsBySource || ensureNotificationStorageLocked_(ss, options);
+  const readSheetsBySource = savedClassroomInputs ? {inCampus: sheetsBySource.inCampus} : sheetsBySource;
   recordPhase('ensureStorageMs');
   const readContext = {
     testMode: false,
     spreadsheet: ss,
-    sheetsBySource,
+    sheetsBySource: readSheetsBySource,
     preloadedRowsBySource: options.preloadedRowsBySource || Object.create(null),
     sourceRowsBySource: Object.create(null),
     sheetReadMs: Object.create(null),
     sheetRowCounts: Object.create(null)
   };
   const rows = getNotificationRowsFromSheets_(
-    sheetsBySource,
+    readSheetsBySource,
     false,
     null,
     readContext,
-    {includeClassroomApi: true, mergeClassroomApiAssignments: true}
+    {includeClassroomApi: !savedClassroomInputs, mergeClassroomApiAssignments: true}
   );
   const extractedItems = getInCampusSupplementItemsForWeb_(null, null, null, readContext, true);
   recordPhase('sourceReadMs');
 
   const taskItems = rows
     .filter(row => isTaskRelatedRow_(row))
-    .map(row => addStoredTaskDateChecks_(rowToNotificationItem_(row)));
+    .map(row => addStoredTaskDateChecks_(rowToNotificationItem_(row)))
+    .concat(savedClassroomInputs ? savedClassroomInputs.tasks : []);
+  // Snapshot before task preparation attaches status/group metadata. Keep
+  // unpublished/expired tasks here so the current clock is projected each save.
+  const classroomTasks = toNotificationWebSafeValue_(taskItems.filter(item => item.source === 'Google Classroom'));
   const mergedTasks = mergeNotificationAndInCampusExtractedItemsForWeb_(
     taskItems,
     extractedItems,
@@ -227,7 +234,9 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
       item.expiresAtTime = getUniversityNoticeExpiryTimeForDisplay_(row);
       item.originalMessageIdForState = String(row.originalMessageIdForState || '');
       return item;
-    });
+    }).concat(savedClassroomInputs ? savedClassroomInputs.notices : []);
+  const classroomInputs = {tasks: classroomTasks,
+    notices: noticeItems.filter(item => item.source === 'Google Classroom')};
   const mergedNotices = filterUniversityNoticeDisplayItemsForNow_(
     buildUniversityNoticeDisplayItems_(noticeItems, extractedItems, false),
     referenceNow
@@ -282,6 +291,8 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   writeUniversityFirstPaintData_(mergedNotices, firstPaintProperties, ss.getId());
   phaseMs.firstPaintDataWriteMs = Date.now() - firstPaintStartedAt;
   publishCompleteDisplaySnapshotLocked_(completeSnapshot);
+  writeClassroomDisplayInputsAfterSync_(ss, classroomInputs, displayGeneration,
+    String(properties[TASK_DISPLAY_STATUS_GENERATION_PROPERTY] || '0'));
   props.setProperty(DISPLAY_WRITE_FINGERPRINTS_PROPERTY, JSON.stringify(writePlan.fingerprints));
   props.deleteProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY);
   recordPhase('displayMetadataCommitMs');
@@ -305,6 +316,7 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
     activeTaskCount: taskRows.length,
     completedTaskCount: completedTaskRows.length,
     noticeCount: noticeRows.length,
+    classroomDisplayInputsReused: Boolean(savedClassroomInputs),
     skippedDisplaySheetWrites: writePlan.plans.filter(plan => plan.unchanged).map(plan => plan.name),
     taskDisplayCacheEntryCount: displayCacheEntryCount
   };
