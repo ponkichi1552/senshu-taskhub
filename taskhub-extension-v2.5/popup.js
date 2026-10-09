@@ -27,6 +27,7 @@ const HUB_API_TOKEN_MIN_LENGTH = 48;
 
 let latestJson = "";
 let latestAssignment = null;
+let isManualSending = false;
 let settingsReady = Promise.resolve();
 
 function syncTimestampReset() {
@@ -478,7 +479,7 @@ async function runSetupCheck() {
 }
 
 function canSend() {
-  return Boolean(!previewOnlyInput.checked && latestAssignment && webAppUrlInput.value.trim() && apiTokenInput.value.trim());
+  return Boolean(!isManualSending && !previewOnlyInput.checked && latestAssignment && webAppUrlInput.value.trim() && apiTokenInput.value.trim());
 }
 
 function updateActionButtons() {
@@ -548,12 +549,15 @@ copyButton.addEventListener("click", async () => {
 
 sendButton.addEventListener("click", async () => {
   await settingsReady;
-  if (!latestAssignment) return;
+  if (isManualSending || !latestAssignment) return;
   if (previewOnlyInput.checked) {
     setStatus("プレビューのみがONのため、Hubへは送信しません。");
     return;
   }
 
+  const assignmentToSend = latestAssignment;
+  isManualSending = true;
+  updateActionButtons();
   setStatus("送信中...");
 
   try {
@@ -569,8 +573,10 @@ sendButton.addEventListener("click", async () => {
 
     const response = await chrome.runtime.sendMessage({
       type: "POST_INCAMPUS_ASSIGNMENT",
-      assignment: latestAssignment
+      assignment: assignmentToSend
     });
+
+    if (latestAssignment !== assignmentToSend) return;
 
     if (!response?.ok) {
       throw new Error(response?.error || "送信に失敗しました。");
@@ -585,7 +591,10 @@ sendButton.addEventListener("click", async () => {
       ? "保存済みデータと同じ内容でした。変更はありません。"
       : response.result?.updated ? "Hubへ更新しました。" : "Hubへ送信しました。");
   } catch (error) {
-    setStatus(normalizeText(error?.message || error), true);
+    if (latestAssignment === assignmentToSend) setStatus(normalizeText(error?.message || error), true);
+  } finally {
+    isManualSending = false;
+    updateActionButtons();
   }
 });
 

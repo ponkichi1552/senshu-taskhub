@@ -98,7 +98,7 @@ function content(initial = {}, options = {}) {
   })};
 }
 
-function popupWithDelayedSettings() {
+function popupWithDelayedSettings(options = {}) {
   const ids = [
     'extract', 'copy', 'send', 'clear', 'syncNow', 'reloadStatus', 'incampusDebug',
     'checkSetup', 'webAppUrl', 'apiToken', 'toggleApiToken', 'autoSyncEnabled',
@@ -123,11 +123,14 @@ function popupWithDelayedSettings() {
       }},
       runtime: {sendMessage: async message => {
         messages.push(message);
+        if (options.onRuntimeMessage) return options.onRuntimeMessage(message);
         return {ok: true, message: 'URLへ到達できました。status=200'};
       }},
       tabs: {
         query: async () => [{id: 1, url: 'https://ic.ss.senshu-u.ac.jp/portal/home'}],
-        sendMessage: async () => ({ok: true, isHomePage: true}),
+        sendMessage: async (_tabId, message) => message?.type === 'EXTRACT_INCAMPUS_ASSIGNMENT_FROM_PAGE' && options.assignment
+          ? {ok:true,assignment:typeof options.assignment==='function' ? options.assignment() : options.assignment}
+          : {ok: true, isHomePage: true},
         create: async () => {}
       }
     }
@@ -186,6 +189,31 @@ test('inCampus assignment POST includes the API token in the JSON body', async (
   assert.equal(payload.action, 'upsertInCampusAssignment');
   assert.equal(payload.apiToken, 'a'.repeat(64));
   assert.equal(payload.assignment.title, '仮想課題');
+});
+test('repeated manual send clicks issue only one request while the first save is pending', async () => {
+  let finishSave;const pending=new Promise(resolve=>{finishSave=resolve;});
+  const p=popupWithDelayedSettings({assignment:{title:'仮想課題A'},onRuntimeMessage:async()=>pending});
+  p.releaseSettings({webAppUrl:'https://script.google.com/macros/s/TEST/exec',apiToken:'a'.repeat(64),previewOnly:false});
+  await p.elements.extract.listeners.click();
+  const first=p.elements.send.listeners.click(),second=p.elements.send.listeners.click();
+  await new Promise(setImmediate);
+  try {
+    assert.equal(p.messages.filter(m=>m.type==='POST_INCAMPUS_ASSIGNMENT').length,1);
+    assert.equal(p.elements.send.disabled,true);
+  } finally {finishSave({ok:true,result:{updated:true,unchanged:true}});await Promise.all([first,second]);}
+  assert.equal(p.elements.send.disabled,false);
+  assert.match(p.elements.status.textContent,/変更はありません/);
+});
+test('an older manual save response does not overwrite a newly extracted assignment status', async () => {
+  let finishSave,assignment={title:'仮想課題A'};const pending=new Promise(resolve=>{finishSave=resolve;});
+  const p=popupWithDelayedSettings({assignment:()=>assignment,onRuntimeMessage:async()=>pending});
+  p.releaseSettings({webAppUrl:'https://script.google.com/macros/s/TEST/exec',apiToken:'a'.repeat(64),previewOnly:false});
+  await p.elements.extract.listeners.click();const save=p.elements.send.listeners.click();await new Promise(setImmediate);
+  assignment={title:'仮想課題B'};await p.elements.extract.listeners.click();
+  finishSave({ok:true,result:{updated:true,unchanged:true}});await save;
+  assert.match(p.elements.output.textContent,/仮想課題B/);
+  assert.equal(p.messages.find(m=>m.type==='POST_INCAMPUS_ASSIGNMENT').assignment.title,'仮想課題A');
+  assert.equal(p.elements.status.textContent,'抽出できました。');
 });
 test('preview mode blocks the inCampus POST', async () => {
   const {message, requests} = background({previewOnly: true});
