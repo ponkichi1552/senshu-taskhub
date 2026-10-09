@@ -1820,5 +1820,17 @@ check('Property quota failures use the committed sheet instead of failing synchr
   assert.equal(result.activeTaskCount,4);assert.equal(manifest.propertyChunks,0);
   assert.equal(e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true).items.length,4);
 });
+check('Many completed tasks do not disable a small active Home initial payload',()=>{
+  const e=firstPaintEnvironment(true);
+  const snapshot=e.c.readCompleteDisplaySnapshot_(e.state.props,true);
+  const completed=Array.from({length:100},(_,i)=>({messageId:'COMPLETED-'+i,status:'完了',
+    title:'完成済みの仮想課題'.repeat(250),displayDueGroupKey:'completed'}));
+  const manifest=e.c.stageCompleteDisplaySnapshotLocked_(e.ss,snapshot.bundle.active,completed,
+    snapshot.bundle.notices,e.state.props.TASKHUB_NOTIFICATION_DISPLAY_DATA_GENERATION,'0');
+  assert.ok(manifest.jsonLength>160000);assert.ok(manifest.propertyChunks>0);
+  e.c.publishCompleteDisplaySnapshotLocked_(manifest);
+  const initial=e.c.getCompleteInitialDisplayPayloadForWeb_('home',e.state.props);
+  assert.equal(initial.payload.items.length,4);assert.equal(initial.universityPayload.items.length,5);
+});
 console.log(JSON.stringify({passed:results.filter(r=>r.passed).length,total:results.length,results},null,2));
 if(results.some(r=>!r.passed))process.exitCode=1;

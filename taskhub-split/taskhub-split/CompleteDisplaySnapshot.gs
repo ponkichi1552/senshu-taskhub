@@ -189,14 +189,18 @@ function getCompleteDisplayPayloadForWeb_(view, properties, propertiesOnly) {
 function getCompleteInitialDisplayPayloadForWeb_(view, properties) {
   const startedAt = Date.now();
   const snapshot = readCompleteDisplaySnapshot_(properties, true);
-  if (!snapshot || snapshot.manifest.jsonLength > COMPLETE_DISPLAY_INITIAL_HTML_MAX_LENGTH) return null;
+  if (!snapshot) return null;
   const payload = completeDisplayPayload_(snapshot, view, properties);
   if (!payload) return null;
   const result = {view, payload};
   if (view === 'home') result.universityPayload = completeDisplayPayload_(snapshot, 'university', properties);
+  // Completed tasks are stored in the same bundle but are not sent at Home
+  // startup. Bound the actual HTML projection, not that larger stored bundle.
+  const initialDataLength = serializeTaskHubInitialPayload_(result).length;
+  if (initialDataLength > COMPLETE_DISPLAY_INITIAL_HTML_MAX_LENGTH) return null;
   Logger.log('TASKHUB_COMPLETE_INITIAL_PAYLOAD ' + JSON.stringify({
     view, taskCount: snapshot.manifest.counts.active, noticeCount: snapshot.manifest.counts.notices,
-    jsonLength: snapshot.manifest.jsonLength, totalMs: Date.now() - startedAt,
+    jsonLength: snapshot.manifest.jsonLength, initialDataLength, totalMs: Date.now() - startedAt,
     spreadsheetRead: false, cacheRead: false
   }));
   return result;
