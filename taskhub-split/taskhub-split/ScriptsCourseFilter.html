@@ -243,7 +243,7 @@
     button.textContent = label;
     button.disabled = Boolean(isDisabled);
     button.classList.toggle('active', Boolean(isActive));
-    button.onclick = isDisabled || !handler ? null : handler;
+    button.onclick = isDisabled || !handler ? null : () => handler();
   }
 
   function getGroupOpenState() {

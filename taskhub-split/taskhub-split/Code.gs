@@ -251,11 +251,21 @@ function getInitialTaskHubViewForWeb_(event) {
 function getInitialTaskHubPayloadForWeb_(view, userPropertiesSnapshot) {
   try {
     const firstPaint = getFirstPaintPayloadForWeb_(view, userPropertiesSnapshot);
-    if (firstPaint) return {view, payload: firstPaint};
-    const payload = view === 'university'
+    const payload = firstPaint || (view === 'university'
       ? getUniversityNoticePayloadForWeb(false, userPropertiesSnapshot)
-      : getTaskDisplayPayloadForWeb('未完了', userPropertiesSnapshot);
-    return {view, payload};
+      : getTaskDisplayPayloadForWeb('未完了', userPropertiesSnapshot));
+    const initialData = {view, payload};
+    if (view === 'home') {
+      // Both small projections are already in the same property snapshot.
+      // Never delay Home with a second full sheet read if this one is absent.
+      try {
+        const universityPayload = getFirstPaintPayloadForWeb_('university', userPropertiesSnapshot);
+        if (universityPayload) initialData.universityPayload = universityPayload;
+      } catch (error) {
+        Logger.log('TASKHUB_INITIAL_NOTICE_PREVIEW_FAILED ' + String(error && error.message || error));
+      }
+    }
+    return initialData;
   } catch (error) {
     Logger.log('TASKHUB_INITIAL_DISPLAY_PAYLOAD_FAILED ' + String(error && error.message ? error.message : error));
     return null;

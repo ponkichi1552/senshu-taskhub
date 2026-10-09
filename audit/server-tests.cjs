@@ -1611,6 +1611,34 @@ check('Sync prepares small real first-card projections; cold HTML uses them with
     assert.ok(Buffer.byteLength(e.state.props[key],'utf8')<=8000,'stored projections fit the per-property byte limit');
   }
 });
+check('Home embeds both first-card projections from one saved snapshot without extra full reads',()=>{
+  const e=firstPaintEnvironment();
+  e.state.cache={};e.state.cacheGetCalls=0;e.state.spreadsheetOpenCalls={};
+  e.c.getTaskDisplayPayloadForWeb=()=>{throw new Error('Home must not wait for all tasks');};
+  e.c.getUniversityNoticePayloadForWeb=()=>{throw new Error('Home must not wait for all notices');};
+  const home=e.c.getInitialTaskHubPayloadForWeb_('home',e.state.props);
+  assert.equal(home.payload.items.length,2);assert.equal(home.universityPayload.items.length,3);
+  assert.equal(home.payload.totalCount,4);assert.equal(home.universityPayload.totalCount,5);
+  assert.equal(home.payload.partial,true);assert.equal(home.universityPayload.partial,true);
+  assert.equal(e.state.cacheGetCalls,0);assert.deepEqual(e.state.spreadsheetOpenCalls,{});
+  assert.equal(e.c.getInitialTaskHubPayloadForWeb_('assignment',e.state.props).universityPayload,undefined);
+  e.state.props.TASKHUB_UNIVERSITY_FIRST_PAINT_DATA='gz:broken';
+  const withoutNotice=e.c.getInitialTaskHubPayloadForWeb_('home',e.state.props);
+  assert.equal(withoutNotice.payload.items.length,2);assert.equal(withoutNotice.universityPayload,undefined);
+  const original=e.c.getFirstPaintPayloadForWeb_;
+  e.c.getFirstPaintPayloadForWeb_=(view,properties)=>{
+    if(view==='university')throw new Error('optional notice projection failed');
+    return original(view,properties);
+  };
+  assert.equal(e.c.getInitialTaskHubPayloadForWeb_('home',e.state.props).payload.items.length,2);
+});
+check('Home never embeds production notice previews into a virtual-date test',()=>{
+  const e=firstPaintEnvironment();e.state.props.TASKHUB_TEST_CASE_MODE='true';
+  e.c.getTaskDisplayPayloadForWeb=()=>({items:[{messageId:'virtual-task'}]});
+  e.c.getUniversityNoticePayloadForWeb=()=>{throw new Error('optional notice preload cannot read another sheet');};
+  const home=e.c.getInitialTaskHubPayloadForWeb_('home',e.state.props);
+  assert.equal(home.payload.items[0].messageId,'virtual-task');assert.equal(home.universityPayload,undefined);
+});
 check('A task status mutation republishes the first cards and a committed projection remains safe during sheet replacement',()=>{
   const e=firstPaintEnvironment();
   const first=e.c.getFirstPaintPayloadForWeb_('assignment',e.state.props);

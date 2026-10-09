@@ -65,6 +65,10 @@
     universityState.totalCount = 0;
     universityState.prefetchedAt = 0;
     universityState.prefetchInFlight = false;
+    document.getElementById('un-list').replaceChildren();
+    document.getElementById('un-detail').replaceChildren();
+    document.getElementById('un-count').textContent = '';
+    document.getElementById('un-status').textContent = 'お知らせを読み込み中…';
   }
 
   function loadHomeNotifications(initialData) {

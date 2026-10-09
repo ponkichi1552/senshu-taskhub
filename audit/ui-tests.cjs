@@ -1086,4 +1086,52 @@ test('a pre-sync notice prefetch cannot be accepted after manual sync completes'
   f.reply(f.take('getUniversityNoticePayloadForWeb'),{items:[{...prefetchedNotice,messageId:'POST-SYNC-NOTICE'}]});
   assert.deepEqual(f.ids('universityState.items'),['POST-SYNC-NOTICE']);
 });
+function simultaneousHomePreviewFixture() {
+  return fixture(undefined,{holdBoot:true,initialPayload:{view:'home',payload:{
+    items:[item('STARTUP-TASK')],partial:true,totalCount:4,
+    homeSummary:[{displayDueGroupKey:'today',displayDueGroupCount:4,displayDueGroupCourseCountsJson:'[["仮想情報演習",4]]'}]
+  },universityPayload:{items:[prefetchedNotice],partial:true,totalCount:89,cacheToken:'startup-generation'}}});
+}
+test('Home and notice previews are ready before any full-list RPC; immediate navigation keeps one pending read',()=>{
+  const f=simultaneousHomePreviewFixture();
+  assert.equal(f.read('currentScreen'),'home');assert.equal(f.calls.length,0);
+  assert.deepEqual(f.ids('notificationData.active'),['STARTUP-TASK']);
+  assert.deepEqual(f.ids('universityState.items'),['HOME-PREFETCH-NOTICE']);
+  assert.equal(f.document.getElementById('un-list').children.length,1);
+  f.flushAnimationFrame();f.flushAnimationFrame();
+  const task=f.take('getTaskDisplayPayloadForWeb'),notice=f.take('getUniversityNoticePayloadForWeb');
+  assert.equal(f.pending('getUniversityNoticePayloadForWeb').length,1);
+  assert.equal(f.read("firstContentMarkedViews.has('university')"),false);
+  f.document.getElementById('bottom-university-button').onclick({type:'click'});
+  assert.equal(f.document.getElementById('un-list').children.length,1,'first notice stays visible while its full read is pending');
+  assert.equal(f.read('currentScreen'),'university');
+  assert.equal(f.pending('getUniversityNoticePayloadForWeb').length,1);
+  f.flushAnimationFrame();f.flushAnimationFrame();
+  assert.equal(f.read("firstContentMarkedViews.has('university')"),true);
+  f.document.getElementById('bottom-assignment-button').onclick({type:'click'});
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb').length,1);
+  assert.deepEqual(f.ids('currentRawData'),['STARTUP-TASK']);
+  f.reply(task,{items:[item('STARTUP-TASK'),item('FULL-TASK')]});
+  f.reply(notice,{items:[prefetchedNotice,{...prefetchedNotice,messageId:'FULL-NOTICE'}],cacheToken:'startup-generation'});
+  assert.equal(f.read('currentScreen'),'active');
+  assert.equal(f.pending('getUniversityNoticeBodyForWeb').length,0);
+  assert.equal(f.calls.some(call=>/sync|bootstrap|MailsToSheet/.test(call.method)),false);
+});
+test('bottom navigation never interprets the click event as an embedded assignment payload',()=>{
+  const f=fixture();f.c.setNotificationData([item('ALREADY-READ')],'active');
+  f.document.getElementById('bottom-assignment-button').onclick({type:'click',target:{id:'bottom-assignment-button'}});
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb').length,1);
+  assert.equal(f.pending('getNotificationsForWeb').length,0,'a click event must not trigger a compatibility fallback');
+  assert.deepEqual(f.ids('currentRawData'),['ALREADY-READ']);
+});
+test('changing the source removes hidden startup previews and rejects their pending full-list replies',()=>{
+  const f=simultaneousHomePreviewFixture();f.flushAnimationFrame();f.flushAnimationFrame();
+  const oldTask=f.take('getTaskDisplayPayloadForWeb'),oldNotice=f.take('getUniversityNoticePayloadForWeb');
+  f.c.applyTestCaseClockState({testCaseModeEnabled:true,testCaseClockDateTime:'2026-12-31T23:58'});
+  assert.equal(f.document.getElementById('un-list').children.length,0);
+  f.c.showUniversityNotices();
+  assert.equal(f.document.getElementById('un-list').children.length,0,'old live cards cannot reappear in the virtual-date view');
+  f.reply(oldNotice,{items:[prefetchedNotice]});f.reply(oldTask,{items:[item('OLD-REAL-TASK')]});
+  assert.deepEqual(f.ids('universityState.items'),[]);assert.deepEqual(f.ids('notificationData.active'),[]);
+});
 console.log(`${passed} UI regression tests passed.`);

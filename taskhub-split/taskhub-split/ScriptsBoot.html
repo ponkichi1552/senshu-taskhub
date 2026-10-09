@@ -46,6 +46,9 @@
       setAppView('home');
       updateBottomNavState();
       loadHomeNotifications(payload);
+      if (hasInitialPayload && isUniversityNoticePayloadValid_(initialData.universityPayload)) {
+        loadUniversityNotices(undefined, undefined, false, initialData.universityPayload, false, true);
+      }
     }
     startInitialPersonalSyncIfPending_();
   }
