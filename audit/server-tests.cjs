@@ -901,6 +901,17 @@ check('Manual page extraction preserves course and update identity plus complete
   const saved=c.buildAssignmentRow_({source:'inCampus',type:'assignment',courseName:'',title:'A',body:'new',pageUrl:url,assignmentKey:url},original),raw=JSON.parse(saved[13]);
   assert.equal(raw.courseName,'仮想情報演習');assert.equal(raw.updateText,'課題(A)が追加');assert.equal(saved[16],'report:1');assert.equal(saved[3],'new');assert.equal(saved[14],'完了');
 });
+check('Manual detail extraction does not rewrite the same course because the page omits its timetable prefix',()=>{
+  const {c}=environment(),url='https://ic.ss.senshu-u.ac.jp/lms/course/report/A';
+  const base={source:'inCampus',type:'assignment',courseName:'火5 仮想情報演習',title:'A',body:'本文',pageUrl:url,assignmentKey:'report:1',updateText:'課題(A)が追加',updateAt:'2026/10/09 08:00'};
+  const previous=c.buildAssignmentRow_(base);
+  const manual=c.buildAssignmentRow_({source:'inCampus',type:'assignment',courseName:'仮想情報演習',title:'A',body:'本文',pageUrl:url,assignmentKey:url},previous);
+  assert(c.areInCampusAssignmentRowsEquivalent_(previous,manual));
+  const rescheduled=c.buildAssignmentRow_({...base,courseName:'水5 仮想情報演習'},previous);
+  assert.equal(JSON.parse(rescheduled[13]).courseName,'水5 仮想情報演習');
+  const renamed=c.buildAssignmentRow_({...base,courseName:'別の仮想授業',assignmentKey:url},previous);
+  assert.equal(JSON.parse(renamed[13]).courseName,'別の仮想授業');
+});
 check('Extracted submission uses strict title and preserves manual undo on reprocessing',()=>{
   const e=environment(),url='https://ic.ss.senshu-u.ac.jp/lms/course/report/';const assignment=title=>({source:'inCampus',type:'assignment',title,courseName:'仮想情報演習',pageUrl:url+title,assignmentKey:title});
   e.c.upsertInCampusAssignment_(assignment('レポート10'));e.c.upsertInCampusAssignment_(assignment('レポート1'));

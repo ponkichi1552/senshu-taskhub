@@ -463,6 +463,10 @@ function buildAssignmentRow_(assignment, existingRow) {
     // A detail-page manual extraction often uses its URL as a temporary key.
     if (assignment.assignmentKey === assignment.pageUrl && (previous.assignmentKey || existingRow[16])) {
       merged.assignmentKey = previous.assignmentKey || existingRow[16];
+      if (previous.courseName && normalizeInCampusCourseNameForMatch_(assignment.courseName) ===
+          normalizeInCampusCourseNameForMatch_(previous.courseName)) {
+        merged.courseName = previous.courseName;
+      }
     }
     assignment = merged;
   }
