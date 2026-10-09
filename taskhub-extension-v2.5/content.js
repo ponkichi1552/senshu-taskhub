@@ -407,17 +407,10 @@ function findDetailValue(details, labels) {
 
   for (const label of labels) {
     const exact = normalizedEntries.find(([key]) => key === label);
-
-    if (exact?.[1]) {
-      return exact[1];
-    }
-  }
-
-  for (const label of labels) {
-    const partial = normalizedEntries.find(([key]) => key.includes(label) || label.includes(key));
-
-    if (partial?.[1]) {
-      return partial[1];
+    // An empty field is authoritative. Fuzzy matching can turn a teacher's
+    // empty attachment field into the student's submitted file information.
+    if (exact) {
+      return exact[1] || '';
     }
   }
 
@@ -451,7 +444,7 @@ function extractAssignmentFromDetailHtml(detailHtml, pageUrl, notification) {
     "";
   const body = findDetailValue(details, ["内容", "課題内容", "説明", "詳細", "本文"]);
 
-  if (!title || !Object.keys(details).some(label => /^(?:タイトル|課題名|課題タイトル|レポート名)$/.test(label)) || (!body && !periodText)) {
+  if (!title || !Object.keys(details).some(label => /^(?:タイトル|課題名|課題タイトル|レポート名)$/.test(label))) {
     return null;
   }
 

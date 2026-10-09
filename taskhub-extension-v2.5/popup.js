@@ -636,6 +636,11 @@ syncNowButton.addEventListener("click", async () => {
       dryRun
     });
 
+    if (result?.skipped) {
+      setStatus(result.reason || '同期を見送りました。');
+      return;
+    }
+
     renderSyncStatus(result || {});
 
     if (!result?.ok && result?.errors?.length) {
@@ -650,7 +655,7 @@ syncNowButton.addEventListener("click", async () => {
 
     setStatus(dryRun || result?.dryRun || result?.previewOnly
       ? `プレビュー完了: ${result?.previewCount || 0}件確認`
-      : `同期完了: ${result?.sentCount || 0}件送信`
+      : `同期完了: 新規${result?.newCount || 0}件・更新${result?.updatedCount || 0}件・変更なし${result?.unchangedCount || 0}件`
     );
   } catch (error) {
     if (isMissingContentScriptError(error)) {

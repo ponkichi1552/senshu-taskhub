@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "課題通知Hub連携",
-  "version": "2.5.13",
+  "version": "2.5.14",
   "description": "inCampusの課題・お知らせ・提出通知を課題通知Hubへ送信します。",
   "permissions": ["activeTab", "clipboardWrite", "storage"],
   "host_permissions": [

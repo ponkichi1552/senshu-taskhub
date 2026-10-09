@@ -440,6 +440,24 @@ test('visible report text keeps line breaks and filenames without hidden storage
   assert.equal(result.startAt,'2026-12-30 09:00');
   assert.equal(result.dueAt,'2027-01-05 24:00');
 });
+test('empty teacher attachments never fall back to submitted files or similar unrelated labels', () => {
+  const {c}=content();
+  const html='<div class="contents-detail"><div class="contents-header">タイトル</div><div class="contents-input-area">仮想空欄課題</div></div>'+
+    '<div class="contents-detail"><div class="contents-header">内容</div><div class="contents-input-area">課題本文</div></div>'+
+    '<div class="contents-detail"><div class="contents-header">添付ファイル</div><div class="contents-input-area"></div></div>'+
+    '<div class="contents-detail"><div class="contents-header">提出済み添付ファイル</div><div class="contents-input-area">仮想提出ファイル.pdf</div></div>';
+  const result=c.extractAssignmentFromDetailHtml(html,detailUrl,{});
+  assert.equal(result.attachment,'');
+  assert.equal(c.findDetailValue({'提出者詳細':'仮想個人情報'},['詳細']),'');
+});
+test('a recognized report with an empty body and no deadline remains a valid assignment', () => {
+  const {c}=content();
+  const html='<div class="contents-detail"><div class="contents-header">課題名</div><div class="contents-input-area">仮想タイトルのみ</div></div>'+
+    '<div class="contents-detail"><div class="contents-header">内容</div><div class="contents-input-area"></div></div>'+
+    '<div class="contents-detail"><div class="contents-header">提出期間</div><div class="contents-input-area"></div></div>';
+  const result=c.extractAssignmentFromDetailHtml(html,detailUrl,{});
+  assert(result);assert.equal(result.title,'仮想タイトルのみ');assert.equal(result.body,'');assert.equal(result.dueAt,'');
+});
 test('missing hidden IDs use URL identity and visible row IDs without collapsing different notices', () => {
   const {c}=content();
   const records=c.dedupeNotifications(c.parseReportNotifications(updatePage(
