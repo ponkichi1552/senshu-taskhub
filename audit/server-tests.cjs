@@ -1575,7 +1575,7 @@ check('Test university notices are materialized from immutable fixtures with pro
   assert.equal(afterExpiry.length,0,'changing the selected virtual date rebuilds the projection and applies the same expiry boundary');
   assert.equal(fixture.rows[1][9].getTime(),new Date(2026,8,10,9).getTime(),'virtual dates are applied only to in-memory copies');
 });
-function firstPaintEnvironment() {
+function firstPaintEnvironment(includeCompleteSnapshot = false) {
   const e=environment();
   const tasks=Array.from({length:4},(_,i)=>row('FIRST-TASK-'+i,'仮想課題'+i,body('仮想課題'+i),
     {due:'2099/10/25',received:new Date(Date.now()-i*1000)}));
@@ -1585,6 +1585,7 @@ function firstPaintEnvironment() {
   putMail(e,tasks.concat(notices));
   e.c.rebuildNotificationDisplayDataLocked_(e.ss);
   markUserStorageWarm(e);
+  if (!includeCompleteSnapshot) delete e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT;
   return e;
 }
 check('Sync prepares small real first-card projections; cold HTML uses them without CacheService or Sheets',()=>{
@@ -1693,6 +1694,131 @@ check('A Sheets date cell keeps the Japanese display format when the full univer
   e.state.sheets['大学通知表示データ'].rows[1][5]=new Date(2026,9,9,10,24);
   const value=e.c.getUniversityNoticePayloadForWeb().items[0].receivedAt;
   assert.match(value,/^2026\/10\/09 10:24/);assert.doesNotMatch(value,/GMT|Fri/);
+});
+check('Committed complete lists are included in cold Home HTML without cache, Sheets or another full-list call',()=>{
+  const e=firstPaintEnvironment(true);
+  e.state.cache={};e.state.cacheGetCalls=0;e.state.spreadsheetOpenCalls={};
+  e.c.getTaskDisplayPayloadForWeb=()=>{throw new Error('no task RPC');};
+  e.c.getUniversityNoticePayloadForWeb=()=>{throw new Error('no notice RPC');};
+  const initial=e.c.getInitialTaskHubPayloadForWeb_('home',e.state.props);
+  assert.equal(initial.payload.items.length,4);assert.equal(initial.universityPayload.items.length,5);
+  assert.equal(initial.payload.partial,false);assert.equal(initial.universityPayload.partial,false);
+  assert.equal(initial.payload.committedSnapshot,true);
+  assert.ok(initial.payload.items.every(item=>item.detailsDeferred&&!Object.hasOwn(item,'body')&&!Object.hasOwn(item,'gmailBody')));
+  assert.ok(initial.universityPayload.items.every(item=>!Object.hasOwn(item,'body')));
+  assert.equal(e.state.cacheGetCalls,0);assert.deepEqual(e.state.spreadsheetOpenCalls,{});
+  for(const [key,value]of Object.entries(e.state.props))if(key.startsWith('TASKHUB_COMPLETE_DISPLAY_CHUNK_'))assert.ok(value.length<=8000);
+});
+check('Readers keep the previous whole list while the inactive snapshot is written; one publish exposes the new generation',()=>{
+  const e=firstPaintEnvironment(true),oldManifest=e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT;
+  const old=e.c.getCompleteDisplayPayloadForWeb_('university',e.state.props,true);
+  const notification=e.state.sheets['inCampus通知'];
+  notification.rows.push(row('NEXT-NOTICE','新しい仮想案内','大学からのお知らせです。'));
+  const publish=e.c.publishCompleteDisplaySnapshotLocked_;
+  let duringWrite;
+  e.c.publishCompleteDisplaySnapshotLocked_=manifest=>{
+    assert.equal(e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT,oldManifest);
+    assert.ok(e.state.props.TASKHUB_NOTIFICATION_DISPLAY_DATA_BUILDING);
+    duringWrite=e.c.getUniversityNoticePayloadForWeb(false,null,false,true);
+    assert.deepEqual(Array.from(duringWrite.items,x=>x.messageId),Array.from(old.items,x=>x.messageId));
+    return publish(manifest);
+  };
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  const next=e.c.getUniversityNoticePayloadForWeb(false,null,false,true);
+  assert.ok(duringWrite);assert.equal(next.items.length,old.items.length+1);
+  assert.notEqual(next.snapshotId,old.snapshotId);
+});
+check('Interrupted mutable-sheet writes leave the complete published list readable even after legacy display revision is invalidated',()=>{
+  const e=firstPaintEnvironment(true),pointer=e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT;
+  const before=e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true);
+  const replace=e.c.replaceDisplaySheetRows_;
+  e.c.replaceDisplaySheetRows_=(sheet,headers,rows)=>{
+    if(sheet.getName()==='大学通知表示データ')throw new Error('simulated interrupted writer');
+    return replace(sheet,headers,rows);
+  };
+  const result=e.c.refreshNotificationDisplayDataAfterSyncLocked_(e.ss,'test-interruption');
+  assert.equal(result.ok,false);assert.equal(e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT,pointer);
+  assert.equal(e.state.props.TASKHUB_NOTIFICATION_DISPLAY_DATA_REVISION,undefined);
+  e.state.spreadsheetOpenCalls={};e.state.cacheGetCalls=0;
+  const after=e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true);
+  assert.deepEqual(Array.from(after.items,x=>x.messageId),Array.from(before.items,x=>x.messageId));
+  assert.equal(e.c.getUniversityNoticePayloadForWeb(false,null,false,true).items.length,5);
+  assert.deepEqual(e.state.spreadsheetOpenCalls,{});assert.equal(e.state.cacheGetCalls,0);
+});
+check('Large complete lists fall back to one immutable compact range and remain readable during mutable display replacement',()=>{
+  const e=firstPaintEnvironment(true),properties=e.state.props;
+  const notices=Array.from({length:400},(_,i)=>({messageId:'LARGE-'+i,title:crypto.randomBytes(300).toString('base64'),
+    source:'inCampus',preview:crypto.randomBytes(100).toString('base64'),receivedAt:'2026/10/09 10:00'}));
+  const manifest=e.c.stageCompleteDisplaySnapshotLocked_(e.ss,[],[],notices,'large-generation','0');
+  assert.equal(manifest.propertyChunks,0);e.c.publishCompleteDisplaySnapshotLocked_(manifest);
+  properties.TASKHUB_NOTIFICATION_DISPLAY_DATA_BUILDING=String(Date.now());
+  for(const name of ['課題表示データ','大学通知表示データ'])e.state.sheets[name].onRead=()=>{throw new Error('mutable rows must not be read');};
+  const sheet=e.state.sheets[manifest.slot==='a'?'表示一覧保存_A':'表示一覧保存_B'];
+  const before=sheet.readCalls.length;
+  const payload=e.c.getUniversityNoticePayloadForWeb(false,null,false,true);
+  assert.equal(payload.items.length,400);assert.equal(sheet.readCalls.length,before+1);
+  assert.equal(e.c.getCompleteInitialDisplayPayloadForWeb_('home',properties),null,'oversized HTML uses the existing first-card fallback');
+});
+check('Corrupt property chunks recover from the committed sheet; wrong workbook and test mode never reuse real lists',()=>{
+  const e=firstPaintEnvironment(true),manifest=JSON.parse(e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT);
+  const key='TASKHUB_COMPLETE_DISPLAY_CHUNK_'+manifest.slot+'_0';
+  e.state.props[key]='corrupted';
+  assert.equal(e.c.getCompleteInitialDisplayPayloadForWeb_('home',e.state.props),null);
+  assert.equal(e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true).items.length,4);
+  e.state.props.TASKHUB_SPREADSHEET_ID='wrong-workbook';
+  assert.equal(e.c.readCompleteDisplaySnapshot_(e.state.props,true),null);
+  e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';e.state.props.TASKHUB_TEST_CASE_MODE='true';
+  assert.equal(e.c.readCompleteDisplaySnapshot_(e.state.props,false),null);
+});
+check('Complete task snapshots track completion and undo, and notice state overlays never rewrite saved content',()=>{
+  const e=firstPaintEnvironment(true),initial=e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true);
+  const id=initial.items[0].messageId;
+  e.c.updateMaterializedTaskStatusLocked_(e.ss,id,'完了',new Date());
+  assert.equal(e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true).items.length,3);
+  assert.equal(e.c.getTaskDisplayPayloadForWeb('完了',null,false,true).items[0].messageId,id);
+  e.c.updateMaterializedTaskStatusLocked_(e.ss,id,'未確認','');
+  assert.equal(e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true).items.length,4);
+  assert.equal(e.c.getTaskDisplayPayloadForWeb('完了',null,false,true).items.length,0);
+  const saved=e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT;
+  const notice=e.c.getUniversityNoticePayloadForWeb(false,null,false,true).items[0];
+  e.c.setUniversityNoticeState(notice.messageId,{read:true,saved:true});
+  const next=e.c.getUniversityNoticePayloadForWeb(false,null,false,true).items[0];
+  assert.equal(next.read,true);assert.equal(next.saved,true);
+  assert.equal(e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT,saved);
+});
+check('Deferred task bodies read only the requested prepared row and reject a stale display generation',()=>{
+  const e=firstPaintEnvironment(true),payload=e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true);
+  const id=payload.items[0].messageId;
+  const sheet=e.state.sheets['課題表示データ'],before=sheet.readCalls.length;
+  const bodyResult=e.c.getTaskNotificationBodyForWeb(id,'未確認',payload.dataGeneration);
+  assert.equal(bodyResult.found,true);assert.ok(bodyResult.body.length>0);
+  const calls=sheet.readCalls.slice(before);
+  assert.ok(calls.every(call=>call.width===1),'only message IDs and one body cell are read');
+  assert.equal(e.c.getTaskNotificationBodyForWeb(id,'未確認','old-generation').stale,true);
+  assert.equal(e.c.getTaskNotificationBodyForWeb('missing-id','未確認',payload.dataGeneration).found,false);
+});
+check('A publication failure after staging new chunks keeps the old whole initial HTML and can recover on the next sync',()=>{
+  const e=firstPaintEnvironment(true),pointer=e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT;
+  const publish=e.c.publishCompleteDisplaySnapshotLocked_;
+  e.c.publishCompleteDisplaySnapshotLocked_=()=>{throw new Error('simulated pointer publication failure');};
+  const failed=e.c.refreshNotificationDisplayDataAfterSyncLocked_(e.ss,'test-publish-failure');
+  assert.equal(failed.ok,false);assert.equal(e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT,pointer);
+  const previous=e.c.getInitialTaskHubPayloadForWeb_('home',e.state.props);
+  assert.equal(previous.payload.items.length,4);assert.equal(previous.universityPayload.items.length,5);
+  e.c.publishCompleteDisplaySnapshotLocked_=publish;e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  assert.notEqual(e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT,pointer);
+  assert.equal(e.c.getInitialTaskHubPayloadForWeb_('home',e.state.props).payload.items.length,4);
+});
+check('Property quota failures use the committed sheet instead of failing synchronization or exposing partial property chunks',()=>{
+  const e=firstPaintEnvironment(true),props=e.c.PropertiesService.getUserProperties(),set=props.setProperty;
+  props.setProperty=(key,value)=>{
+    if(key.startsWith('TASKHUB_COMPLETE_DISPLAY_CHUNK_'))throw new Error('simulated property quota');
+    return set(key,value);
+  };
+  const result=e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  const manifest=JSON.parse(e.state.props.TASKHUB_COMPLETE_DISPLAY_SNAPSHOT);
+  assert.equal(result.activeTaskCount,4);assert.equal(manifest.propertyChunks,0);
+  assert.equal(e.c.getTaskDisplayPayloadForWeb('未完了',null,false,true).items.length,4);
 });
 console.log(JSON.stringify({passed:results.filter(r=>r.passed).length,total:results.length,results},null,2));
 if(results.some(r=>!r.passed))process.exitCode=1;

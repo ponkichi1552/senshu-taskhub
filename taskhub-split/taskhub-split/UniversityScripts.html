@@ -87,6 +87,7 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, 
   const selectionChanged = previousSelected !== universityState.selected;
   if (listChanged || selectionChanged) renderUniversityNotices();
   if (listChanged || selectionChanged) renderUniversityDetail();
+  markTaskHubAllListsReady_();
   if (typeof onSuccess === 'function') onSuccess(universityState.items);
   const currentQuery = document.getElementById('un-search').value.trim();
   if (currentQuery) handleUniversitySearchInput();
@@ -103,7 +104,7 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, 
    setTimeout(() => {
     if (requestId !== universityState.requestId) return;
     google.script.run.withSuccessHandler(handleSuccess).withFailureHandler(handleFailure)
-     .getUniversityNoticePayloadForWeb(Boolean(forceRefresh));
+     .getUniversityNoticePayloadForWeb(Boolean(forceRefresh), null, false, true);
    }, delay);
    return;
   }
@@ -117,8 +118,8 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData, 
   handleSuccess(initialData);
  } else {
   const runner = google.script.run.withSuccessHandler(handleSuccess).withFailureHandler(handleFailure);
-  if (!fullRead && !forceRefresh && !universityState.loaded) runner.getUniversityNoticePayloadForWeb(false, null, true);
-  else runner.getUniversityNoticePayloadForWeb(Boolean(forceRefresh));
+  if (!fullRead && !forceRefresh && !universityState.loaded) runner.getUniversityNoticePayloadForWeb(false, null, true, true);
+  else runner.getUniversityNoticePayloadForWeb(Boolean(forceRefresh), null, false, true);
  }
 }
 function invalidateUniversityNoticePrefetchAfterSync_() {

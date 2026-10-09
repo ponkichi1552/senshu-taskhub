@@ -946,7 +946,8 @@ test('initial task cards paint before the full RPC and Home totals do not count 
   f.flushAnimationFrame();assert.equal(f.calls.length,0);
   f.flushAnimationFrame();
   const full=f.take('getTaskDisplayPayloadForWeb');
-  assert.equal(full.args.length,1,'the follow-up bypasses the first-card endpoint path');
+  assert.equal(full.args[2],false,'the follow-up bypasses the first-card endpoint path');
+  assert.equal(full.args[3],true,'the follow-up can use the committed complete list');
   assert.equal(f.pending('cacheTaskDisplayItemsAfterWebDisplay').length,0);
   f.reply(full,{items:[item('first-task'),item('last-task')]});
   assert.deepEqual(f.ids('notificationData.active'),['first-task','last-task']);
@@ -959,7 +960,7 @@ test('a failed full task read keeps the painted cards and opening the view retri
   f.flushAnimationFrame();f.flushAnimationFrame();f.fail(f.take('getTaskDisplayPayloadForWeb'));
   assert.deepEqual(f.ids('notificationData.active'),['visible-task']);
   assert.match(f.document.getElementById('assignment-load-status').textContent,/残りを読み込めません/);
-  f.c.loadNotifications();assert.equal(f.take('getTaskDisplayPayloadForWeb').args.length,1);
+  f.c.loadNotifications();assert.equal(f.take('getTaskDisplayPayloadForWeb').args[2],false);
 });
 test('first university cards remain selected and preserve an in-flight read/save change when the full list arrives',()=>{
   const notice={messageId:'preview-notice',title:'最初のお知らせ',preview:'抜粋',source:'inCampus',receivedAt:'2099/10/01 10:00'};
@@ -984,14 +985,14 @@ test('a failed full university read keeps the first notice and allows a complete
   f.flushAnimationFrame();f.flushAnimationFrame();f.fail(f.take('getUniversityNoticePayloadForWeb'));
   assert.equal(f.read('universityState.items[0].messageId'),'first');
   assert.match(f.document.getElementById('un-status').textContent,/残りを読み込めません/);
-  f.c.showUniversityNotices();assert.equal(f.take('getUniversityNoticePayloadForWeb').args.length,1);
+  f.c.showUniversityNotices();assert.equal(f.take('getUniversityNoticePayloadForWeb').args[2],false);
 });
 test('initial read-only RPC requests prefer the saved first cards; full follow-ups and completion reads do not',()=>{
   const task=fixture(undefined,{holdBoot:true,initialRoute:'assignment'});
-  assert.deepEqual(task.take('getTaskDisplayPayloadForWeb').args,['未完了',null,true]);
+  assert.deepEqual(task.take('getTaskDisplayPayloadForWeb').args,['未完了',null,true,true]);
   const university=fixture(undefined,{holdBoot:true,initialRoute:'university'});
-  assert.deepEqual(university.take('getUniversityNoticePayloadForWeb').args,[false,null,true]);
-  task.c.loadCompletedNotifications();assert.deepEqual(task.take('getTaskDisplayPayloadForWeb','完了').args,['完了']);
+  assert.deepEqual(university.take('getUniversityNoticePayloadForWeb').args,[false,null,true,true]);
+  task.c.loadCompletedNotifications();assert.deepEqual(task.take('getTaskDisplayPayloadForWeb','完了').args,['完了',null,false,true]);
 });
 function homePrefetchFixture(partial = false) {
   return fixture(undefined, {holdBoot:true,initialPayload:{view:'home',payload:{
@@ -1009,7 +1010,7 @@ test('Home paints before parallel task and notice reads; assignment navigation s
   f.flushAnimationFrame();assert.equal(f.calls.length,0);
   f.flushAnimationFrame();
   const task=f.take('getTaskDisplayPayloadForWeb'),notice=f.take('getUniversityNoticePayloadForWeb');
-  assert.deepEqual(task.args,['未完了']);assert.deepEqual(notice.args,[false]);
+  assert.deepEqual(task.args,['未完了',null,false,true]);assert.deepEqual(notice.args,[false,null,false,true]);
   assert.deepEqual(f.calls.map(c=>c.method).sort(),['getTaskDisplayPayloadForWeb','getUniversityNoticePayloadForWeb']);
   f.c.loadNotifications();
   assert.equal(f.pending('getTaskDisplayPayloadForWeb').length,1,'the assignment view reuses the active Home read');
@@ -1133,5 +1134,57 @@ test('changing the source removes hidden startup previews and rejects their pend
   assert.equal(f.document.getElementById('un-list').children.length,0,'old live cards cannot reappear in the virtual-date view');
   f.reply(oldNotice,{items:[prefetchedNotice]});f.reply(oldTask,{items:[item('OLD-REAL-TASK')]});
   assert.deepEqual(f.ids('universityState.items'),[]);assert.deepEqual(f.ids('notificationData.active'),[]);
+});
+function completeStartupFixture({initialSyncPending=false}={}) {
+  const tasks=Array.from({length:4},(_,i)=>({...item('COMPLETE-TASK-'+i),detailsDeferred:true}));
+  const notices=Array.from({length:89},(_,i)=>({...prefetchedNotice,messageId:'COMPLETE-NOTICE-'+i}));
+  return fixture(undefined,{holdBoot:true,initialSyncPending,initialPayload:{view:'home',
+    payload:{items:tasks,partial:false,committedSnapshot:true,dataGeneration:'complete-generation',cacheToken:''},
+    universityPayload:{items:notices,partial:false,committedSnapshot:true,cacheToken:'snapshot:complete'}}});
+}
+test('Complete initial HTML prepares every task and notice without follow-up data, cache-write or body RPCs',()=>{
+  const f=completeStartupFixture();
+  assert.equal(f.read('notificationData.active.length'),4);assert.equal(f.read('notificationDataLoaded.active'),true);
+  assert.equal(f.read('universityState.items.length'),89);assert.equal(f.read('universityState.partial'),false);
+  assert.equal(f.document.getElementById('un-list').children.length,89);
+  f.flushAnimationFrame();f.flushAnimationFrame();assert.equal(f.calls.length,0);
+  assert.equal(f.document.body.dataset.taskhubAllTasksCount,'4');assert.equal(f.document.body.dataset.taskhubAllNoticesCount,'89');
+  f.document.getElementById('bottom-assignment-button').onclick({type:'click'});
+  assert.equal(f.read('currentRawData.length'),4);assert.equal(f.calls.length,0);
+  f.c.showHomeView();f.document.getElementById('bottom-university-button').onclick({type:'click'});
+  assert.equal(f.read('currentScreen'),'university');assert.equal(f.calls.length,0);
+});
+test('A deferred task body is fetched on demand, reused after reopen, and safely displayed as text',()=>{
+  const f=completeStartupFixture();f.c.loadNotifications();
+  f.c.toggleBody(0);
+  const request=f.take('getTaskNotificationBodyForWeb');
+  assert.deepEqual(request.args,['COMPLETE-TASK-0','未確認','complete-generation']);
+  f.c.toggleBody(0);f.c.toggleBody(0);
+  assert.equal(f.pending('getTaskNotificationBodyForWeb').length,1);
+  f.reply(request,{found:true,messageId:'COMPLETE-TASK-0',body:'<script>untrusted body</script>'});
+  assert.equal(f.document.getElementById('body-0').textContent,'<script>untrusted body</script>');
+  assert.equal(f.read('currentRawData[0].detailsDeferred'),false);
+  f.c.toggleBody(0);f.c.toggleBody(0);assert.equal(f.pending('getTaskNotificationBodyForWeb').length,0);
+});
+test('Failed deferred task detail retries after reopen and an older source response cannot restore real content',()=>{
+  const f=completeStartupFixture();f.c.loadNotifications();f.c.toggleBody(0);
+  f.fail(f.take('getTaskNotificationBodyForWeb'));assert.match(f.document.getElementById('body-0').textContent,/再試行/);
+  f.c.toggleBody(0);f.c.toggleBody(0);const retry=f.take('getTaskNotificationBodyForWeb');
+  f.c.invalidateClientNotificationData_();
+  f.reply(retry,{found:true,messageId:'COMPLETE-TASK-0',body:'OLD REAL CONTENT'});
+  assert.doesNotMatch(f.document.getElementById('body-0').textContent,/OLD REAL CONTENT/);
+  assert.deepEqual(f.ids('notificationData.active'),[]);
+});
+test('Filtered task detail buttons select the message ID instead of an index in the unfiltered task list',()=>{
+  const f=completeStartupFixture();f.c.loadNotifications();
+  f.c.toggleBody(0,encodeURIComponent('COMPLETE-TASK-3'));
+  assert.equal(f.take('getTaskNotificationBodyForWeb').args[0],'COMPLETE-TASK-3');
+});
+test('Complete startup data never suppresses the required first personal import or its post-sync task reread',()=>{
+  const f=completeStartupFixture({initialSyncPending:true});
+  const initial=f.take('bootstrapInitialPersonalDataForWeb');
+  f.c.showAssignmentView('active');
+  f.reply(initial,{started:true,apiSuccess:true,gmailSuccess:true,apiCourseworkCount:2,savedCount:1});
+  assert.equal(f.pending('getTaskDisplayPayloadForWeb').length,1,'initial empty data must be reread after the import');
 });
 console.log(`${passed} UI regression tests passed.`);

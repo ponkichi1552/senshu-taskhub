@@ -58,6 +58,7 @@
   function startInitialPersonalSyncIfPending_() {
     if (document.body.dataset.taskhubInitialSync !== 'true' || initialPersonalSyncRequestStarted) return;
     initialPersonalSyncRequestStarted = true;
+    notificationStartupSnapshotReusable = false;
     notificationSyncInFlight = true;
     setManualSyncButtonBusy(true);
     showSyncToast('初回データを取得しています（Classroom API → Gmail）…', 'loading');

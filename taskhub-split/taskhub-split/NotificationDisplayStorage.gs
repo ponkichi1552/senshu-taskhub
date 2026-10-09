@@ -263,11 +263,14 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   replaceDisplaySheetRows_(noticeSheet, UNIVERSITY_NOTICE_DISPLAY_HEADERS, noticeRows);
   phaseMs.noticeSheetWriteMs = Date.now() - phaseWriteStartedAt;
   phaseStartedAt = Date.now();
+  const displayGeneration = String(Date.now()) + ':' + Utilities.getUuid();
+  const completeSnapshot = stageCompleteDisplaySnapshotLocked_(ss, activeTasks, completedTasks,
+    mergedNotices, displayGeneration, String(props.getProperty(TASK_DISPLAY_STATUS_GENERATION_PROPERTY) || '0'));
+  recordPhase('completeSnapshotStageMs');
   SpreadsheetApp.flush();
   recordPhase('flushMs');
   phaseStartedAt = Date.now();
   props.setProperty(NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY, NOTIFICATION_DISPLAY_DATA_REVISION);
-  const displayGeneration = String(Date.now()) + ':' + Utilities.getUuid();
   props.setProperty(NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY, displayGeneration);
   const firstPaintStartedAt = Date.now();
   const firstPaintProperties = {
@@ -277,6 +280,7 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   writeTaskFirstPaintData_(activeTasks, firstPaintProperties, ss.getId());
   writeUniversityFirstPaintData_(mergedNotices, firstPaintProperties, ss.getId());
   phaseMs.firstPaintDataWriteMs = Date.now() - firstPaintStartedAt;
+  publishCompleteDisplaySnapshotLocked_(completeSnapshot);
   props.deleteProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY);
   recordPhase('displayMetadataCommitMs');
   const displayCacheWarmStartedAt = Date.now();
@@ -696,11 +700,15 @@ function getTaskDisplayCacheKey_(properties, status) {
     status === '完了' ? 'completed' : 'active', generation, statusGeneration].join(':');
 }
 
-function getTaskDisplayPayloadForWeb(status, userPropertiesSnapshot, preferFirstPaint) {
+function getTaskDisplayPayloadForWeb(status, userPropertiesSnapshot, preferFirstPaint, preferCommittedList) {
   const startedAt = Date.now();
   const propertiesStartedAt = Date.now();
   const viewStatus = status === '完了' || status === 'completed' ? '完了' : '未完了';
   const properties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  if (preferCommittedList === true) {
+    const complete = getCompleteDisplayPayloadForWeb_(viewStatus, properties, false);
+    if (complete) return complete;
+  }
   if (preferFirstPaint === true && viewStatus === '未完了') {
     const firstPaint = getFirstPaintPayloadForWeb_('assignment', properties);
     if (firstPaint) return firstPaint;
@@ -940,13 +948,21 @@ function updateMaterializedTaskStatusLocked_(spreadsheet, messageId, status, com
     insertTaskDisplayRowInOrder_(targetSheet, rowValues, status);
   }
   const activeRows = refreshTaskDisplayGroupSummariesInSheet_(activeSheet, '未完了');
-  refreshTaskDisplayGroupSummariesInSheet_(completedSheet, '完了');
+  const completedRows = refreshTaskDisplayGroupSummariesInSheet_(completedSheet, '完了');
   const props = PropertiesService.getUserProperties();
   props.setProperty(
     TASK_DISPLAY_STATUS_GENERATION_PROPERTY,
     String(Date.now()) + ':' + Utilities.getUuid()
   );
-  writeTaskFirstPaintData_(activeRows.map(taskDisplayRowToItem_), props.getProperties(), spreadsheet.getId());
+  const properties = props.getProperties();
+  writeTaskFirstPaintData_(activeRows.map(taskDisplayRowToItem_), properties, spreadsheet.getId());
+  try {
+    refreshCompleteSnapshotTaskStatusLocked_(spreadsheet, activeRows, completedRows, properties);
+  } catch (error) {
+    // The status epoch already changed, so an older task projection is rejected
+    // and readers fall back to the updated display rows if publication fails.
+    Logger.log('TASKHUB_COMPLETE_SNAPSHOT_STATUS_FAILED ' + String(error && error.message || error));
+  }
   return true;
 }
 

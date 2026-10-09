@@ -52,6 +52,7 @@
     const card = document.createElement('div');
     card.className = `card ${getCardClassByGroupKey(currentGroupKey)}`;
     const currentIndex = cardIndex++;
+    const detailMessageId = encodeURIComponent(String(item.messageId || '')).replaceAll("'", '%27');
     card.innerHTML = `
       <div class="source">${escapeHtml(item.source || '')}</div>
       <div class="course">${escapeHtml(item.courseName || '授業名未抽出')}</div>
@@ -63,7 +64,7 @@
       <div class="button-row">
         ${getClassroomOpenButtonHtml(item)}
         ${getGmailOpenButtonHtml(item)}
-        ${item.firstPaintOnly ? '<button disabled>詳細を読み込み中</button>' : `<button onclick="toggleBody(${currentIndex})">詳細</button>`}
+        ${item.firstPaintOnly ? '<button disabled>詳細を読み込み中</button>' : `<button onclick="toggleBody(${currentIndex}, '${detailMessageId}')">詳細</button>`}
         ${getStatusActionButtonHtml(item, viewMode)}
       </div>
       <div class="body" id="body-${currentIndex}">${escapeHtml(item.body || '')}</div>

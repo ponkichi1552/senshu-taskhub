@@ -1,5 +1,5 @@
 <script>
-  function toggleBody(index) {
+  function toggleBody(index, encodedMessageId) {
     const body = document.getElementById(`body-${index}`);
 
     if (!body) {
@@ -10,7 +10,37 @@
       body.style.display = 'none';
     } else {
       body.style.display = 'block';
+      const item = encodedMessageId
+        ? currentRawData.find(item => item.messageId === decodeURIComponent(encodedMessageId))
+        : currentRawData[index];
+      if (item && item.detailsDeferred) loadDeferredTaskBody_(item, body);
     }
+  }
+
+  function loadDeferredTaskBody_(item, body) {
+    if (item.bodyLoading) return;
+    const generation = clientViewDataGeneration;
+    const detailsGeneration = item.detailsGeneration;
+    item.bodyLoading = true;
+    body.textContent = '本文を読み込み中…';
+    const isCurrent = () => generation === clientViewDataGeneration &&
+      currentRawData.includes(item) && item.detailsGeneration === detailsGeneration;
+    google.script.run.withSuccessHandler(result => {
+      item.bodyLoading = false;
+      if (!isCurrent()) return;
+      if (!result || result.messageId !== item.messageId || !result.found) {
+        body.textContent = result && result.stale
+          ? '課題が更新されました。一覧を更新してから開き直してください。'
+          : '本文を読み取れませんでした。閉じてから再度開くと再試行します。';
+        return;
+      }
+      item.body = String(result.body || '');
+      item.detailsDeferred = false;
+      body.textContent = item.body;
+    }).withFailureHandler(() => {
+      item.bodyLoading = false;
+      if (isCurrent()) body.textContent = '本文を読み取れませんでした。閉じてから再度開くと再試行します。';
+    }).getTaskNotificationBodyForWeb(item.messageId, item.status, detailsGeneration);
   }
 
   function markAsDone(encodedMessageId) {

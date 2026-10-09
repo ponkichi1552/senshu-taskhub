@@ -45,6 +45,10 @@
   function invalidateClientNotificationData_() {
     clientViewDataGeneration++;
     homeViewPrefetchScheduled = false;
+    notificationStartupSnapshotReusable = false;
+    delete document.body.dataset.taskhubAllListsReadyAt;
+    delete document.body.dataset.taskhubAllTasksCount;
+    delete document.body.dataset.taskhubAllNoticesCount;
     notificationRequestIds.active++;
     notificationRequestIds.completed++;
     notificationRequestsInFlight.active = null;

@@ -2,10 +2,14 @@ function getUniversityNoticesForWeb(forceRefresh) {
   return getUniversityNoticesForWebLocked_(Boolean(forceRefresh));
 }
 
-function getUniversityNoticePayloadForWeb(forceRefresh, userPropertiesSnapshot, preferFirstPaint) {
+function getUniversityNoticePayloadForWeb(forceRefresh, userPropertiesSnapshot, preferFirstPaint, preferCommittedList) {
   const startedAt = Date.now();
   const propertiesStartedAt = Date.now();
   const properties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  if (preferCommittedList === true) {
+    const complete = getCompleteDisplayPayloadForWeb_('university', properties, false);
+    if (complete) return complete;
+  }
   if (preferFirstPaint === true && !forceRefresh) {
     const firstPaint = getFirstPaintPayloadForWeb_('university', properties);
     if (firstPaint) return firstPaint;

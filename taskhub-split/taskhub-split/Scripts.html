@@ -18,6 +18,7 @@
   let homeFirstPaintSummary = null;
   let clientViewDataGeneration = 0;
   let homeViewPrefetchScheduled = false;
+  let notificationStartupSnapshotReusable = false;
   const firstContentMarkedViews = new Set();
   let selectedCourseName = 'すべて';
   let currentScreen = 'home';
@@ -45,6 +46,19 @@
         performance.mark('taskhub-first-content-' + view);
         console.info('TASKHUB_BROWSER_FIRST_CONTENT', {view, frameMs: performance.now()});
       }
+    }));
+  }
+
+  function markTaskHubAllListsReady_() {
+    if (!notificationDataLoaded.active || !universityState.loaded || universityState.partial ||
+        document.body.dataset.taskhubAllListsReadyAt) return;
+    const generation = clientViewDataGeneration;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (generation !== clientViewDataGeneration || !notificationDataLoaded.active ||
+          !universityState.loaded || universityState.partial) return;
+      document.body.dataset.taskhubAllListsReadyAt = String(Date.now());
+      document.body.dataset.taskhubAllTasksCount = String(notificationData.active.length);
+      document.body.dataset.taskhubAllNoticesCount = String(universityState.items.length);
     }));
   }
 </script>

@@ -8,6 +8,7 @@ const path = require('node:path');
 const http = require('node:http');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const {URL} = require('node:url');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -21,7 +22,7 @@ const EXCEL_EPOCH_UTC = Date.UTC(1899, 11, 30);
 const TEST_DUE_POSITIONS = new Set(['期限切れ', '今日まで', '明日まで', '今週中', '来週以降']);
 const WEB_METHODS = new Set([
   'getNotificationsForWeb', 'getCompletedNotificationsForWeb', 'getTaskDisplayPayloadForWeb', 'getUniversityNoticePayloadForWeb',
-  'getUniversityNoticeBodyForWeb', 'searchUniversityNoticesForWeb',
+  'getUniversityNoticeBodyForWeb', 'getTaskNotificationBodyForWeb', 'searchUniversityNoticesForWeb',
   'refreshAndGetNotificationsForWeb', 'syncAndGetNotificationsForWeb', 'bootstrapInitialPersonalDataForWeb', 'markNotificationDone',
   'markNotificationUndone', 'getUniversityNoticesForWeb',
   'setUniversityNoticeState', 'getSecuritySettingsForWeb', 'rotateApiTokenForWeb',
@@ -527,9 +528,14 @@ window.google = {script: {
 
 function createContext() {
   const NativeDate = Date;
+  const blob = data => {
+    const bytes = typeof data === 'string' ? Buffer.from(data,'utf8') : Buffer.from(data);
+    return {getBytes: () => Array.from(bytes), getDataAsString: () => bytes.toString('utf8')};
+  };
   const props = {
     getProperty(key) { return state.properties[key] ?? null; },
     setProperty(key, value) { state.properties[key] = String(value); saveState(); return this; },
+    setProperties(values) {for (const [key,value] of Object.entries(values)) state.properties[key] = String(value); saveState(); return this;},
     deleteProperty(key) { delete state.properties[key]; saveState(); },
     getProperties() { return {...state.properties}; }
   };
@@ -584,6 +590,11 @@ function createContext() {
     Utilities: {
       DigestAlgorithm: {SHA_256: 'sha256'}, Charset: {UTF_8: 'utf8'},
       computeDigest(_algo, value) { return [...crypto.createHash('sha256').update(String(value)).digest()].map(n => n > 127 ? n - 256 : n); },
+      newBlob: blob,
+      gzip: input => blob(zlib.gzipSync(Buffer.from(input.getBytes()))),
+      ungzip: input => blob(zlib.gunzipSync(Buffer.from(input.getBytes()))),
+      base64Encode: bytes => Buffer.from(bytes).toString('base64'),
+      base64Decode: value => Array.from(Buffer.from(value,'base64')),
       getUuid: () => crypto.randomUUID(), formatDate: gasFormatDate
     },
     ScriptApp: {
