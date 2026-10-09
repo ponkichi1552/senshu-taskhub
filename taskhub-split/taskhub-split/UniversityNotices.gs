@@ -2,17 +2,28 @@ function getUniversityNoticesForWeb(forceRefresh) {
   return getUniversityNoticesForWebLocked_(Boolean(forceRefresh));
 }
 
-function getUniversityNoticePayloadForWeb(forceRefresh) {
+function getUniversityNoticePayloadForWeb(forceRefresh, userPropertiesSnapshot) {
   const startedAt = Date.now();
   const propertiesStartedAt = Date.now();
-  const properties = PropertiesService.getUserProperties().getProperties();
-  const propertiesMs = Date.now() - propertiesStartedAt;
+  const properties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  const propertiesMs = userPropertiesSnapshot ? 0 : Date.now() - propertiesStartedAt;
   const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
   const now = testMode ? getTestCaseReferenceNowFromProperties_(properties) : new Date();
   const cacheToken = getUniversityNoticeCacheKey_(properties, testMode, now);
   const dataStartedAt = Date.now();
   const listItems = getUniversityNoticeListItemsForWeb_(Boolean(forceRefresh), properties);
-  const items = listItems.map(toUniversityNoticeListItemForWeb_);
+  const items = testMode ? listItems.map(toUniversityNoticeListItemForWeb_) : listItems;
+  if (!testMode) {
+    // A page may have captured its initial properties just before a background
+    // sync begins replacing the prepared sheets. Verify the read generation
+    // after the range read so a mixed/partial sheet snapshot is retried.
+    const latestProperties = PropertiesService.getUserProperties().getProperties();
+    const generationBeforeRead = String(properties[NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY] || '');
+    const generationAfterRead = String(latestProperties[NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY] || '');
+    if (!isNotificationDisplayDataCurrent_(latestProperties) || generationBeforeRead !== generationAfterRead) {
+      throw new Error('大学通知表示データを更新中です。表示データの更新後に再試行します。');
+    }
+  }
   const dataMs = Date.now() - dataStartedAt;
   const clockStateStartedAt = Date.now();
   const testCaseClockState = getTestCaseClockStateForWeb(properties);
@@ -37,12 +48,18 @@ function getUniversityNoticeListItemsForWeb_(forceRefresh, properties) {
   }
 
   if (!isNotificationDisplayDataCurrent_(properties)) {
-    throw new Error('同期時に作成する大学通知表示データが未準備です。更新を実行してください。');
+    const message = isNotificationDisplayDataBuilding_(properties)
+      ? '大学通知表示データを更新中です。表示データの更新後に再試行します。'
+      : '同期時に作成する大学通知表示データが未準備です。更新を実行してください。';
+    throw new Error(message);
   }
   const spreadsheet = getSpreadsheetForRead_(properties);
   const items = getMaterializedUniversityNoticeListForWeb_(spreadsheet, properties, properties);
   if (items === null) {
-    throw new Error('大学通知の表示用シートを読み取れません。同期を再実行してください。');
+    const message = isNotificationDisplayDataBuilding_(PropertiesService.getUserProperties().getProperties())
+      ? '大学通知表示データを更新中です。表示データの更新後に再試行します。'
+      : '大学通知の表示用シートを読み取れません。同期を再実行してください。';
+    throw new Error(message);
   }
   Logger.log('TASKHUB_UNIVERSITY_NOTICE_LIST_READ ' + JSON.stringify({
     mode: 'prepared-list-only', itemCount: items.length, bodyColumnRead: false

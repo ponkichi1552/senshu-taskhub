@@ -5,6 +5,8 @@ const NOTIFICATION_DISPLAY_DATA_REVISION = '2026-10-07-v5';
 const NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY = 'TASKHUB_NOTIFICATION_DISPLAY_DATA_REVISION';
 const NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY = 'TASKHUB_NOTIFICATION_DISPLAY_DATA_BUILDING';
 const NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY = 'TASKHUB_NOTIFICATION_DISPLAY_DATA_GENERATION';
+const NOTIFICATION_DISPLAY_SCHEMA_CACHE_PROPERTY = 'TASKHUB_NOTIFICATION_DISPLAY_SCHEMA_CACHE';
+const NOTIFICATION_DISPLAY_SCHEMA_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const UNIVERSITY_NOTICE_STATE_GENERATION_PROPERTY = 'TASKHUB_UNIVERSITY_NOTICE_STATE_GENERATION';
 const UNIVERSITY_NOTICE_CACHE_PREFIX = 'taskhub-university-notices-v5';
 // This generation-scoped cache stores full bodies for repeated searches only.
@@ -15,8 +17,10 @@ const TASK_DISPLAY_SHEET_NAME = '課題表示データ';
 const COMPLETED_TASK_DISPLAY_SHEET_NAME = '完了課題表示データ';
 const UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME = '大学通知表示データ';
 const TASK_DISPLAY_STATUS_GENERATION_PROPERTY = 'TASKHUB_TASK_DISPLAY_STATUS_GENERATION';
-const TASK_DISPLAY_CACHE_PREFIX = 'taskhub-task-display-v3';
-const TASK_DISPLAY_CACHE_TTL_SECONDS = 600;
+const TASK_DISPLAY_CACHE_PREFIX = 'taskhub-task-display-v4';
+// Display generations change on every rebuild, so a longer cache lifetime does
+// not make stale rows visible. It keeps the prepared view hot between syncs.
+const TASK_DISPLAY_CACHE_TTL_SECONDS = 21600;
 const TASK_DISPLAY_CACHE_MAX_VALUE_LENGTH = 95000;
 
 const TASK_DUE_DISPLAY_GROUPS = [
@@ -127,7 +131,12 @@ function normalizeNotificationDisplayTime_(value) {
 function isNotificationDisplayDataCurrent_(userProperties) {
   const properties = userProperties || PropertiesService.getUserProperties().getProperties();
   return properties[NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY] === NOTIFICATION_DISPLAY_DATA_REVISION &&
-    !isNotificationDisplayDataBuilding_(properties);
+    !hasNotificationDisplayDataWriteMarker_(properties);
+}
+
+function hasNotificationDisplayDataWriteMarker_(userProperties) {
+  const properties = userProperties || PropertiesService.getUserProperties().getProperties();
+  return Boolean(String(properties[NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY] || '').trim());
 }
 
 function isNotificationDisplayDataBuilding_(userProperties) {
@@ -136,19 +145,54 @@ function isNotificationDisplayDataBuilding_(userProperties) {
   return Number.isFinite(startedAt) && startedAt > 0 && Date.now() - startedAt < 5 * 60 * 1000;
 }
 
+function getNotificationDisplaySchemaCacheKey_(spreadsheet) {
+  const spreadsheetId = spreadsheet && spreadsheet.getId ? spreadsheet.getId() : 'current-user';
+  return [spreadsheetId, NOTIFICATION_DISPLAY_DATA_REVISION,
+    TASK_DISPLAY_HEADERS.join('\u001f'), UNIVERSITY_NOTICE_DISPLAY_HEADERS.join('\u001f')].join('|');
+}
+
+function shouldValidateNotificationDisplaySheets_(spreadsheet, userProperties) {
+  const props = userProperties || PropertiesService.getUserProperties();
+  const saved = String(props.getProperty(NOTIFICATION_DISPLAY_SCHEMA_CACHE_PROPERTY) || '');
+  const separator = saved.indexOf('|');
+  if (separator < 1) return true;
+  const checkedAt = Number(saved.slice(0, separator));
+  const schemaKey = saved.slice(separator + 1);
+  return schemaKey !== getNotificationDisplaySchemaCacheKey_(spreadsheet) ||
+    !Number.isFinite(checkedAt) || checkedAt <= 0 || Date.now() - checkedAt >= NOTIFICATION_DISPLAY_SCHEMA_CACHE_TTL_MS;
+}
+
+function invalidateNotificationDisplaySchemaCache_() {
+  PropertiesService.getUserProperties().deleteProperty(NOTIFICATION_DISPLAY_SCHEMA_CACHE_PROPERTY);
+}
+
 /** Rebuild both prepared views from the user's saved source data. Caller holds the user lock. */
-function rebuildNotificationDisplayDataLocked_(spreadsheet) {
+function rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions) {
   const startedAt = Date.now();
+  const options = rebuildOptions || {};
+  let phaseStartedAt = startedAt;
+  const phaseMs = Object.create(null);
+  const recordPhase = name => {
+    const now = Date.now();
+    phaseMs[name] = now - phaseStartedAt;
+    phaseStartedAt = now;
+  };
   const referenceNow = new Date();
   const ss = spreadsheet || getOrCreateSpreadsheetLocked_();
   const props = PropertiesService.getUserProperties();
-  props.setProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY, String(Date.now()));
+  const validateDisplaySheetSchemas = shouldValidateNotificationDisplaySheets_(ss, props);
+  // Keep an interrupted writer's marker until this rebuild commits. That older
+  // execution may have stopped partway through replacing the prepared sheets.
+  // Normal rebuilds have no marker here, so their last complete generation
+  // remains readable during the source scan and projection below.
 
-  const sheetsBySource = ensureNotificationStorageLocked_(ss);
+  const sheetsBySource = options.sheetsBySource || ensureNotificationStorageLocked_(ss, options);
+  recordPhase('ensureStorageMs');
   const readContext = {
     testMode: false,
     spreadsheet: ss,
     sheetsBySource,
+    preloadedRowsBySource: options.preloadedRowsBySource || Object.create(null),
     sourceRowsBySource: Object.create(null),
     sheetReadMs: Object.create(null),
     sheetRowCounts: Object.create(null)
@@ -161,6 +205,7 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet) {
     {includeClassroomApi: true, mergeClassroomApiAssignments: true}
   );
   const extractedItems = getInCampusSupplementItemsForWeb_(null, null, null, readContext, true);
+  recordPhase('sourceReadMs');
 
   const taskItems = rows
     .filter(row => isTaskRelatedRow_(row))
@@ -186,33 +231,71 @@ function rebuildNotificationDisplayDataLocked_(spreadsheet) {
     buildUniversityNoticeDisplayItems_(noticeItems, extractedItems, false),
     referenceNow
   );
+  recordPhase('classifyMergeFilterSortMs');
 
-  const taskSheet = getOrCreateDisplaySheetLocked_(ss, TASK_DISPLAY_SHEET_NAME, TASK_DISPLAY_HEADERS);
-  const completedTaskSheet = getOrCreateDisplaySheetLocked_(ss, COMPLETED_TASK_DISPLAY_SHEET_NAME, TASK_DISPLAY_HEADERS);
-  const noticeSheet = getOrCreateDisplaySheetLocked_(ss, UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME, UNIVERSITY_NOTICE_DISPLAY_HEADERS);
   const taskRows = activeTasks.map(taskDisplayItemToRow_);
   const completedTaskRows = completedTasks.map(taskDisplayItemToRow_);
   const noticeRows = mergedNotices.map(item => UNIVERSITY_NOTICE_DISPLAY_FIELDS.map(field =>
     item[field] === undefined || item[field] === null ? '' : item[field]
   ));
+  recordPhase('displayRowsBuildMs');
 
+  // Keep the previous complete generation readable throughout the expensive
+  // source scan and projection. Readers pause only while these three prepared
+  // sheets are actually being replaced.
+  props.setProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY, String(Date.now()));
+  const taskSheet = getOrCreateDisplaySheetLocked_(ss, TASK_DISPLAY_SHEET_NAME, TASK_DISPLAY_HEADERS, !validateDisplaySheetSchemas);
+  const completedTaskSheet = getOrCreateDisplaySheetLocked_(ss, COMPLETED_TASK_DISPLAY_SHEET_NAME, TASK_DISPLAY_HEADERS, !validateDisplaySheetSchemas);
+  const noticeSheet = getOrCreateDisplaySheetLocked_(ss, UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME, UNIVERSITY_NOTICE_DISPLAY_HEADERS, !validateDisplaySheetSchemas);
+  if (validateDisplaySheetSchemas) {
+    props.setProperty(NOTIFICATION_DISPLAY_SCHEMA_CACHE_PROPERTY,
+      `${Date.now()}|${getNotificationDisplaySchemaCacheKey_(ss)}`);
+  }
+  recordPhase('displaySheetPrepareMs');
+
+  let phaseWriteStartedAt = Date.now();
   replaceDisplaySheetRows_(taskSheet, TASK_DISPLAY_HEADERS, taskRows);
+  phaseMs.taskSheetWriteMs = Date.now() - phaseWriteStartedAt;
+  phaseWriteStartedAt = Date.now();
   replaceDisplaySheetRows_(completedTaskSheet, TASK_DISPLAY_HEADERS, completedTaskRows);
+  phaseMs.completedTaskSheetWriteMs = Date.now() - phaseWriteStartedAt;
+  phaseWriteStartedAt = Date.now();
   replaceDisplaySheetRows_(noticeSheet, UNIVERSITY_NOTICE_DISPLAY_HEADERS, noticeRows);
+  phaseMs.noticeSheetWriteMs = Date.now() - phaseWriteStartedAt;
+  phaseStartedAt = Date.now();
   SpreadsheetApp.flush();
+  recordPhase('flushMs');
+  phaseStartedAt = Date.now();
   props.setProperty(NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY, NOTIFICATION_DISPLAY_DATA_REVISION);
-  props.setProperty(NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY,
-    String(Date.now()) + ':' + Utilities.getUuid());
+  const displayGeneration = String(Date.now()) + ':' + Utilities.getUuid();
+  props.setProperty(NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY, displayGeneration);
   props.deleteProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY);
+  recordPhase('displayMetadataCommitMs');
+  const displayCacheWarmStartedAt = Date.now();
+  let displayCacheEntryCount = 0;
+  if (props.getProperty(TEST_CASE_MODE_PROPERTY) !== 'true') {
+    const displayCacheProperties = {
+      [NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY]: NOTIFICATION_DISPLAY_DATA_REVISION,
+      [NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY]: displayGeneration,
+      [TASK_DISPLAY_STATUS_GENERATION_PROPERTY]: String(props.getProperty(TASK_DISPLAY_STATUS_GENERATION_PROPERTY) || '0')
+    };
+    displayCacheEntryCount = writeTaskDisplayCachesAfterSync_([
+      {cacheKey: getTaskDisplayCacheKey_(displayCacheProperties, '未完了'), items: activeTasks},
+      {cacheKey: getTaskDisplayCacheKey_(displayCacheProperties, '完了'), items: completedTasks}
+    ]);
+  }
+  phaseMs.taskDisplayCacheWarmMs = Date.now() - displayCacheWarmStartedAt;
 
   const result = {
     taskCount: taskRows.length + completedTaskRows.length,
     activeTaskCount: taskRows.length,
     completedTaskCount: completedTaskRows.length,
-    noticeCount: noticeRows.length
+    noticeCount: noticeRows.length,
+    taskDisplayCacheEntryCount: displayCacheEntryCount
   };
   Logger.log('TASKHUB_DISPLAY_DATA_BUILD ' + JSON.stringify({
     elapsedMs: Date.now() - startedAt,
+    phaseMs,
     sheetReadMs: readContext.sheetReadMs,
     sheetRowCounts: readContext.sheetRowCounts,
     ...result
@@ -327,17 +410,20 @@ function taskDisplayItemToRow_(item) {
   });
 }
 
-function refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, label) {
+function refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, label, rebuildOptions) {
   try {
-    return rebuildNotificationDisplayDataLocked_(spreadsheet);
+    return rebuildNotificationDisplayDataLocked_(spreadsheet, rebuildOptions);
   } catch (error) {
-    PropertiesService.getUserProperties().deleteProperty(NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY);
-    PropertiesService.getUserProperties().deleteProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY);
+    const props = PropertiesService.getUserProperties();
+    const writeWasStarted = hasNotificationDisplayDataWriteMarker_(props.getProperties());
+    if (writeWasStarted) props.deleteProperty(NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY);
+    props.deleteProperty(NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY);
     Logger.log('TASKHUB_DISPLAY_DATA_BUILD_FAILED ' + JSON.stringify({
       label: String(label || 'sync'),
-      error: String(error && error.message ? error.message : error)
+      error: String(error && error.message ? error.message : error),
+      previousGenerationPreserved: !writeWasStarted
     }));
-    return {ok: false, error: String(error && error.message ? error.message : error)};
+    return {ok: false, error: String(error && error.message ? error.message : error), previousGenerationPreserved: !writeWasStarted};
   }
 }
 
@@ -346,7 +432,6 @@ function refreshNotificationDisplayDataAfterCombinedSync_(label) {
     return runWithUserLock_('表示用データ更新', () =>
       refreshNotificationDisplayDataAfterSyncLocked_(getOrCreateSpreadsheetLocked_(), label || 'combined-sync'));
   } catch (error) {
-    PropertiesService.getUserProperties().deleteProperty(NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY);
     Logger.log('TASKHUB_DISPLAY_DATA_REFRESH_DEFERRED ' + JSON.stringify({
       label: String(label || 'combined-sync'),
       error: String(error && error.message ? error.message : error)
@@ -355,9 +440,11 @@ function refreshNotificationDisplayDataAfterCombinedSync_(label) {
   }
 }
 
-function getOrCreateDisplaySheetLocked_(spreadsheet, name, headers) {
+function getOrCreateDisplaySheetLocked_(spreadsheet, name, headers, skipSchemaValidation) {
   let sheet = spreadsheet.getSheetByName(name);
-  if (!sheet) sheet = spreadsheet.insertSheet(name);
+  const isNewSheet = !sheet;
+  if (isNewSheet) sheet = spreadsheet.insertSheet(name);
+  if (skipSchemaValidation && !isNewSheet) return sheet;
   const lastRow = sheet.getLastRow();
   const lastColumn = Math.max(sheet.getLastColumn(), headers.length);
   const currentHeader = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
@@ -441,7 +528,10 @@ function readMaterializedTaskItems_(spreadsheet, status, userProperties) {
   const values = sheet.getRange(1, 1, lastRow, TASK_DISPLAY_HEADERS.length).getValues();
   const getValuesMs = Date.now() - readStartedAt;
   const header = values[0] || [];
-  if (!TASK_DISPLAY_HEADERS.every((value, index) => header[index] === value)) return null;
+  if (!TASK_DISPLAY_HEADERS.every((value, index) => header[index] === value)) {
+    invalidateNotificationDisplaySchemaCache_();
+    return null;
+  }
   if (values.length < 2) {
     Logger.log('TASKHUB_MATERIALIZED_READ_TIMING ' + JSON.stringify({sheetName, lastRow, columns: TASK_DISPLAY_HEADERS.length, getValuesMs, mapMs: 0, itemCount: 0}));
     return [];
@@ -478,7 +568,10 @@ function readMaterializedUniversityNotices_(spreadsheet, userProperties) {
   const values = sheet.getRange(1, 1, lastRow, UNIVERSITY_NOTICE_DISPLAY_HEADERS.length).getValues();
   const getValuesMs = Date.now() - readStartedAt;
   const header = values[0] || [];
-  if (!UNIVERSITY_NOTICE_DISPLAY_HEADERS.every((value, index) => header[index] === value)) return null;
+  if (!UNIVERSITY_NOTICE_DISPLAY_HEADERS.every((value, index) => header[index] === value)) {
+    invalidateNotificationDisplaySchemaCache_();
+    return null;
+  }
   if (values.length < 2) {
     Logger.log('TASKHUB_MATERIALIZED_READ_TIMING ' + JSON.stringify({sheetName: UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME, lastRow, columns: UNIVERSITY_NOTICE_DISPLAY_HEADERS.length, getValuesMs, mapMs: 0, itemCount: 0}));
     return [];
@@ -495,26 +588,26 @@ function readMaterializedUniversityNotices_(spreadsheet, userProperties) {
   return items;
 }
 
-function readMaterializedUniversityNoticeList_(spreadsheet, userProperties) {
+function readMaterializedUniversityNoticeList_(spreadsheet, userProperties, noticeStates) {
   if (!isNotificationDisplayDataCurrent_(userProperties)) return null;
   const sheet = spreadsheet && spreadsheet.getSheetByName(UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME);
   if (!sheet) return null;
   const lastRow = sheet.getLastRow();
   if (lastRow < 1) return null;
-  const bodyIndex = UNIVERSITY_NOTICE_DISPLAY_FIELDS.indexOf('body');
+  const stateIdIndex = UNIVERSITY_NOTICE_DISPLAY_FIELDS.indexOf('originalMessageIdForState');
+  const readWidth = stateIdIndex + 1;
   const readStartedAt = Date.now();
-  // body is the final column, so this range retrieves the prepared list and
-  // preview without transferring any full email bodies to Apps Script. The
-  // header is included in this same read to avoid a separate Sheets RPC.
-  const values = sheet.getRange(1, 1, lastRow, bodyIndex).getValues();
+  // Read only compact list columns plus the Gmail ID used for state matching.
+  // The body, expiry, and extraction-link columns are unnecessary at page boot.
+  const values = sheet.getRange(1, 1, lastRow, readWidth).getValues();
   const getValuesMs = Date.now() - readStartedAt;
   const header = values[0] || [];
-  if (!UNIVERSITY_NOTICE_DISPLAY_HEADERS.slice(0, bodyIndex).every((value, index) => header[index] === value)) return null;
+  if (!UNIVERSITY_NOTICE_DISPLAY_HEADERS.slice(0, readWidth).every((value, index) => header[index] === value)) return null;
   if (values.length < 2) {
     Logger.log('TASKHUB_MATERIALIZED_READ_TIMING ' + JSON.stringify({
       sheetName: UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME,
       lastRow,
-      columns: bodyIndex,
+      columns: readWidth,
       bodyColumnRead: false,
       getValuesMs,
       mapMs: 0,
@@ -523,18 +616,35 @@ function readMaterializedUniversityNoticeList_(spreadsheet, userProperties) {
     return [];
   }
   const mapStartedAt = Date.now();
-  const listFields = UNIVERSITY_NOTICE_DISPLAY_FIELDS.slice(0, bodyIndex);
-  const items = values.slice(1).map(row => {
-    const item = {};
-    listFields.forEach((field, index) => { item[field] = row[index] === null ? '' : row[index]; });
-    item.receivedAtTime = Number(item.receivedAtTime || 0);
-    item.expiresAtTime = item.expiresAtTime === '' ? null : Number(item.expiresAtTime);
-    return toNotificationWebSafeValue_(item);
-  }).filter(item => String(item.messageId || ''));
+  const statePrefix = getUniversityNoticeStatePrefix_(false);
+  const stateMap = noticeStates || {};
+  const items = [];
+  values.slice(1).forEach(row => {
+    const messageId = String(row[0] || '');
+    if (!messageId) return;
+    let state = {};
+    const originalMessageId = String(row[stateIdIndex] || '');
+    const savedState = stateMap[statePrefix + messageId] ||
+      (originalMessageId ? stateMap[statePrefix + originalMessageId] : '') || '{}';
+    try { state = JSON.parse(savedState); } catch (_) {}
+    items.push({
+      messageId,
+      source: String(row[1] || ''),
+      title: String(row[2] || ''),
+      courseName: String(row[3] || ''),
+      from: String(row[4] || ''),
+      receivedAt: String(row[5] || ''),
+      receivedAtTime: Number(row[6] || 0),
+      gmailLink: String(row[7] || ''),
+      preview: String(row[8] || ''),
+      read: Boolean(state.read),
+      saved: Boolean(state.saved)
+    });
+  });
   Logger.log('TASKHUB_MATERIALIZED_READ_TIMING ' + JSON.stringify({
     sheetName: UNIVERSITY_NOTICE_DISPLAY_SHEET_NAME,
     lastRow,
-    columns: bodyIndex,
+    columns: readWidth,
     bodyColumnRead: false,
     getValuesMs,
     mapMs: Date.now() - mapStartedAt,
@@ -576,18 +686,33 @@ function getTaskDisplayCacheKey_(properties, status) {
     status === '完了' ? 'completed' : 'active', generation, statusGeneration].join(':');
 }
 
-function getTaskDisplayPayloadForWeb(status) {
+function getTaskDisplayPayloadForWeb(status, userPropertiesSnapshot) {
   const startedAt = Date.now();
   const propertiesStartedAt = Date.now();
   const viewStatus = status === '完了' || status === 'completed' ? '完了' : '未完了';
-  const properties = PropertiesService.getUserProperties().getProperties();
-  const propertiesMs = Date.now() - propertiesStartedAt;
+  const properties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
+  const propertiesMs = userPropertiesSnapshot ? 0 : Date.now() - propertiesStartedAt;
   const testMode = properties[TEST_CASE_MODE_PROPERTY] === 'true';
-  const cacheToken = testMode || properties[NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY] !== NOTIFICATION_DISPLAY_DATA_REVISION
+  const candidateCacheToken = testMode || properties[NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY] !== NOTIFICATION_DISPLAY_DATA_REVISION
     ? ''
     : getTaskDisplayCacheKey_(properties, viewStatus);
   const dataStartedAt = Date.now();
-  const items = viewStatus === '完了' ? getCompletedNotificationsForWeb(properties) : getNotificationsForWeb(properties);
+  const readResult = viewStatus === '完了'
+    ? getCompletedNotificationsForWebLocked_(properties, true)
+    : getNotificationsForWebLocked_(properties, true);
+  const items = readResult.items;
+  const cacheHit = readResult.cacheHit === true;
+  if (!testMode && !cacheHit) {
+    const latestProperties = PropertiesService.getUserProperties().getProperties();
+    const generationBeforeRead = String(properties[NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY] || '');
+    const generationAfterRead = String(latestProperties[NOTIFICATION_DISPLAY_DATA_GENERATION_PROPERTY] || '');
+    if (!isNotificationDisplayDataCurrent_(latestProperties) || generationBeforeRead !== generationAfterRead) {
+      throw new Error('課題表示データを更新中です。表示データの更新後に再試行します。');
+    }
+  }
+  // A hit means sync already populated this exact generation. Do not issue a
+  // redundant browser RPC to write the same items after they have rendered.
+  const cacheToken = cacheHit ? '' : candidateCacheToken;
   const dataMs = Date.now() - dataStartedAt;
   const clockStateStartedAt = Date.now();
   const testCaseClockState = getTestCaseClockStateForWeb(properties);
@@ -598,6 +723,7 @@ function getTaskDisplayPayloadForWeb(status) {
     totalMs: Date.now() - startedAt,
     status: viewStatus,
     itemCount: items.length,
+    cacheHit,
     cacheTokenAvailable: Boolean(cacheToken)
   }));
   return {items, cacheToken, status: viewStatus, testCaseClockState};
@@ -640,21 +766,52 @@ function readTaskDisplayCache_(properties, status) {
 function writeTaskDisplayCache_(cacheKey, items) {
   if (!cacheKey || typeof CacheService === 'undefined' || typeof CacheService.getUserCache !== 'function') return false;
   try {
-    const json = JSON.stringify(items);
-    let encoded = 'json:' + json;
-    try {
-      const compressed = Utilities.gzip(Utilities.newBlob(json, 'application/json'));
-      const gzipEncoded = 'gz:' + Utilities.base64Encode(compressed.getBytes());
-      if (gzipEncoded.length < encoded.length) encoded = gzipEncoded;
-    } catch (_) {
-      // Keep the plain JSON fallback for local shims and older Apps Script runtimes.
-    }
-    if (encoded.length > TASK_DISPLAY_CACHE_MAX_VALUE_LENGTH) return false;
+    const encoded = encodeTaskDisplayCacheValue_(items);
+    if (!encoded) return false;
     CacheService.getUserCache().put(cacheKey, encoded, TASK_DISPLAY_CACHE_TTL_SECONDS);
     return true;
   } catch (error) {
     Logger.log('TASKHUB_TASK_DISPLAY_CACHE_WRITE_FAILED ' + String(error && error.message ? error.message : error));
     return false;
+  }
+}
+
+function encodeTaskDisplayCacheValue_(items) {
+  if (!Array.isArray(items) || items.length > 1500) return '';
+  const json = JSON.stringify(items);
+  let encoded = 'json:' + json;
+  try {
+    const compressed = Utilities.gzip(Utilities.newBlob(json, 'application/json'));
+    const gzipEncoded = 'gz:' + Utilities.base64Encode(compressed.getBytes());
+    if (gzipEncoded.length < encoded.length) encoded = gzipEncoded;
+  } catch (_) {
+    // Keep the plain JSON fallback for local shims and older Apps Script runtimes.
+  }
+  return encoded.length <= TASK_DISPLAY_CACHE_MAX_VALUE_LENGTH ? encoded : '';
+}
+
+/** Warm the two task views during background sync so the next page load avoids Sheets. */
+function writeTaskDisplayCachesAfterSync_(entries) {
+  if (typeof CacheService === 'undefined' || typeof CacheService.getUserCache !== 'function') return 0;
+  const values = Object.create(null);
+  (Array.isArray(entries) ? entries : []).forEach(entry => {
+    if (!entry || !entry.cacheKey) return;
+    const encoded = encodeTaskDisplayCacheValue_(entry.items);
+    if (encoded) values[entry.cacheKey] = encoded;
+  });
+  const keys = Object.keys(values);
+  if (!keys.length) return 0;
+  try {
+    const cache = CacheService.getUserCache();
+    if (typeof cache.putAll === 'function') {
+      cache.putAll(values, TASK_DISPLAY_CACHE_TTL_SECONDS);
+    } else {
+      keys.forEach(key => cache.put(key, values[key], TASK_DISPLAY_CACHE_TTL_SECONDS));
+    }
+    return keys.length;
+  } catch (error) {
+    Logger.log('TASKHUB_TASK_DISPLAY_CACHE_WARM_FAILED ' + String(error && error.message ? error.message : error));
+    return 0;
   }
 }
 
@@ -740,17 +897,7 @@ function getMaterializedUniversityNoticesForWeb_(spreadsheet, referenceNow, stat
 }
 
 function getMaterializedUniversityNoticeListForWeb_(spreadsheet, states, userProperties) {
-  const items = readMaterializedUniversityNoticeList_(spreadsheet, userProperties);
-  if (!items) return null;
-  const statePrefix = getUniversityNoticeStatePrefix_(false);
-  const stateMap = states || {};
-  return items.map(item => {
-    let state = {};
-    const storedState = stateMap[statePrefix + item.messageId] ||
-      (item.originalMessageIdForState ? stateMap[statePrefix + item.originalMessageIdForState] : '') || '{}';
-    try { state = JSON.parse(storedState); } catch (_) {}
-    return Object.assign(item, {read: Boolean(state.read), saved: Boolean(state.saved)});
-  });
+  return readMaterializedUniversityNoticeList_(spreadsheet, userProperties, states);
 }
 
 function updateMaterializedTaskStatusLocked_(spreadsheet, messageId, status, completedAt) {

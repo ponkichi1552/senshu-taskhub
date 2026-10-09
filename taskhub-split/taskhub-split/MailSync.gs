@@ -489,13 +489,16 @@ function ensureNotificationStorage_(ss) {
   return runWithUserLock_('保存データ処理', () => ensureNotificationStorageLocked_(ss));
 }
 
-function ensureNotificationStorageLocked_(ss) {
+function ensureNotificationStorageLocked_(ss, options) {
   const spreadsheet = ss || getOrCreateSpreadsheet_();
+  const prepareOptions = options || {};
   ensureClassroomStructuredStorageLocked_(spreadsheet);
   const sheetsBySource = {};
 
   NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
-    sheetsBySource[storageConfig.source] = getOrCreateNotificationSheet_(spreadsheet, storageConfig.source);
+    sheetsBySource[storageConfig.source] = storageConfig.source === 'inCampus' && prepareOptions.inCampusSheet
+      ? prepareOptions.inCampusSheet
+      : getOrCreateNotificationSheet_(spreadsheet, storageConfig.source);
   });
 
   migrateLegacyNotificationSheet_(spreadsheet, sheetsBySource);
@@ -718,7 +721,8 @@ function normalizeNotificationSheet_(sheet, storageConfig) {
 }
 
 function normalizeUnifiedInCampusNotificationSheet_(sheet, storageConfig) {
-  setupInCampusUnifiedHeader_(sheet);
+  const spreadsheet = sheet && typeof sheet.getParent === 'function' ? sheet.getParent() : null;
+  setupInCampusUnifiedHeader_(sheet, spreadsheet);
   ensureNotificationProcessingMetadataHeader_(sheet, 'inCampus');
   const width = Math.max(sheet.getLastColumn(), INCAMPUS_UNIFIED_HEADERS.length + 1);
   const allRows = sheet.getLastRow() >= 2

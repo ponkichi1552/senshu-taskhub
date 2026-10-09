@@ -24,7 +24,9 @@
     }
 
     const requestId = ++notificationRequestIds[viewMode];
-    const requestState = {method, requestId, statusGeneration, options, compatibilityFallbackStarted: false};
+    const requestState = {method, requestId, statusGeneration, options, compatibilityFallbackStarted: false,
+      transientRetryCount: Number(options.transientRetryCount || 0)};
+    const transientRetryDelays = [100, 250, 500, 1000, 1500, 2000, 3000];
     notificationRequestsInFlight[viewMode] = requestState;
     const isCurrentRequest = () => requestId === notificationRequestIds[viewMode]
       && statusGeneration === notificationStatusGeneration;
@@ -100,6 +102,17 @@
           if (typeof options.onStale === 'function') options.onStale(error, true);
           return;
         }
+        if (/課題表示データを更新中/.test(getErrorMessage(error)) &&
+            requestState.transientRetryCount < transientRetryDelays.length) {
+          const delay = transientRetryDelays[requestState.transientRetryCount++];
+          setTimeout(() => {
+            if (!isCurrentRequest()) return;
+            requestNotificationData(viewMode, Object.assign({}, options, {
+              transientRetryCount: requestState.transientRetryCount
+            }));
+          }, delay);
+          return;
+        }
         console.error(error);
         if (options.loadingText && currentScreen === viewMode) {
           list.textContent = 'エラーが発生しました：' + getErrorMessage(error);
@@ -127,7 +140,8 @@
 
   function loadNotifications(initialData) {
     closeCourseFilterPanel();
-    showAssignmentView('active');
+    const hasEmbeddedItems = Boolean(initialData && Array.isArray(initialData.items));
+    showAssignmentView('active', {deferRender: hasEmbeddedItems});
     if (notificationSyncInFlight) return;
     const options = notificationDataLoaded.active
       ? {remember: true}

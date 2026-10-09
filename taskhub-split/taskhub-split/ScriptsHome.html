@@ -83,12 +83,12 @@
     }
   }
 
-  function showAssignmentView(viewMode = 'active') {
+  function showAssignmentView(viewMode = 'active', options = {}) {
     currentScreen = viewMode === 'completed' ? 'completed' : 'active';
     currentViewMode = currentScreen;
     setAppView('assignment');
     updateBottomNavState();
-    refreshCurrentView();
+    if (!options.deferRender) refreshCurrentView();
   }
 
   function setAppView(viewName) {

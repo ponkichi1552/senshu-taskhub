@@ -2,8 +2,6 @@
   groupOpenState = getGroupOpenState();
   let initialPersonalSyncRequestStarted = false;
 
-  updateBottomNavState();
-  renderHome();
   showHelpOnFirstVisit();
 
   function getInitialTaskHubPayload_() {
@@ -28,6 +26,8 @@
     } else if (view === 'assignment') {
       loadNotifications(payload);
     } else {
+      setAppView('home');
+      updateBottomNavState();
       loadHomeNotifications(payload);
     }
     startInitialPersonalSyncIfPending_();

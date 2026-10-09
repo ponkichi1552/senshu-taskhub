@@ -1,19 +1,29 @@
 /** Create and migrate the single physical inCampus notification/extraction tab. */
+const INCAMPUS_RECORD_MARKER_CHECK_PROPERTY = 'TASKHUB_INCAMPUS_RECORD_MARKER_CHECK';
+const INCAMPUS_LEGACY_MIGRATION_CHECK_PROPERTY = 'TASKHUB_INCAMPUS_LEGACY_MIGRATION_CHECK';
+
 function getOrCreateInCampusUnifiedSheetLocked_(spreadsheet) {
   const ss = spreadsheet || getTargetSpreadsheet_();
   let sheet = ss.getSheetByName(INCAMPUS_SHEET_NAME);
   if (!sheet) sheet = ss.insertSheet(INCAMPUS_SHEET_NAME);
-  setupInCampusUnifiedHeader_(sheet);
-  migrateLegacyInCampusExtractionLocked_(ss, sheet);
+  setupInCampusUnifiedHeader_(sheet, ss);
+  const properties = PropertiesService.getUserProperties();
+  const migrationKey = getInCampusSchemaCheckKey_(ss, sheet, 'legacy-v1');
+  const spreadsheetId = String(ss.getId ? ss.getId() : 'default');
+  const legacyMigration = properties.getProperty(LEGACY_INCAMPUS_EXTRACT_MIGRATION_PROPERTY);
+  if (properties.getProperty(INCAMPUS_LEGACY_MIGRATION_CHECK_PROPERTY) !== migrationKey && legacyMigration !== spreadsheetId) {
+    migrateLegacyInCampusExtractionLocked_(ss, sheet);
+    properties.setProperty(INCAMPUS_LEGACY_MIGRATION_CHECK_PROPERTY, migrationKey);
+  }
   return sheet;
 }
 
-function setupInCampusUnifiedHeader_(sheet) {
+function setupInCampusUnifiedHeader_(sheet, spreadsheet) {
   const width = Math.max(sheet.getLastColumn(), INCAMPUS_UNIFIED_HEADERS.length);
   const currentHeader = sheet.getRange(1, 1, 1, width).getValues()[0];
   const isUnified = INCAMPUS_UNIFIED_HEADERS.every((header, index) => currentHeader[index] === header);
   if (isUnified) {
-    ensureInCampusRecordTypeMarkers_(sheet, width);
+    ensureInCampusRecordTypeMarkers_(sheet, width, spreadsheet);
     return;
   }
 
@@ -56,7 +66,7 @@ function setupInCampusUnifiedHeader_(sheet) {
     sheet.getRange(2, 1, unifiedRows.length, INCAMPUS_UNIFIED_HEADERS.length).setValues(unifiedRows);
   }
   sheet.setFrozenRows(1);
-  ensureInCampusRecordTypeMarkers_(sheet, Math.max(width, INCAMPUS_UNIFIED_HEADERS.length));
+  ensureInCampusRecordTypeMarkers_(sheet, Math.max(width, INCAMPUS_UNIFIED_HEADERS.length), spreadsheet);
 }
 
 function isLegacyNotificationMailHeader_(header) {
@@ -64,25 +74,42 @@ function isLegacyNotificationMailHeader_(header) {
     HEADER_ROW.slice(0, 15).every((name, index) => header[index] === name);
 }
 
-function ensureInCampusRecordTypeMarkers_(sheet, width) {
+function ensureInCampusRecordTypeMarkers_(sheet, width, spreadsheet) {
+  const properties = PropertiesService.getUserProperties();
+  const markerKey = getInCampusSchemaCheckKey_(spreadsheet, sheet, 'markers-v1');
+  if (properties.getProperty(INCAMPUS_RECORD_MARKER_CHECK_PROPERTY) === markerKey) return;
   const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return;
-  const values = sheet.getRange(2, 1, lastRow - 1, Math.max(width, INCAMPUS_UNIFIED_HEADERS.length)).getValues();
-  let changed = false;
-  values.forEach(row => {
-    const typeIndex = INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN;
-    if (row[typeIndex]) return;
-    if (String(row[2] || '') === 'inCampus') {
-      row[typeIndex] = INCAMPUS_GMAIL_RECORD_TYPE;
-      changed = true;
-    } else if (row.slice(INCAMPUS_UNIFIED_EXTRACT_START_COLUMN).some(value => value !== '' && value !== null && value !== undefined)) {
-      row[typeIndex] = INCAMPUS_EXTRACT_RECORD_TYPE;
-      changed = true;
+  if (lastRow >= 2) {
+    const values = sheet.getRange(2, 1, lastRow - 1, Math.max(width, INCAMPUS_UNIFIED_HEADERS.length)).getValues();
+    let changed = false;
+    values.forEach(row => {
+      const typeIndex = INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN;
+      if (row[typeIndex]) return;
+      if (String(row[2] || '') === 'inCampus') {
+        row[typeIndex] = INCAMPUS_GMAIL_RECORD_TYPE;
+        changed = true;
+      } else if (row.slice(INCAMPUS_UNIFIED_EXTRACT_START_COLUMN).some(value => value !== '' && value !== null && value !== undefined)) {
+        row[typeIndex] = INCAMPUS_EXTRACT_RECORD_TYPE;
+        changed = true;
+      }
+    });
+    if (changed) {
+      sheet.getRange(2, 1, values.length, Math.max(width, INCAMPUS_UNIFIED_HEADERS.length)).setValues(values);
     }
-  });
-  if (changed) {
-    sheet.getRange(2, 1, values.length, Math.max(width, INCAMPUS_UNIFIED_HEADERS.length)).setValues(values);
   }
+  properties.setProperty(INCAMPUS_RECORD_MARKER_CHECK_PROPERTY, markerKey);
+}
+
+function getInCampusSchemaCheckKey_(spreadsheet, sheet, revision) {
+  let workbook = spreadsheet;
+  if (!workbook && sheet && typeof sheet.getParent === 'function') workbook = sheet.getParent();
+  let spreadsheetId = workbook && workbook.getId ? workbook.getId() : '';
+  if (!spreadsheetId) {
+    const properties = PropertiesService.getUserProperties();
+    spreadsheetId = properties.getProperty(USER_SPREADSHEET_ID_PROPERTY) || '';
+  }
+  const sheetId = sheet && sheet.getSheetId ? sheet.getSheetId() : '';
+  return `${spreadsheetId || 'current-user'}:${sheetId}:${revision}`;
 }
 
 function migrateLegacyInCampusExtractionLocked_(spreadsheet, destinationSheet) {
@@ -194,10 +221,16 @@ function migrateLegacyInCampusExtractionLocked_(spreadsheet, destinationSheet) {
 /** Expose only extraction records to the existing inCampus parser/writer code. */
 function createInCampusExtractSheetAdapter_(unifiedSheet) {
   const getHeader = () => INCAMPUS_HEADERS.slice();
+  let lastReadRecords = null;
+  let lastReadPhysicalRows = null;
 
   function getRecordsSafely_() {
-    if (!unifiedSheet || unifiedSheet.getLastRow() < 2) return [];
+    if (!unifiedSheet || unifiedSheet.getLastRow() < 2) {
+      lastReadPhysicalRows = [];
+      return [];
+    }
     const values = unifiedSheet.getRange(2, 1, unifiedSheet.getLastRow() - 1, INCAMPUS_UNIFIED_HEADERS.length).getValues();
+    lastReadPhysicalRows = values;
     return values.map((row, index) => ({
       physicalRow: index + 2,
       values: row.slice(INCAMPUS_UNIFIED_EXTRACT_START_COLUMN, INCAMPUS_UNIFIED_EXTRACT_START_COLUMN + INCAMPUS_HEADERS.length),
@@ -216,15 +249,67 @@ function createInCampusExtractSheetAdapter_(unifiedSheet) {
   }
 
   function writeRange_(row, column, values) {
-    const records = getRecordsSafely_();
-    values.forEach((sourceRow, rowOffset) => {
-      const logicalRow = row + rowOffset;
-      if (logicalRow < 2) throw new Error('inCampus抽出の見出しは変更できません。');
-      const record = records[logicalRow - 2];
+    updateExtractedRanges_(values.map((sourceRow, rowOffset) => ({
+      row: row + rowOffset,
+      column,
+      values: sourceRow
+    })));
+  }
+
+  function updateExtractedRanges_(updates) {
+    const records = lastReadRecords || getRecordsSafely_();
+    if (!updates.length) return;
+    const mapped = updates.map(update => {
+      if (update.row < 2) throw new Error('inCampus抽出の見出しは変更できません。');
+      const record = records[update.row - 2];
       if (!record) throw new Error('更新対象のinCampus抽出行が見つかりません。');
-      unifiedSheet.getRange(record.physicalRow, INCAMPUS_UNIFIED_EXTRACT_START_COLUMN + column, 1, sourceRow.length)
-        .setValues([sourceRow]);
+      return {record, column: update.column, values: update.values};
     });
+    const firstPhysicalRow = Math.min(...mapped.map(update => update.record.physicalRow));
+    const lastPhysicalRow = Math.max(...mapped.map(update => update.record.physicalRow));
+    const firstColumn = Math.min(...mapped.map(update => update.column));
+    const lastColumn = Math.max(...mapped.map(update => update.column + update.values.length - 1));
+    const rowCount = lastPhysicalRow - firstPhysicalRow + 1;
+    const columnCount = lastColumn - firstColumn + 1;
+    const startColumnOffset = INCAMPUS_UNIFIED_EXTRACT_START_COLUMN + firstColumn - 1;
+    const values = Array.from({length: rowCount}, (_, rowOffset) => {
+      const physicalRow = firstPhysicalRow + rowOffset;
+      const physicalValues = lastReadPhysicalRows[physicalRow - 2] || [];
+      return Array.from({length: columnCount}, (_, columnOffset) => {
+        const value = physicalValues[startColumnOffset + columnOffset];
+        return value === undefined ? '' : value;
+      });
+    });
+    mapped.forEach(update => {
+      const rowOffset = update.record.physicalRow - firstPhysicalRow;
+      const columnOffset = update.column - firstColumn;
+      update.values.forEach((value, index) => { values[rowOffset][columnOffset + index] = value; });
+    });
+    unifiedSheet.getRange(firstPhysicalRow, INCAMPUS_UNIFIED_EXTRACT_START_COLUMN + firstColumn,
+      rowCount, columnCount).setValues(values);
+    values.forEach((row, rowOffset) => {
+      const physicalValues = lastReadPhysicalRows[firstPhysicalRow - 2 + rowOffset];
+      row.forEach((value, columnOffset) => {
+        physicalValues[startColumnOffset + columnOffset] = value;
+      });
+    });
+    lastReadRecords = null;
+  }
+
+  function appendRows_(rows) {
+    if (!rows.length) return;
+    const unifiedRows = rows.map(values => {
+      const row = Array(INCAMPUS_UNIFIED_HEADERS.length).fill('');
+      row[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] = INCAMPUS_EXTRACT_RECORD_TYPE;
+      INCAMPUS_HEADERS.forEach((_, index) => {
+        row[INCAMPUS_UNIFIED_EXTRACT_START_COLUMN + index] = values[index] === undefined ? '' : values[index];
+      });
+      return row;
+    });
+    const startRow = unifiedSheet.getLastRow() + 1;
+    unifiedSheet.getRange(startRow, 1, unifiedRows.length, INCAMPUS_UNIFIED_HEADERS.length).setValues(unifiedRows);
+    lastReadRecords = null;
+    lastReadPhysicalRows = null;
   }
 
   function makeRange_(row, column, rowCount, columnCount) {
@@ -246,18 +331,29 @@ function createInCampusExtractSheetAdapter_(unifiedSheet) {
     getFrozenRows() { return 1; },
     setFrozenRows() {},
     getDataRange() {
-      const values = [getHeader()].concat(getRecordsSafely_().map(record => record.values));
+      lastReadRecords = getRecordsSafely_();
+      const values = [getHeader()].concat(lastReadRecords.map(record => record.values));
       return {getValues() { return values.map(row => row.slice()); }};
+    },
+    getUnifiedRowsSnapshot() {
+      if (!Array.isArray(lastReadPhysicalRows) || unifiedSheet.getLastRow() !== lastReadPhysicalRows.length + 1) {
+        getRecordsSafely_();
+      }
+      return [INCAMPUS_UNIFIED_HEADERS.slice()].concat(lastReadPhysicalRows.map(row => row.slice()));
     },
     getRange(row, column, rowCount = 1, columnCount = 1) {
       return makeRange_(row, column, rowCount, columnCount);
     },
     appendRow(values) {
-      const row = Array(INCAMPUS_UNIFIED_HEADERS.length).fill('');
-      row[INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN] = INCAMPUS_EXTRACT_RECORD_TYPE;
-      INCAMPUS_HEADERS.forEach((_, index) => { row[INCAMPUS_UNIFIED_EXTRACT_START_COLUMN + index] = values[index] === undefined ? '' : values[index]; });
-      const targetRow = unifiedSheet.getLastRow() + 1;
-      unifiedSheet.getRange(targetRow, 1, 1, row.length).setValues([row]);
+      appendRows_([values]);
+      return this;
+    },
+    appendRows(values) {
+      appendRows_(values);
+      return this;
+    },
+    updateRows(updates) {
+      updateExtractedRanges_(updates.map(update => ({row: update.row, column: 1, values: update.values})));
       return this;
     }
   };

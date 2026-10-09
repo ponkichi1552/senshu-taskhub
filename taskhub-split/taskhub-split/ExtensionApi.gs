@@ -1,6 +1,8 @@
 function doPost(e) {
+  const requestStartedAt = Date.now();
   try {
     return runWithUserLock_('同期処理', () => {
+    const lockAcquiredAt = Date.now();
     const payload = parseJsonBody_(e);
     assertValidApiToken_(payload);
 
@@ -8,13 +10,74 @@ function doPost(e) {
       const assignment = sanitizeObjectByFieldLimits_(payload.assignment || {}, ASSIGNMENT_FIELD_LIMITS);
       validateAssignment_(assignment);
 
-      const result = upsertInCampusAssignment_(assignment);
-      refreshNotificationDisplayDataAfterSyncLocked_(getOrCreateSpreadsheetLocked_(), 'extension-incampus-upsert');
+      const spreadsheet = getOrCreateSpreadsheetLocked_();
+      const result = upsertInCampusAssignmentLocked_(assignment, spreadsheet);
+      if (result.changed) refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, 'extension-incampus-upsert');
 
       return jsonResponse_({
         ok: true,
         updated: result.updated,
+        unchanged: Boolean(result.unchanged),
         row: result.row
+      });
+    }
+
+    if (payload.action === 'upsertInCampusAssignments') {
+      const assignments = sanitizeAssignmentRecords_(payload.assignments || []);
+      assignments.forEach(validateAssignment_);
+
+      if (assignments.length === 0) {
+        return jsonResponse_({ok: true, foundCount: 0, newCount: 0, updatedCount: 0, unchangedCount: 0, results: []});
+      }
+
+      const spreadsheetStartedAt = Date.now();
+      const spreadsheet = getOrCreateSpreadsheetLocked_();
+      const spreadsheetSetupMs = Date.now() - spreadsheetStartedAt;
+      const inCampusSheetStartedAt = Date.now();
+      const inCampusUnifiedSheet = getOrCreateInCampusUnifiedSheetLocked_(spreadsheet);
+      const inCampusExtractSheet = createInCampusExtractSheetAdapter_(inCampusUnifiedSheet);
+      const inCampusSheetSetupMs = Date.now() - inCampusSheetStartedAt;
+      const upsertStartedAt = Date.now();
+      const result = upsertInCampusAssignmentsLocked_(assignments, spreadsheet, inCampusExtractSheet);
+      const upsertMs = Date.now() - upsertStartedAt;
+      let storageSetupMs = 0;
+      let displayBuildMs = 0;
+      if (result.changedCount > 0) {
+        const storageSetupStartedAt = Date.now();
+        const sheetsBySource = ensureNotificationStorageLocked_(spreadsheet, {inCampusSheet: inCampusUnifiedSheet});
+        storageSetupMs = Date.now() - storageSetupStartedAt;
+        const preloadedInCampusRows = inCampusExtractSheet.getUnifiedRowsSnapshot().slice(1);
+        const displayBuildStartedAt = Date.now();
+        refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, 'extension-incampus-batch-upsert', {
+          sheetsBySource,
+          preloadedRowsBySource: {inCampus: preloadedInCampusRows}
+        });
+        displayBuildMs = Date.now() - displayBuildStartedAt;
+      }
+      Logger.log('TASKHUB_INCAMPUS_BATCH_SYNC ' + JSON.stringify({
+        lockWaitMs: lockAcquiredAt - requestStartedAt,
+        spreadsheetSetupMs,
+        inCampusSheetSetupMs,
+        upsertMs,
+        storageSetupMs,
+        displayBuildMs,
+        totalBeforeResponseMs: Date.now() - requestStartedAt,
+        assignmentCount: assignments.length,
+        changedCount: result.changedCount,
+        unchangedCount: result.unchangedCount
+      }));
+
+      return jsonResponse_({
+        ok: true,
+        foundCount: result.results.length,
+        newCount: result.results.filter(item => !item.updated).length,
+        updatedCount: result.results.filter(item => item.updated && !item.unchanged).length,
+        unchangedCount: result.unchangedCount,
+        results: result.results.map(item => ({
+          updated: item.updated,
+          unchanged: Boolean(item.unchanged),
+          row: item.row
+        }))
       });
     }
 
@@ -261,6 +324,23 @@ function sanitizePostRecords_(records) {
   }
 
   return records.map(record => sanitizeObjectByFieldLimits_(record || {}, CLASSROOM_RECORD_FIELD_LIMITS));
+}
+
+function sanitizeAssignmentRecords_(assignments) {
+  if (!Array.isArray(assignments)) {
+    throw new Error('assignmentsが配列ではありません。');
+  }
+
+  if (assignments.length > MAX_POST_RECORDS) {
+    throw new Error('一度に送信できる課題データが多すぎます。');
+  }
+
+  return assignments.map(assignment => {
+    if (!assignment || typeof assignment !== 'object' || Array.isArray(assignment)) {
+      throw new Error('課題データの形式が正しくありません。');
+    }
+    return sanitizeObjectByFieldLimits_(assignment, ASSIGNMENT_FIELD_LIMITS);
+  });
 }
 
 function sanitizeObjectByFieldLimits_(source, fieldLimits) {

@@ -9,7 +9,7 @@
     return;
   }
 
-  list.innerHTML = '';
+  const fragment = document.createDocumentFragment();
 
   // Sync already assigned every task a due group and sorted these rows. The
   // browser only walks that order and emits a heading when the stored key
@@ -40,13 +40,13 @@
           <span class="group-arrow" id="${groupArrowId}">${groupOpen ? '⌃' : '⌄'}</span>
         </span>
       `;
-      list.appendChild(groupTitle);
+      fragment.appendChild(groupTitle);
 
       groupBody = document.createElement('div');
       groupBody.id = groupBodyId;
       groupBody.className = 'group-body';
       groupBody.style.display = groupOpen ? '' : 'none';
-      list.appendChild(groupBody);
+      fragment.appendChild(groupBody);
     }
 
     const card = document.createElement('div');
@@ -71,6 +71,7 @@
     groupBody.appendChild(card);
   });
 
+  list.replaceChildren(fragment);
   if (!cardIndex) list.textContent = '表示対象の通知はありません。';
 }
 

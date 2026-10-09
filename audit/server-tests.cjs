@@ -54,12 +54,13 @@ class Sheet {
   autoResizeColumns() {throw new Error('Read must not auto-resize');}
 }
 function environment(shared) {
-  const state = shared || {held: false, acquisitions: 0, releases: 0, flushes: 0, props: {}, scriptProps: {}, sheets: {}, testSheets: {}, triggers: [], gmail: [], gmailSearches: 0, gmailQueries: [], userPropertyGetCalls: 0, userPropertiesSnapshotCalls: 0, spreadsheetOpenCalls: {}, spreadsheetCreateCalls: 0, logs: [], cache: {}, cacheGetCalls: 0, cachePutCalls: 0};
+  const state = shared || {held: false, acquisitions: 0, releases: 0, flushes: 0, props: {}, scriptProps: {}, sheets: {}, testSheets: {}, triggers: [], gmail: [], gmailSearches: 0, gmailQueries: [], userPropertyGetCalls: 0, userPropertiesSnapshotCalls: 0, spreadsheetOpenCalls: {}, spreadsheetCreateCalls: 0, logs: [], cache: {}, cacheGetCalls: 0, cachePutCalls: 0, cachePutAllCalls: 0};
   state.spreadsheetCreateCalls ||= 0;
   state.logs ||= [];
   state.cache ||= {};
   state.cacheGetCalls ||= 0;
   state.cachePutCalls ||= 0;
+  state.cachePutAllCalls ||= 0;
   const ss = {getId: () => 'test-sheet', getUrl: () => 'mock://test-sheet', getSheetByName: name => state.sheets[name] || null,
     insertSheet(name) {return state.sheets[name] = new Sheet(name);}, deleteSheet(sheet) {delete state.sheets[sheet.name];}};
   const testSs = {getId: () => 'test-case-sheet', getUrl: () => 'mock://test-case-sheet', getSheetByName: name => state.testSheets[name] || null,
@@ -81,6 +82,7 @@ function environment(shared) {
     CacheService: {getUserCache() {return {
       get(key) {state.cacheGetCalls++; return state.cache[key] || null;},
       put(key, value, ttl) {state.cachePutCalls++; state.cache[key] = value; state.cacheTtl = ttl;},
+      putAll(values, ttl) {state.cachePutAllCalls++; Object.assign(state.cache, values); state.cacheTtl = ttl;},
       remove(key) {delete state.cache[key];}
     };}},
     ScriptApp: {
@@ -287,6 +289,100 @@ check('The previous university notice display schema migrates safely and unknown
   assert.throws(()=>e2.c.rebuildNotificationDisplayDataLocked_(e2.ss),/既存データ形式が異なる/);
   assert.deepEqual(unknown.rows,[['unknown-schema'],['must-preserve']],'unrecognized saved data is never erased by schema repair');
 });
+check('Prepared display-sheet header reads are cached while rebuilds still replace stale rows',()=>{
+  const e=environment();
+  e.add('inCampus通知',[e.headers]);e.add('補足通知',[e.headers]);e.add('Classroom通知',[e.headers]);
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  const cacheKey=vm.runInContext('NOTIFICATION_DISPLAY_SCHEMA_CACHE_PROPERTY',e.c);
+  assert.ok(e.state.props[cacheKey],'a successful schema validation stores its timestamp and workbook/schema key');
+  const names=['課題表示データ','完了課題表示データ','大学通知表示データ'];
+  for (const name of names) {
+    const sheet=e.state.sheets[name];sheet.readCalls=[];
+    sheet.rows.push(Array(sheet.rows[0].length).fill('stale-derived-row'));
+  }
+  const rebuilt=e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  assert.equal(rebuilt.taskCount,0);assert.equal(rebuilt.noticeCount,0);
+  for (const name of names) {
+    const sheet=e.state.sheets[name];
+    assert.equal(sheet.readCalls.length,0,`${name} skips the repeated header read while the schema cache is current`);
+    assert.equal(sheet.getLastRow(),1,`${name} still clears stale derived rows during rebuild`);
+  }
+});
+check('Existing display sheets stay readable during source preparation and prior data survives pre-write failure',()=>{
+  const e=environment();
+  const source=e.add('inCampus通知',[e.headers]);
+  e.add('補足通知',[e.headers]);e.add('Classroom通知',[e.headers]);
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  const revisionKey=vm.runInContext('NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY',e.c);
+  const markerKey=vm.runInContext('NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY',e.c);
+  source.onRead=()=>{
+    assert.equal(e.state.props[markerKey],undefined,'the write marker is absent during source reads');
+    assert.equal(e.c.isNotificationDisplayDataCurrent_(),true,'the last complete generation remains readable during projection work');
+  };
+  const built=e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  assert.equal(built.noticeCount,0);
+
+  source.onRead=()=>{throw new Error('source preparation failed before display writes');};
+  const failed=e.c.refreshNotificationDisplayDataAfterSyncLocked_(e.ss,'pre-write-failure');
+  assert.equal(failed.ok,false);
+  assert.equal(failed.previousGenerationPreserved,true);
+  assert.equal(e.state.props[revisionKey],vm.runInContext('NOTIFICATION_DISPLAY_DATA_REVISION',e.c));
+  assert.equal(e.c.isNotificationDisplayDataCurrent_(),true,'a source-read failure leaves the previous prepared sheets usable');
+  assert.ok(e.state.logs.some(message=>message.includes('"previousGenerationPreserved":true')));
+});
+check('A stale marker from an interrupted sheet write remains blocking until the recovery rebuild commits',()=>{
+  const e=environment();
+  const source=e.add('inCampus通知',[e.headers]);
+  e.add('補足通知',[e.headers]);e.add('Classroom通知',[e.headers]);
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  const revisionKey=vm.runInContext('NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY',e.c);
+  const markerKey=vm.runInContext('NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY',e.c);
+
+  e.state.props[markerKey]=String(Date.now()-6*60*1000);
+  source.onRead=()=>{
+    assert.ok(e.state.props[markerKey],'the interrupted-write marker stays set throughout recovery preparation');
+    assert.equal(e.c.isNotificationDisplayDataCurrent_(),false,'possibly partial rows are never served during recovery');
+  };
+  const recovered=e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  assert.equal(recovered.noticeCount,0);
+  assert.equal(e.state.props[markerKey],undefined,'the recovery clears its marker only after all sheets commit');
+  assert.equal(e.c.isNotificationDisplayDataCurrent_(),true);
+
+  e.state.props[markerKey]=String(Date.now()-6*60*1000);
+  source.onRead=()=>{throw new Error('recovery preparation failed');};
+  const failed=e.c.refreshNotificationDisplayDataAfterSyncLocked_(e.ss,'stale-marker-recovery-failure');
+  assert.equal(failed.ok,false);
+  assert.equal(failed.previousGenerationPreserved,false,'an interrupted-write generation cannot be trusted after recovery fails');
+  assert.equal(e.state.props[revisionKey],undefined);
+  assert.equal(e.state.props[markerKey],undefined);
+});
+check('A failure after the prepared-sheet write phase begins invalidates the partially replaced snapshot',()=>{
+  const e=environment();
+  e.add('inCampus通知',[e.headers]);e.add('補足通知',[e.headers]);e.add('Classroom通知',[e.headers]);
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  const revisionKey=vm.runInContext('NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY',e.c);
+  const markerKey=vm.runInContext('NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY',e.c);
+  const original=e.c.replaceDisplaySheetRows_;
+  e.c.replaceDisplaySheetRows_=()=>{
+    assert.ok(e.state.props[markerKey],'the write marker is present before replacing prepared rows');
+    throw new Error('simulated prepared-sheet write failure');
+  };
+  const failed=e.c.refreshNotificationDisplayDataAfterSyncLocked_(e.ss,'write-failure');
+  e.c.replaceDisplaySheetRows_=original;
+  assert.equal(failed.ok,false);
+  assert.equal(failed.previousGenerationPreserved,false);
+  assert.equal(e.state.props[revisionKey],undefined,'partially replaced rows cannot be served as a current generation');
+  assert.equal(e.state.props[markerKey],undefined,'failed writes clear the transient marker after invalidation');
+});
+check('A prepared-sheet header mismatch invalidates the cached schema validation',()=>{
+  const e=environment();
+  e.add('inCampus通知',[e.headers]);e.add('補足通知',[e.headers]);e.add('Classroom通知',[e.headers]);
+  e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  const cacheKey=vm.runInContext('NOTIFICATION_DISPLAY_SCHEMA_CACHE_PROPERTY',e.c);
+  const taskSheet=e.state.sheets['課題表示データ'];taskSheet.rows[0][0]='unexpected-header';
+  assert.equal(e.c.readMaterializedTaskItems_(e.ss,'未完了'),null);
+  assert.equal(e.state.props[cacheKey],undefined,'the next rebuild performs a full schema check');
+});
 check('A transient prepared notice read failure leaves the workbook untouched and can be retried',()=>{
   const e=environment();e.c.rebuildNotificationDisplayDataLocked_(e.ss);markUserStorageWarm(e);
   const sheet=e.state.sheets['大学通知表示データ'];
@@ -297,6 +393,14 @@ check('A transient prepared notice read failure leaves the workbook untouched an
   assert.deepEqual(Array.from(retried.items),[],'a later read recovers without needing a rebuild or data sync');
   assert.equal(Object.values(e.state.sheets).reduce((sum,current)=>sum+current.writes,0),writesBefore,
     'read retry never writes to the workbook');
+});
+check('A notice read overlapping the prepared-sheet write phase is marked retryable after the sheet read',()=>{
+  const e=environment();e.c.rebuildNotificationDisplayDataLocked_(e.ss);markUserStorageWarm(e);
+  const markerKey=vm.runInContext('NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY',e.c);
+  const sheet=e.state.sheets['大学通知表示データ'];
+  sheet.onRead=()=>{e.state.props[markerKey]=String(Date.now());};
+  assert.throws(()=>e.c.getUniversityNoticePayloadForWeb(),/大学通知表示データを更新中/,
+    'the post-read generation check catches a marker set after the first property snapshot');
 });
 check('A task status change refreshes saved active and completed group totals', () => {
   const e = environment();
@@ -344,7 +448,7 @@ check('A page read during a display-data rebuild never falls back to filtering r
   assert.equal(result.skipped,true);assert.equal(result.displayDataBuilding,true);
   assert.equal(e.state.acquisitions,0,'a background projection refresh does not block list reads on the shared lock');
   assert.equal(e.state.spreadsheetOpenCalls['test-sheet']||0,0);
-  assert.throws(()=>e.c.getNotificationsForWeb(),/表示データが未準備です/);
+  assert.throws(()=>e.c.getNotificationsForWeb(),/課題表示データを更新中/);
   assert.equal(Object.values(e.state.sheets).reduce((count,sheet)=>count+sheet.dataRangeCalls,0),0,
     'the read path does not fall back to raw sheets while sync is rebuilding the prepared view');
 });
@@ -393,7 +497,7 @@ check('12-hour trigger maintenance repairs sync triggers without opening the per
   assert.equal(e.state.spreadsheetOpenCalls['test-sheet']||0,0);
   assert.ok(e.state.logs.some(message=>message.startsWith('TASKHUB_TRIGGER_MAINTENANCE_TIMING ')));
 });
-check('Home notification read consumes the prepared task sheet without rereading inCampus source rows',()=>{
+check('Home notification read consumes the prewarmed task cache without reopening source or display sheets',()=>{
   const e=environment();
   const revisionKey=vm.runInContext('USER_STORAGE_INITIALIZATION_REVISION_PROPERTY',e.c);
   const lastRunKey=vm.runInContext('USER_STORAGE_INITIALIZATION_LAST_RUN_PROPERTY',e.c);
@@ -413,13 +517,15 @@ check('Home notification read consumes the prepared task sheet without rereading
   e.add('Classroom通知',[e.headers]);
   e.c.rebuildNotificationDisplayDataLocked_(e.ss);
   markUserStorageWarm(e);
+  e.state.spreadsheetOpenCalls['test-sheet']=0;
   const rawReadCount=inCampus.dataRangeCalls;
   const items=e.c.getNotificationsForWeb();
   assert.equal(inCampus.dataRangeCalls,rawReadCount,'page rendering does not reread Gmail or extraction source rows');
+  assert.equal(e.state.spreadsheetOpenCalls['test-sheet'],0,'the warmed cache avoids opening the workbook for the home payload');
   assert.ok(items.some(item=>String(item.messageId).startsWith('mail-snapshot:update:')));
-  const timing=e.state.logs.find(message=>message.startsWith('TASKHUB_NOTIFICATION_READ_TIMING ')&&message.includes('personal-display-data'));
+  const timing=e.state.logs.find(message=>message.startsWith('TASKHUB_NOTIFICATION_READ_TIMING ')&&message.includes('"mode":"cache-hit"'));
   assert.ok(timing);
-  assert.equal(JSON.parse(timing.slice('TASKHUB_NOTIFICATION_READ_TIMING '.length)).rawNotificationSheetsRead,false);
+  assert.equal(JSON.parse(timing.slice('TASKHUB_NOTIFICATION_READ_TIMING '.length)).spreadsheetRead,false);
 });
 check('Classroom submission sync uses paginated course-wide lookups and joins by coursework ID', () => {
   const e = environment();
@@ -683,6 +789,72 @@ check('Separate announcement update IDs sharing course URL are stored independen
   const e=environment(),url='https://ic.ss.senshu-u.ac.jp/lms/course/C';const a={source:'inCampus',type:'announcement',title:'休講',courseName:'仮想情報演習',pageUrl:url,assignmentKey:'update:1'};
   e.c.upsertInCampusAssignment_(a);e.c.upsertInCampusAssignment_({...a,title:'教室変更',assignmentKey:'update:2'});e.c.upsertInCampusAssignment_({...a,title:'休講（更新）'});
   const s=e.c.getOrCreateInCampusSheet_(),rows=s.getDataRange().getValues();assert.equal(s.getLastRow(),3);assert.equal(rows[1][2],'休講（更新）');assert.equal(rows[2][2],'教室変更');
+});
+check('inCampus batch upsert reads the sheet once, appends together, and skips unchanged writes',()=>{
+  const e=environment(),sheet=e.c.getOrCreateInCampusSheet_();
+  const physical=e.state.sheets['inCampus通知'];
+  const assignment=(key,title,extractedAt='2026-10-09T01:00:00.000Z')=>({source:'inCampus',type:'assignment',title,body:'仮想本文',courseName:'仮想情報演習',pageUrl:`https://ic.ss.senshu-u.ac.jp/lms/course/report/${key}`,assignmentKey:key,extractedAt});
+  const first=[assignment('batch:A','仮想課題A'),assignment('batch:B','仮想課題B')];
+  physical.readCalls=[];physical.writes=0;
+  const inserted=e.c.upsertInCampusAssignments_(first);
+  assert.equal(inserted.changedCount,2);
+  assert.equal(physical.readCalls.filter(call=>call.row>1).length,0,'an empty extraction table needs no read before append');
+  assert.equal(physical.writes,1,'new records are appended with one range write');
+
+  physical.readCalls=[];physical.writes=0;
+  const repeated=e.c.upsertInCampusAssignments_(first.map(item=>({...item,extractedAt:'2026-10-09T02:00:00.000Z'})));
+  assert.equal(repeated.unchangedCount,2);assert.equal(repeated.changedCount,0);
+  assert.equal(physical.readCalls.filter(call=>call.row>1).length,1);assert.equal(physical.writes,0,'timestamp-only differences do not rewrite saved rows');
+
+  physical.readCalls=[];physical.writes=0;
+  const changed=e.c.upsertInCampusAssignments_([{...first[0],title:'仮想課題A（更新）'}]);
+  assert.equal(changed.results[0].updated,true);assert.equal(changed.results[0].unchanged,false);
+  assert.equal(physical.readCalls.filter(call=>call.row>1).length,1);assert.equal(physical.writes,1);
+  assert.equal(e.c.getOrCreateInCampusSheet_().getDataRange().getValues()[1][2],'仮想課題A（更新）');
+
+  physical.readCalls=[];physical.writes=0;
+  const multiChanged=e.c.upsertInCampusAssignments_([
+    {...first[0],title:'仮想課題A（再更新）'},
+    {...first[1],title:'仮想課題B（更新）'}
+  ]);
+  assert.equal(multiChanged.changedCount,2);
+  assert.equal(physical.readCalls.filter(call=>call.row>1).length,1);
+  assert.equal(physical.writes,1,'several existing rows are updated with one rectangular range write');
+  const adapter=e.c.getOrCreateInCampusSheet_();
+  const snapshot=adapter.getUnifiedRowsSnapshot();
+  const extractTypeIndex=vm.runInContext('INCAMPUS_UNIFIED_RECORD_TYPE_COLUMN',e.c);
+  const extractStart=vm.runInContext('INCAMPUS_UNIFIED_EXTRACT_START_COLUMN',e.c);
+  const updatedSnapshotRows=snapshot.filter(row=>row[extractTypeIndex]==='extract');
+  assert.equal(updatedSnapshotRows[0][extractStart+2],'仮想課題A（再更新）');
+  assert.equal(updatedSnapshotRows[1][extractStart+2],'仮想課題B（更新）');
+});
+check('inCampus batch endpoint rebuilds display data once only when a saved row changes',()=>{
+  const e=environment();e.state.props.TASKHUB_SPREADSHEET_ID='test-sheet';e.state.props.TASKHUB_API_TOKEN='x'.repeat(48);
+  e.c.getOrCreateSpreadsheetLocked_=()=>e.ss;
+  const sheet=e.c.getOrCreateInCampusSheet_();let refreshes=0;
+  e.c.refreshNotificationDisplayDataAfterSyncLocked_=()=>{refreshes++;return {ok:true};};
+  const records=[
+    {source:'inCampus',type:'assignment',title:'仮想課題A',body:'仮想本文',courseName:'仮想情報演習',pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/batch-A',assignmentKey:'batch-A',extractedAt:'2026-10-09T01:00:00.000Z'},
+    {source:'inCampus',type:'assignment',title:'仮想課題B',body:'仮想本文',courseName:'仮想情報演習',pageUrl:'https://ic.ss.senshu-u.ac.jp/lms/course/report/batch-B',assignmentKey:'batch-B',extractedAt:'2026-10-09T01:00:00.000Z'}
+  ];
+  const post=list=>e.c.doPost({postData:{contents:JSON.stringify({apiToken:'x'.repeat(48),action:'upsertInCampusAssignments',assignments:list})}});
+  const first=JSON.parse(post(records).value);
+  assert.equal(first.ok,true);assert.equal(first.newCount,2);assert.equal(first.unchangedCount,0);assert.equal(refreshes,1);
+  const second=JSON.parse(post(records.map(item=>({...item,extractedAt:'2026-10-09T02:00:00.000Z'}))).value);
+  assert.equal(second.ok,true);assert.equal(second.newCount,0);assert.equal(second.updatedCount,0);assert.equal(second.unchangedCount,2);
+  assert.equal(refreshes,1,'identical rows do not trigger another display-data rebuild');
+  assert.equal(sheet.getLastRow(),3);
+});
+check('Repeated submission markers use stable notification time instead of extraction time',()=>{
+  const e=environment(),sheet=e.c.getOrCreateInCampusSheet_();
+  e.c.extractInCampusSubmissionRecords_=()=>[{courseName:'仮想情報演習',weekdayPeriod:'火曜5限',title:'仮想レポート',submittedAt:''}];
+  const assignment=extractedAt=>({source:'inCampus',type:'submissionRecord',title:'仮想提出通知',body:'仮想提出内容',courseName:'仮想情報演習',pageUrl:'https://ic.ss.senshu-u.ac.jp/updateinfo/virtual',assignmentKey:'update:virtual-1',updateAt:'2026/10/09 08:15',extractedAt});
+  const first=e.c.upsertInCampusAssignment_(assignment('2026-10-09T01:00:00.000Z'));
+  const second=e.c.upsertInCampusAssignment_(assignment('2026-10-09T02:00:00.000Z'));
+  assert.equal(first.updated,false);assert.equal(second.unchanged,true);
+  const saved=e.c.getOrCreateInCampusSheet_().getDataRange().getValues();
+  assert.equal(saved.length,2,'the same submission mail cannot create a second marker');
+  assert.equal(saved[1][15],'2026/10/09 08:15');
 });
 check('Manual page extraction preserves course and update identity plus completed state',()=>{
   const {c}=environment(),url='https://ic.ss.senshu-u.ac.jp/lms/course/report/A';
@@ -1168,6 +1340,25 @@ check('Sync-time display build materializes classified task and university notic
   assert.equal(e.state.props[vm.runInContext('NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY',e.c)],vm.runInContext('NOTIFICATION_DISPLAY_DATA_REVISION',e.c));
   assert.equal(e.state.testSheets['テストinCampus'],undefined,'materialization while test mode is ON still uses the personal workbook');
 });
+check('Sync prewarms versioned active and completed task caches for the next browser load',()=>{
+  const e=environment();
+  putMail(e,[row('cache-task','キャッシュ課題',body('キャッシュ課題'),{due:'2026/10/25',received:new Date()})]);
+  const built=e.c.rebuildNotificationDisplayDataLocked_(e.ss);
+  assert.equal(built.taskDisplayCacheEntryCount,2);
+  assert.equal(e.state.cachePutAllCalls,1,'both task views are warmed in one CacheService call');
+  assert.equal(e.state.cacheTtl,21600,'generation-keyed task data stays hot between periodic syncs');
+  const activeKey=e.c.getTaskDisplayCacheKey_(e.state.props,'未完了');
+  const completedKey=e.c.getTaskDisplayCacheKey_(e.state.props,'完了');
+  assert.match(activeKey,/taskhub-task-display-v4/,'the release starts with an empty cache namespace for a clean cold-read measurement');
+  assert.ok(e.state.cache[activeKey]);assert.ok(e.state.cache[completedKey]);
+  assert.deepEqual(Array.from(e.c.readTaskDisplayCache_(e.state.props,'未完了').items,item=>item.title),['キャッシュ課題']);
+  markUserStorageWarm(e);e.state.spreadsheetOpenCalls['test-sheet']=0;
+  const payload=e.c.getTaskDisplayPayloadForWeb('未完了');
+  assert.deepEqual(Array.from(payload.items,item=>item.title),['キャッシュ課題']);
+  assert.equal(payload.cacheToken,'','a task cache hit does not schedule a duplicate post-display cache write');
+  assert.equal(e.state.spreadsheetOpenCalls['test-sheet'],0,'the initial browser payload needs no spreadsheet open after sync prewarming');
+  assert.ok(e.state.logs.some(message=>message.includes('"mode":"cache-hit"')));
+});
 check('University notice list reads previews only, selection reads one body, and full-text search is deferred',()=>{
   const e=environment();
   const unifiedHeaders=Array.from(vm.runInContext('INCAMPUS_UNIFIED_HEADERS',e.c));
@@ -1184,7 +1375,8 @@ check('University notice list reads previews only, selection reads one body, and
 
   const built=e.c.rebuildNotificationDisplayDataLocked_(e.ss);
   assert.equal(built.noticeCount,1);
-  assert.equal(e.state.cachePutCalls,0,'sync prepares the sheet but does not write the web cache');
+  assert.equal(e.state.cachePutCalls,0,'sync warming uses one batch write rather than separate cache calls');
+  assert.equal(e.state.cachePutAllCalls,1,'sync prepares the task cache without reading or writing the university full-body cache');
   markUserStorageWarm(e);
   const noticeSheet=e.state.sheets['大学通知表示データ'];
   const bodyColumn=vm.runInContext("UNIVERSITY_NOTICE_DISPLAY_FIELDS.indexOf('body')+1",e.c);
@@ -1195,7 +1387,7 @@ check('University notice list reads previews only, selection reads one body, and
   e.state.userPropertyGetCalls=0;
   const cacheReadsBeforeList=e.state.cacheGetCalls;
   const payload=e.c.getUniversityNoticePayloadForWeb();
-  assert.equal(e.state.userPropertiesSnapshotCalls,1,'payload and display read share one property snapshot');
+  assert.equal(e.state.userPropertiesSnapshotCalls,2,'the read shares its initial snapshot and uses one verification snapshot to detect overlapping sync writes');
   assert.equal(e.state.userPropertyGetCalls,0,'display state uses the same property snapshot without per-item lookups');
   assert.deepEqual(Array.from(payload.items,item=>item.title),['仮想休講案内']);
   assert.equal(Object.prototype.hasOwnProperty.call(payload.items[0],'body'),false,'the initial list payload omits full notice bodies');
@@ -1207,6 +1399,8 @@ check('University notice list reads previews only, selection reads one body, and
   assert.equal(e.c.cacheUniversityNoticeItemsAfterWebDisplay(payload.items,payload.cacheToken),false,'a compact list cannot overwrite the full-body cache');
   assert.ok(noticeSheet.readCalls.every(call=>call.row===1||call.column+call.width-1<bodyColumn),
     'opening the list reads headers and preview columns only, never body cells: '+JSON.stringify(noticeSheet.readCalls));
+  assert.ok(noticeSheet.readCalls.some(call=>call.row===1&&call.column===1&&call.width===11),
+    'the list reads only the 11 columns needed for compact cards and state matching');
   const detail=e.c.getUniversityNoticeBodyForWeb(payload.items[0].messageId);
   assert.equal(detail.found,true);
   assert.match(detail.body,/仮想休講案内/);
@@ -1281,7 +1475,7 @@ check('Prepared task views are status-specific, already filtered, and page reads
   const notices=e.c.getUniversityNoticePayloadForWeb().items;
   assert.deepEqual(active.map(item=>item.title),['今後の課題']);
   assert.deepEqual(Array.from(completed,item=>item.title),['完了課題']);
-  assert.deepEqual(notices.map(item=>item.title),['表示対象']);
+  assert.deepEqual(Array.from(notices,item=>item.title),['表示対象']);
   const futureActive=active.find(item=>item.title==='今後の課題');
   assert.equal(typeof futureActive.savedAt,'string','sheet Dates are normalized before task results cross Apps Script RPC');
   assert.ok(Array.isArray(JSON.parse(JSON.stringify(active))),'prepared task results remain JSON-serializable arrays');
@@ -1293,15 +1487,16 @@ check('Prepared task views are status-specific, already filtered, and page reads
     'prepared views use schema-bounded ranges rather than reading each sheet data range');
   assert.ok(taskSheet.rangeCalls.some(call=>call.row===1&&call.height===taskSheet.getLastRow()&&call.width===vm.runInContext('TASK_DISPLAY_HEADERS.length',e.c)));
   const noticeBodyColumn=vm.runInContext("UNIVERSITY_NOTICE_DISPLAY_FIELDS.indexOf('body')+1",e.c);
-  assert.ok(noticeSheet.readCalls.some(call=>call.row===1&&call.height===noticeSheet.getLastRow()&&call.width===noticeBodyColumn-1),
-    'university notice list validates the used header and reads compact rows in one call');
+  const noticeStateIdWidth=vm.runInContext("UNIVERSITY_NOTICE_DISPLAY_FIELDS.indexOf('originalMessageIdForState')+1",e.c);
+  assert.ok(noticeSheet.readCalls.some(call=>call.row===1&&call.height===noticeSheet.getLastRow()&&call.width===noticeStateIdWidth),
+    'university notice list validates the header and reads only compact list plus state-matching columns');
   assert.ok(noticeSheet.readCalls.filter(call=>call.row>1).every(call=>call.column+call.width-1<noticeBodyColumn),
     'university notice list never reads body cells');
   assert.equal(e.state.sheets['inCampus通知'].dataRangeCalls,0);assert.equal(e.state.sheets['補足通知'].dataRangeCalls,0);
   assert.equal(e.state.spreadsheetOpenCalls['test-sheet'],3,'each view reads only its own prepared sheet');
   e.state.userPropertiesSnapshotCalls=0;
   const taskPayload=e.c.getTaskDisplayPayloadForWeb('active');
-  assert.equal(e.state.userPropertiesSnapshotCalls,1,'task payload passes its property snapshot through the read path');
+  assert.equal(e.state.userPropertiesSnapshotCalls,2,'task payload reads one snapshot and checks the generation once after a sheet read');
   assert.equal(e.state.cachePutCalls,0,'a display read does not synchronously write its task cache');
   assert.equal(e.c.cacheTaskDisplayItemsAfterWebDisplay(taskPayload.items,'active',taskPayload.cacheToken),true);
   const staleTaskPayload=e.c.getTaskDisplayPayloadForWeb('active');

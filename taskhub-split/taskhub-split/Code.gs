@@ -149,6 +149,7 @@ const ASSIGNMENT_FIELD_LIMITS = {
   assignmentKey: 512,
   extractedAt: 64,
   receivedAt: 64,
+  submittedAt: 64,
   rawText: 5000,
   courseName: 500,
   updateText: 2000,
@@ -214,17 +215,21 @@ function doGet(e) {
   }
 
   const ensureStartedAt = Date.now();
-  ensureUserStorageForWeb_();
+  const storageResult = ensureUserStorageForWeb_();
   const userStorageEnsureMs = Date.now() - ensureStartedAt;
+  const userProperties = storageResult && storageResult.userPropertiesSnapshot
+    ? storageResult.userPropertiesSnapshot
+    : PropertiesService.getUserProperties().getProperties();
 
   const initialView = getInitialTaskHubViewForWeb_(e);
   const initialPayloadStartedAt = Date.now();
-  const initialPayload = getInitialTaskHubPayloadForWeb_(initialView);
+  const initialPayload = getInitialTaskHubPayloadForWeb_(initialView, userProperties);
   const initialPayloadGenerationMs = Date.now() - initialPayloadStartedAt;
   const initialPayloadJson = serializeTaskHubInitialPayload_(initialPayload);
   const template = HtmlService.createTemplateFromFile('Index');
   template.initialView = initialView;
   template.initialPayloadJson = initialPayloadJson;
+  template.initialSyncPending = isInitialPersonalDataSyncPendingForWeb_(userProperties);
   const evaluateStartedAt = Date.now();
   const output = template.evaluate().setTitle('課題通知Hub | TaskHub for Senshu University');
   Logger.log('TASKHUB_WEB_BOOT_TIMING ' + JSON.stringify({
@@ -243,11 +248,11 @@ function getInitialTaskHubViewForWeb_(event) {
   return requested === 'assignment' || requested === 'university' ? requested : 'home';
 }
 
-function getInitialTaskHubPayloadForWeb_(view) {
+function getInitialTaskHubPayloadForWeb_(view, userPropertiesSnapshot) {
   try {
     const payload = view === 'university'
-      ? getUniversityNoticePayloadForWeb(false)
-      : getTaskDisplayPayloadForWeb('未完了');
+      ? getUniversityNoticePayloadForWeb(false, userPropertiesSnapshot)
+      : getTaskDisplayPayloadForWeb('未完了', userPropertiesSnapshot);
     return {view, payload};
   } catch (error) {
     Logger.log('TASKHUB_INITIAL_DISPLAY_PAYLOAD_FAILED ' + String(error && error.message ? error.message : error));
@@ -258,19 +263,23 @@ function getInitialTaskHubPayloadForWeb_(view) {
 function serializeTaskHubInitialPayload_(payload) {
   if (!payload) return 'null';
   return JSON.stringify(payload)
-    .replace(/&/g, '\\u0026')
-    .replace(/</g, '\\u003c')
-    .replace(/>/g, '\\u003e')
-    .replace(/\u2028/g, '\\u2028')
-    .replace(/\u2029/g, '\\u2029');
+    .replace(/[&<>\u2028\u2029]/g, character => {
+      switch (character) {
+        case '&': return '\\u0026';
+        case '<': return '\\u003c';
+        case '>': return '\\u003e';
+        case '\u2028': return '\\u2028';
+        default: return '\\u2029';
+      }
+    });
 }
 
 function include(filename) {
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
-function isInitialPersonalDataSyncPendingForWeb_() {
-  const props = PropertiesService.getUserProperties().getProperties();
+function isInitialPersonalDataSyncPendingForWeb_(userPropertiesSnapshot) {
+  const props = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
   return props[USER_INITIAL_DATA_SYNC_PENDING_PROPERTY] === 'true' ||
     props[NOTIFICATION_INITIAL_BACKFILL_PENDING_PROPERTY] === 'true';
 }
@@ -292,22 +301,31 @@ function ensureUserStorageForWeb_() {
   const properties = PropertiesService.getUserProperties().getProperties();
   if (isUserStorageInitializationCurrentForProperties_(properties)) {
     if (isNotificationDisplayDataBuildingForProperties_(properties)) {
-      return {ok: true, skipped: true, displayDataBuilding: true};
+      return {ok: true, skipped: true, displayDataBuilding: true, userPropertiesSnapshot: properties};
     }
     if (!isNotificationDisplayDataCurrentForProperties_(properties)) {
-      return runWithUserLock_('表示用データ初期化', () => {
+      const result = runWithUserLock_('表示用データ初期化', () => {
         if (isNotificationDisplayDataCurrent_()) return {ok: true, skipped: true};
         const spreadsheet = getSpreadsheetForRead_(PropertiesService.getUserProperties().getProperties());
         const result = refreshNotificationDisplayDataAfterSyncLocked_(spreadsheet, 'display-data-migration');
         return Object.assign({ok: Boolean(result && result.taskCount !== undefined)}, result);
       });
+      return withUserPropertiesSnapshotForWeb_(result);
     }
     if (properties[USER_TRIGGER_MAINTENANCE_REVISION_PROPERTY] === USER_TRIGGER_MAINTENANCE_REVISION) {
-      return {ok: true, skipped: true};
+      return {ok: true, skipped: true, userPropertiesSnapshot: properties};
     }
-    return runWithUserLock_('バックグラウンドトリガー設定', () => ensureUserTriggerMaintenanceConfigurationLocked_());
+    const result = runWithUserLock_('バックグラウンドトリガー設定', () => ensureUserTriggerMaintenanceConfigurationLocked_());
+    return withUserPropertiesSnapshotForWeb_(result);
   }
-  return runWithUserLock_('保存データ処理', () => ensureUserStorageForWebLocked_());
+  const result = runWithUserLock_('保存データ処理', () => ensureUserStorageForWebLocked_());
+  return withUserPropertiesSnapshotForWeb_(result);
+}
+
+function withUserPropertiesSnapshotForWeb_(result) {
+  return Object.assign({}, result || {}, {
+    userPropertiesSnapshot: PropertiesService.getUserProperties().getProperties()
+  });
 }
 
 function isUserStorageInitializationCurrentForProperties_(properties) {
@@ -326,7 +344,7 @@ function isNotificationDisplayDataBuildingForProperties_(properties) {
 
 function isNotificationDisplayDataCurrentForProperties_(properties) {
   return (properties || {})[NOTIFICATION_DISPLAY_DATA_REVISION_PROPERTY] === NOTIFICATION_DISPLAY_DATA_REVISION &&
-    !isNotificationDisplayDataBuildingForProperties_(properties);
+    !String((properties || {})[NOTIFICATION_DISPLAY_DATA_BUILDING_PROPERTY] || '');
 }
 
 function isUserStorageInitializationCurrent_() {

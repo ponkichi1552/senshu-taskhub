@@ -499,11 +499,11 @@ function gasFormatDate(value, _zone, pattern) {
   return full;
 }
 
-function buildHtml(initialView = 'home', initialPayloadJson = 'null') {
+function buildHtml(initialView = 'home', initialPayloadJson = 'null', initialSyncPending = false) {
   const source = fs.readFileSync(path.join(GAS_DIR, 'Index.html'), 'utf8');
   const renderedIncludes = source.replace(/<\?!=\s*include\(['"]([^'"]+)['"]\)\s*;?\s*\?>/g, (_all, name) => fs.readFileSync(path.join(GAS_DIR, name + '.html'), 'utf8'));
-  const rendered = renderedIncludes.replace(/<\?!=\s*JSON\.stringify\(isInitialPersonalDataSyncPendingForWeb_\(\)\)\s*\?>/g,
-    JSON.stringify(Boolean(gas.isInitialPersonalDataSyncPendingForWeb_())))
+  const rendered = renderedIncludes.replace(/<\?!=\s*JSON\.stringify\(initialSyncPending\)\s*\?>/g,
+    JSON.stringify(Boolean(initialSyncPending)))
     .replace(/<\?=\s*initialView\s*\?>/g, ['assignment', 'university'].includes(initialView) ? initialView : 'home')
     .replace(/<\?!=\s*initialPayloadJson\s*\?>/g, () => String(initialPayloadJson || 'null'));
   const testClock = state.testClock ? new Date(state.testClock) : null;
@@ -603,7 +603,7 @@ function createContext() {
     Classroom: {Courses: {list: () => ({courses: []})}},
     ContentService: {MimeType: {JSON: 'application/json'}, createTextOutput(value) { return {value, setMimeType() {return this;}}; }},
     HtmlService: {
-      createTemplateFromFile() { return {initialView: 'home', initialPayloadJson: 'null', evaluate() { const initialView = this.initialView; const initialPayloadJson = this.initialPayloadJson; return {getContent: () => buildHtml(initialView, initialPayloadJson), setTitle() {return this;}}; }}; },
+      createTemplateFromFile() { return {initialView: 'home', initialPayloadJson: 'null', initialSyncPending: false, evaluate() { const initialView = this.initialView; const initialPayloadJson = this.initialPayloadJson; const initialSyncPending = this.initialSyncPending; return {getContent: () => buildHtml(initialView, initialPayloadJson, initialSyncPending), setTitle() {return this;}}; }}; },
       createHtmlOutputFromFile(name) { return {getContent: () => fs.readFileSync(path.join(GAS_DIR, name + '.html'), 'utf8')}; }
     }
   });

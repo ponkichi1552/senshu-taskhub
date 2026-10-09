@@ -1,8 +1,8 @@
 function getNotificationsForWeb(userProperties) {
-  return getNotificationsForWebLocked_(userProperties);
+  return getNotificationsForWebLocked_(userProperties, false);
 }
 
-function getNotificationsForWebLocked_(userPropertiesSnapshot) {
+function getNotificationsForWebLocked_(userPropertiesSnapshot, includeReadMetadata) {
   const startedAt = Date.now();
   const userProperties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
   const testMode = userProperties[TEST_CASE_MODE_PROPERTY] === 'true';
@@ -19,7 +19,7 @@ function getNotificationsForWebLocked_(userPropertiesSnapshot) {
         itemCounts: {returned: displayItems.length},
         spreadsheetRead: false
       }));
-      return displayItems;
+      return includeReadMetadata ? {items: displayItems, cacheHit: true} : displayItems;
     }
     const displayStartedAt = Date.now();
     const spreadsheet = getSpreadsheetForRead_(userProperties);
@@ -36,9 +36,12 @@ function getNotificationsForWebLocked_(userPropertiesSnapshot) {
         itemCounts: {returned: displayItems.length},
         rawNotificationSheetsRead: false
       }));
-      return displayItems;
+      return includeReadMetadata ? {items: displayItems, cacheHit: false} : displayItems;
     }
-    throw new Error('同期時に作成する課題表示データが未準備です。更新を実行してください。');
+    const message = isNotificationDisplayDataBuilding_(userProperties)
+      ? '課題表示データを更新中です。表示データの更新後に再試行します。'
+      : '同期時に作成する課題表示データが未準備です。更新を実行してください。';
+    throw new Error(message);
   }
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
   const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, deadlineReferenceNow) : null;
@@ -72,7 +75,7 @@ function getNotificationsForWebLocked_(userPropertiesSnapshot) {
     itemCounts: {active: activeItems.length, supplement: supplementItems.length, returned: result.length},
     inCampusSnapshotReused: !testMode && Array.isArray(readContext.sourceRowsBySource.inCampus)
   }));
-  return result;
+  return includeReadMetadata ? {items: result, cacheHit: false} : result;
 }
 
 function getActiveNotificationItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext) {
@@ -102,13 +105,18 @@ function getNotificationRowsFromSheets_(sheetsBySource, testMode, testDateContex
 
   NOTIFICATION_STORAGE_CONFIGS.forEach(storageConfig => {
     const sheet = sheetsBySource && sheetsBySource[storageConfig.source];
+    const preloadedSourceRows = readContext && readContext.preloadedRowsBySource &&
+      readContext.preloadedRowsBySource[storageConfig.source];
+    const hasPreloadedRows = Array.isArray(preloadedSourceRows);
 
-    if (!sheet || sheet.getLastRow() < 2) {
+    if (!sheet || (!hasPreloadedRows && sheet.getLastRow() < 2) || (hasPreloadedRows && preloadedSourceRows.length === 0)) {
       return;
     }
 
     const readStartedAt = Date.now();
-    let sourceRows = sheet.getDataRange().getValues().slice(1);
+    let sourceRows = hasPreloadedRows
+      ? preloadedSourceRows.map(row => row.slice())
+      : sheet.getDataRange().getValues().slice(1);
     if (readContext) {
       readContext.sheetReadMs[storageConfig.source] = (readContext.sheetReadMs[storageConfig.source] || 0) + Date.now() - readStartedAt;
       readContext.sheetRowCounts[storageConfig.source] = sourceRows.length;

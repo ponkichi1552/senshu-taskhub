@@ -23,28 +23,141 @@ function upsertInCampusAssignment_(assignment) {
   return runWithUserLock_('保存データ処理', () => upsertInCampusAssignmentLocked_(assignment));
 }
 
-function upsertInCampusAssignmentLocked_(assignment) {
-  const sheet = getOrCreateInCampusSheet_();
+function upsertInCampusAssignments_(assignments) {
+  return runWithUserLock_('保存データ処理', () => upsertInCampusAssignmentsLocked_(assignments));
+}
+
+function upsertInCampusAssignmentLocked_(assignment, spreadsheet) {
+  const sheet = getOrCreateInCampusSheetLocked_(spreadsheet);
+  return upsertInCampusAssignmentForSheetLocked_(sheet, assignment, false);
+}
+
+function upsertInCampusAssignmentsLocked_(assignments, spreadsheet, preparedInCampusSheet) {
+  const startedAt = Date.now();
+  let phaseStartedAt = startedAt;
+  const phaseMs = Object.create(null);
+  const sheet = preparedInCampusSheet || getOrCreateInCampusSheetLocked_(spreadsheet);
+  phaseMs.prepareSheetMs = Date.now() - phaseStartedAt;
+  phaseStartedAt = Date.now();
+  const rows = sheet.getDataRange().getValues();
+  phaseMs.readRowsMs = Date.now() - phaseStartedAt;
+  phaseStartedAt = Date.now();
+  const initialLastRow = rows.length;
+  const changedExistingRows = new Map();
+  const results = [];
+  let changedCount = 0;
+
+  assignments.forEach(assignment => {
+    const prepared = prepareInCampusAssignmentUpsert_(rows, assignment);
+    const result = prepared.result;
+    results.push(result);
+    if (!result.changed) return;
+
+    changedCount++;
+    if (!prepared.isNew && prepared.row <= initialLastRow) {
+      changedExistingRows.set(prepared.row, prepared.rowValues);
+    }
+  });
+  phaseMs.matchAndPrepareMs = Date.now() - phaseStartedAt;
+
+  const updates = Array.from(changedExistingRows, ([row, values]) => ({row, values}));
+  phaseStartedAt = Date.now();
+  if (updates.length > 0) {
+    if (typeof sheet.updateRows === 'function') {
+      sheet.updateRows(updates);
+    } else {
+      updates.forEach(update => sheet.getRange(update.row, 1, 1, INCAMPUS_HEADERS.length).setValues([update.values]));
+    }
+  }
+  phaseMs.updateRowsMs = Date.now() - phaseStartedAt;
+
+  const newRows = rows.slice(initialLastRow);
+  phaseStartedAt = Date.now();
+  if (newRows.length > 0) {
+    if (typeof sheet.appendRows === 'function') {
+      sheet.appendRows(newRows);
+    } else {
+      sheet.getRange(initialLastRow + 1, 1, newRows.length, INCAMPUS_HEADERS.length).setValues(newRows);
+    }
+  }
+  phaseMs.appendRowsMs = Date.now() - phaseStartedAt;
+
+  phaseStartedAt = Date.now();
+  if (changedCount > 0 && hasSavedInCampusSubmissionRecords_(rows)) {
+    applySavedInCampusExtractedSubmissionRecordsLocked_(sheet, rows);
+  }
+  phaseMs.applySubmissionMs = Date.now() - phaseStartedAt;
+  Logger.log('TASKHUB_INCAMPUS_BATCH_UPSERT ' + JSON.stringify({
+    elapsedMs: Date.now() - startedAt,
+    phaseMs,
+    assignmentCount: assignments.length,
+    existingUpdateCount: updates.length,
+    newRowCount: newRows.length,
+    changedCount,
+    unchangedCount: results.length - changedCount
+  }));
+  return {
+    results,
+    changedCount,
+    unchangedCount: results.length - changedCount
+  };
+}
+
+function upsertInCampusAssignmentForSheetLocked_(sheet, assignment, deferSubmissionApply) {
+  const rows = sheet.getDataRange().getValues();
+  const prepared = prepareInCampusAssignmentUpsert_(rows, assignment);
+  if (!prepared.result.changed) return prepared.result;
+
+  if (prepared.isNew) {
+    sheet.appendRow(prepared.rowValues);
+  } else {
+    sheet.getRange(prepared.row, 1, 1, INCAMPUS_HEADERS.length).setValues([prepared.rowValues]);
+  }
+
+  if (!deferSubmissionApply && hasSavedInCampusSubmissionRecords_(rows)) {
+    applySavedInCampusExtractedSubmissionRecordsLocked_(sheet, rows);
+  }
+  return prepared.result;
+}
+
+function prepareInCampusAssignmentUpsert_(rows, assignment) {
   const submissionRecord = extractInCampusSubmissionRecordFromAssignment_(assignment);
+  let rowAssignment = assignment;
 
   if (submissionRecord) {
-    return upsertInCampusSubmissionRecord_(sheet, assignment, submissionRecord);
+    rowAssignment = buildInCampusSubmissionRecordMarkerAssignment_(assignment, submissionRecord);
   }
 
-  const existingRowNumber = findExistingInCampusAssignmentRow_(sheet, assignment);
+  const existingRowNumber = findExistingInCampusAssignmentRowInValues_(rows, rowAssignment);
 
   if (existingRowNumber) {
-    const existingRow = sheet.getRange(existingRowNumber, 1, 1, INCAMPUS_HEADERS.length).getValues()[0];
-    const rowValues = buildAssignmentRow_(assignment, existingRow);
-    sheet.getRange(existingRowNumber, 1, 1, INCAMPUS_HEADERS.length).setValues([rowValues]);
-    applySavedInCampusExtractedSubmissionRecords_(sheet);
-    return { updated: true, row: existingRowNumber };
+    const existingRow = rows[existingRowNumber - 1];
+    const rowValues = buildAssignmentRow_(rowAssignment, existingRow);
+    if (areInCampusAssignmentRowsEquivalent_(existingRow, rowValues)) {
+      return {
+        result: {updated: true, unchanged: true, changed: false, row: existingRowNumber},
+        isNew: false,
+        row: existingRowNumber,
+        rowValues: existingRow
+      };
+    }
+    rows[existingRowNumber - 1] = rowValues;
+    return {
+      result: {updated: true, unchanged: false, changed: true, row: existingRowNumber},
+      isNew: false,
+      row: existingRowNumber,
+      rowValues
+    };
   }
 
-  const rowValues = buildAssignmentRow_(assignment);
-  sheet.appendRow(rowValues);
-  applySavedInCampusExtractedSubmissionRecords_(sheet);
-  return { updated: false, row: sheet.getLastRow() };
+  const rowValues = buildAssignmentRow_(rowAssignment);
+  rows.push(rowValues);
+  return {
+    result: {updated: false, unchanged: false, changed: true, row: rows.length},
+    isNew: true,
+    row: rows.length,
+    rowValues
+  };
 }
 
 function extractInCampusSubmissionRecordFromAssignment_(assignment) {
@@ -58,7 +171,7 @@ function extractInCampusSubmissionRecordFromAssignment_(assignment) {
   const records = extractInCampusSubmissionRecords_(
     '',
     text,
-    assignment.receivedAt || assignment.extractedAt || new Date()
+    assignment.submittedAt || assignment.updateAt || assignment.receivedAt || assignment.extractedAt || new Date()
   );
 
   if (records.length === 0) {
@@ -71,44 +184,29 @@ function extractInCampusSubmissionRecordFromAssignment_(assignment) {
     courseName: isGenericInCampusCourseNameForMatch_(normalizeInCampusCourseNameForMatch_(record.courseName)) ? assignment.courseName || '' : record.courseName,
     weekdayPeriod: record.weekdayPeriod || assignment.weekdayPeriod || '',
     title: record.title,
-    submittedAt: record.submittedAt || assignment.receivedAt || assignment.extractedAt || '',
+    submittedAt: record.submittedAt || assignment.submittedAt || assignment.updateAt || assignment.receivedAt || '',
     pageUrl: assignment.pageUrl || ''
   };
 }
 
-function upsertInCampusSubmissionRecord_(sheet, assignment, record) {
-  const markerAssignment = Object.assign({}, assignment, {
+function buildInCampusSubmissionRecordMarkerAssignment_(assignment, record) {
+  return Object.assign({}, assignment, {
     type: INCAMPUS_SUBMISSION_RECORD_TYPE,
     title: record.title,
     body: assignment.body || assignment.title || '',
     pageUrl: buildInCampusSubmissionRecordPageUrl_(assignment, record),
     assignmentKey: buildInCampusSubmissionRecordAssignmentKey_(assignment, record),
     status: INCAMPUS_SUBMISSION_RECORD_STATUS,
-    completedAt: record.submittedAt || assignment.receivedAt || assignment.extractedAt || ''
+    completedAt: record.submittedAt || assignment.submittedAt || assignment.updateAt || assignment.receivedAt || ''
   });
-  const existingRowNumber = findExistingInCampusAssignmentRow_(sheet, markerAssignment);
-
-  if (existingRowNumber) {
-    const existingRow = sheet.getRange(existingRowNumber, 1, 1, INCAMPUS_HEADERS.length).getValues()[0];
-    const rowValues = buildAssignmentRow_(markerAssignment, existingRow);
-    sheet.getRange(existingRowNumber, 1, 1, INCAMPUS_HEADERS.length).setValues([rowValues]);
-    applySavedInCampusExtractedSubmissionRecords_(sheet);
-    return { updated: true, row: existingRowNumber };
-  }
-
-  const rowValues = buildAssignmentRow_(markerAssignment);
-  sheet.appendRow(rowValues);
-  applySavedInCampusExtractedSubmissionRecords_(sheet);
-  return { updated: false, row: sheet.getLastRow() };
 }
 
 function buildInCampusSubmissionRecordPageUrl_(assignment, record) {
   const baseUrl = assignment.pageUrl || 'incampus-submission';
   const key = [
+    assignment.assignmentKey || assignment.updateInfoId || assignment.reportId || '',
     record.title,
-    record.submittedAt,
-    assignment.extractedAt,
-    assignment.receivedAt
+    record.submittedAt || assignment.submittedAt || assignment.updateAt || assignment.receivedAt || ''
   ].filter(Boolean).join('-');
 
   return `${baseUrl}#submitted-${encodeURIComponent(normalizeInCampusMatchText_(key))}`;
@@ -126,7 +224,7 @@ function buildInCampusSubmissionRecordAssignmentKey_(assignment, record) {
     'submission',
     existingKey || assignment.pageUrl || '',
     record.title || assignment.title || '',
-    record.submittedAt || assignment.receivedAt || assignment.extractedAt || ''
+    record.submittedAt || assignment.submittedAt || assignment.updateAt || assignment.receivedAt || ''
   ].filter(Boolean);
 
   return parts.length > 2 ? parts.join(':') : '';
@@ -134,7 +232,10 @@ function buildInCampusSubmissionRecordAssignmentKey_(assignment, record) {
 
 function findExistingInCampusAssignmentRow_(sheet, assignment) {
   if (sheet.getLastRow() < 2) return 0;
-  const values = sheet.getDataRange().getValues();
+  return findExistingInCampusAssignmentRowInValues_(sheet.getDataRange().getValues(), assignment);
+}
+
+function findExistingInCampusAssignmentRowInValues_(values, assignment) {
   const type = String(assignment.type || 'assignment');
   const key = String(assignment.assignmentKey || '').trim();
   const url = String(assignment.pageUrl || '').trim();
@@ -154,14 +255,66 @@ function findExistingInCampusAssignmentRow_(sheet, assignment) {
   return 0;
 }
 
-function applySavedInCampusExtractedSubmissionRecords_(sheet) {
-  return runWithUserLock_('提出記録処理', () => applySavedInCampusExtractedSubmissionRecordsLocked_(sheet));
+function hasSavedInCampusSubmissionRecords_(values) {
+  return values.some((row, index) => index > 0 &&
+    (row[1] === INCAMPUS_SUBMISSION_RECORD_TYPE || row[14] === INCAMPUS_SUBMISSION_RECORD_STATUS));
 }
 
-function applySavedInCampusExtractedSubmissionRecordsLocked_(sheet) {
-  if (!sheet || sheet.getLastRow() < 2) return 0;
-  const values = sheet.getDataRange().getValues();
+function areInCampusAssignmentRowsEquivalent_(existingRow, nextRow) {
+  const volatileColumns = new Set([11, 12]); // extractedAt / savedAt
+
+  for (let index = 0; index < INCAMPUS_HEADERS.length; index++) {
+    if (volatileColumns.has(index)) continue;
+
+    if (index === 13) {
+      const existingRaw = parseInCampusRawJson_(existingRow[index]);
+      const nextRaw = parseInCampusRawJson_(nextRow[index]);
+      delete existingRaw.extractedAt;
+      delete nextRaw.extractedAt;
+      if (stableInCampusJson_(existingRaw) !== stableInCampusJson_(nextRaw)) return false;
+      continue;
+    }
+
+    const existingValue = existingRow[index];
+    const nextValue = nextRow[index];
+    const normalizedExisting = existingValue instanceof Date ? `date:${existingValue.getTime()}` : String(existingValue ?? '');
+    const normalizedNext = nextValue instanceof Date ? `date:${nextValue.getTime()}` : String(nextValue ?? '');
+    if (normalizedExisting !== normalizedNext) return false;
+  }
+
+  return true;
+}
+
+function stableInCampusJson_(value) {
+  if (Array.isArray(value)) return value.map(stableInCampusJson_);
+  if (value && typeof value === 'object') {
+    const sorted = {};
+    Object.keys(value).sort().forEach(key => {
+      if (value[key] === '' || value[key] === null || value[key] === undefined) return;
+      sorted[key] = stableInCampusJson_(value[key]);
+    });
+    return JSON.stringify(sorted);
+  }
+  return JSON.stringify(value);
+}
+
+function applySavedInCampusExtractedSubmissionRecords_(sheet, values) {
+  return runWithUserLock_('提出記録処理', () => applySavedInCampusExtractedSubmissionRecordsLocked_(sheet, values));
+}
+
+function applySavedInCampusExtractedSubmissionRecordsLocked_(sheet, preloadedValues) {
+  if (!sheet) return 0;
+  const values = Array.isArray(preloadedValues) ? preloadedValues : sheet.getDataRange().getValues();
+  if (values.length < 2) return 0;
   let completedCount = 0;
+  const changedRows = new Map();
+  const assignmentIndexByUrl = new Map();
+  for (let index = 1; index < values.length; index++) {
+    if (values[index][1] === 'assignment' && values[index][10] && !assignmentIndexByUrl.has(String(values[index][10]))) {
+      assignmentIndexByUrl.set(String(values[index][10]), index);
+    }
+  }
+
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
     if (row[1] !== INCAMPUS_SUBMISSION_RECORD_TYPE && row[14] !== INCAMPUS_SUBMISSION_RECORD_STATUS) continue;
@@ -172,17 +325,29 @@ function applySavedInCampusExtractedSubmissionRecordsLocked_(sheet) {
     };
     const eventKey = buildInCampusSubmissionEventKey_(record, row[16], row[12]);
     const bindings = raw.appliedSubmissionTargets || {};
-    const matches = findMatchingInCampusExtractedRecords_(values, record);
-    const targets = bindings[eventKey] || matches.map(match => match.row[10]);
+    const targets = bindings[eventKey] || findMatchingInCampusExtractedRecords_(values, record).map(match => match.row[10]);
     if (!targets.length) continue;
     if (!bindings[eventKey]) {
       bindings[eventKey] = targets; raw.appliedSubmissionTargets = bindings;
-      row[13] = JSON.stringify(raw); sheet.getRange(i + 1, 14).setValue(row[13]);
+      row[13] = JSON.stringify(raw);
+      changedRows.set(i + 1, row);
     }
     targets.forEach(url => {
-      const index = values.findIndex((target, offset) => offset > 0 && target[1] === 'assignment' && String(target[10]) === String(url));
-      if (index > 0 && setInCampusExtractedSubmissionStatus_(sheet, values, index, record, eventKey)) completedCount++;
+      const index = assignmentIndexByUrl.get(String(url));
+      if (index > 0 && setInCampusExtractedSubmissionStatus_(sheet, values, index, record, eventKey, true)) {
+        completedCount++;
+        changedRows.set(index + 1, values[index]);
+      }
     });
+  }
+
+  if (changedRows.size > 0) {
+    const updates = Array.from(changedRows, ([row, values]) => ({row, values: toSafeSpreadsheetRow_(values)}));
+    if (typeof sheet.updateRows === 'function') {
+      sheet.updateRows(updates);
+    } else {
+      updates.forEach(update => sheet.getRange(update.row, 14, 1, 3).setValues([update.values.slice(13, 16)]));
+    }
   }
   return completedCount;
 }
@@ -219,14 +384,14 @@ function findMatchingInCampusExtractedRecords_(values, record) {
   return new Set(candidates.map(candidate => String(candidate.row[10]))).size > 1 ? [] : candidates;
 }
 
-function setInCampusExtractedSubmissionStatus_(sheet, values, index, record, eventKey) {
+function setInCampusExtractedSubmissionStatus_(sheet, values, index, record, eventKey, deferWrite) {
   const row = values[index];
   const raw = parseInCampusRawJson_(row[13]);
   const events = raw.appliedSubmissionEvents || {};
   if (events[eventKey]) return false;
   events[eventKey] = true; raw.appliedSubmissionEvents = events;
   row[13] = JSON.stringify(raw); row[14] = '完了'; row[15] = record.submittedAt || new Date();
-  sheet.getRange(index + 1, 14, 1, 3).setValues([[row[13], row[14], toSafeSpreadsheetCell_(row[15])]]);
+  if (!deferWrite) sheet.getRange(index + 1, 14, 1, 3).setValues([[row[13], row[14], toSafeSpreadsheetCell_(row[15])]]);
   return true;
 }
 
@@ -234,8 +399,8 @@ function getOrCreateInCampusSheet_() {
   return runWithUserLock_('保存データ処理', () => getOrCreateInCampusSheetLocked_());
 }
 
-function getOrCreateInCampusSheetLocked_() {
-  const ss = getTargetSpreadsheet_();
+function getOrCreateInCampusSheetLocked_(spreadsheet) {
+  const ss = spreadsheet || getTargetSpreadsheet_();
   const unifiedSheet = getOrCreateInCampusUnifiedSheetLocked_(ss);
   return createInCampusExtractSheetAdapter_(unifiedSheet);
 }
@@ -293,8 +458,9 @@ function buildAssignmentRow_(assignment, existingRow) {
   const existingStatus = existingRow ? String(existingRow[14] || '') : '';
   const existingCompletedAt = existingRow ? existingRow[15] : '';
   const status = existingStatus || assignment.status || '未確認';
-  const completedAt = status === '完了'
-    ? existingCompletedAt || assignment.completedAt || now
+  const isCompleted = status === '完了' || status === INCAMPUS_SUBMISSION_RECORD_STATUS;
+  const completedAt = isCompleted
+    ? existingCompletedAt || assignment.completedAt || (status === '完了' ? now : '')
     : '';
 
   return toSafeSpreadsheetRow_([

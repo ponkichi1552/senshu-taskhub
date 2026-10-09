@@ -279,10 +279,10 @@ function updateInCampusExtractedStatusLocked_(messageId, status) {
 }
 
 function getCompletedNotificationsForWeb(userProperties) {
-  return getCompletedNotificationsForWebLocked_(userProperties);
+  return getCompletedNotificationsForWebLocked_(userProperties, false);
 }
 
-function getCompletedNotificationsForWebLocked_(userPropertiesSnapshot) {
+function getCompletedNotificationsForWebLocked_(userPropertiesSnapshot, includeReadMetadata) {
   const startedAt = Date.now();
   const userProperties = userPropertiesSnapshot || PropertiesService.getUserProperties().getProperties();
   const testMode = userProperties[TEST_CASE_MODE_PROPERTY] === 'true';
@@ -299,7 +299,7 @@ function getCompletedNotificationsForWebLocked_(userPropertiesSnapshot) {
         itemCounts: {returned: displayItems.length},
         spreadsheetRead: false
       }));
-      return displayItems;
+      return includeReadMetadata ? {items: displayItems, cacheHit: true} : displayItems;
     }
     const displayStartedAt = Date.now();
     const spreadsheet = getSpreadsheetForRead_(userProperties);
@@ -316,9 +316,12 @@ function getCompletedNotificationsForWebLocked_(userPropertiesSnapshot) {
         itemCounts: {returned: displayItems.length},
         rawNotificationSheetsRead: false
       }));
-      return displayItems;
+      return includeReadMetadata ? {items: displayItems, cacheHit: false} : displayItems;
     }
-    throw new Error('同期時に作成する課題表示データが未準備です。更新を実行してください。');
+    const message = isNotificationDisplayDataBuilding_(userProperties)
+      ? '課題表示データを更新中です。表示データの更新後に再試行します。'
+      : '同期時に作成する課題表示データが未準備です。更新を実行してください。';
+    throw new Error(message);
   }
   const testSpreadsheet = testMode ? openTestCaseSpreadsheet_() : null;
   const testDateContext = testMode ? getTestCaseDateContext_(testSpreadsheet, deadlineReferenceNow) : null;
@@ -331,7 +334,8 @@ function getCompletedNotificationsForWebLocked_(userPropertiesSnapshot) {
     testMode
   );
 
-  return prepareTaskDisplayItemsForSync_(data, '完了', deadlineReferenceNow);
+  const displayItems = prepareTaskDisplayItemsForSync_(data, '完了', deadlineReferenceNow);
+  return includeReadMetadata ? {items: displayItems, cacheHit: false} : displayItems;
 }
 
 function getInCampusSupplementItemsForWeb_(testSpreadsheet, testStates, testDateContext, readContext, forceProduction) {

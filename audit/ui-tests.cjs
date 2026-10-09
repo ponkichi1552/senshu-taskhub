@@ -7,6 +7,10 @@ const sourceDir = path.resolve(__dirname, '../taskhub-split/taskhub-split');
 
 function element() {
   const classes = new Set();
+  const appendChild = (parent, child) => {
+    if (child && child.isDocumentFragment) parent.children.push(...child.children);
+    else parent.children.push(child);
+  };
   const node = {
     children: [], style: {}, dataset: {}, value: '', textContent: '', innerHTML: '',
     classList: {
@@ -17,9 +21,9 @@ function element() {
         if (value) classes.add(name); else classes.delete(name); return value;}
     },
     setAttribute(name, value) {this[name] = value;},
-    append(...children) {this.children.push(...children);},
-    appendChild(child) {this.children.push(child);},
-    replaceChildren(...children) {this.children = children;},
+    append(...children) {children.forEach(child => appendChild(this, child));},
+    appendChild(child) {appendChild(this, child);},
+    replaceChildren(...children) {this.children = []; children.forEach(child => appendChild(this, child));},
     addEventListener() {}
   };
   let innerHTML = '';
@@ -40,7 +44,8 @@ function fixture(fixedNow, {holdBoot = false, initialRoute = 'home', initialSync
   const document = {
     body,
     getElementById(id) {if (!nodes.has(id)) nodes.set(id, element()); return nodes.get(id);},
-    querySelectorAll() {return [];}, createElement: element
+    querySelectorAll() {return [];}, createElement: element,
+    createDocumentFragment() {const fragment = element(); fragment.isDocumentFragment = true; return fragment;}
   };
   const script = {};
   Object.defineProperty(script, 'run', {get() {
@@ -266,6 +271,34 @@ test('invalid university preload falls back to a valid server response before sh
   assert.doesNotMatch(f.document.getElementById('un-status').textContent, /形式を確認できません/);
 });
 
+test('university list retries when its prepared sheet is briefly being replaced by background sync', () => {
+  const f = fixture(undefined, {holdBoot: true, initialRoute: 'university'});
+  const first = f.take('getUniversityNoticePayloadForWeb');
+  first.settled = true;
+  first.failure(new Error('大学通知表示データを更新中です。表示データの更新後に再試行します。'));
+  assert.equal(f.read('universityState.loading'), true, 'the list remains in loading state during a transient write');
+  f.flushTimers();
+  const retry = f.take('getUniversityNoticePayloadForWeb');
+  f.reply(retry, {items: [{messageId: 'retry-notice', title: '再試行で取得', preview: '要約',
+    source: 'inCampus', receivedAt: '2026/10/09 10:00', from: '', read: false, saved: false}], cacheToken: 'new-generation'});
+  assert.equal(f.read('universityState.loaded'), true);
+  assert.equal(f.read('universityState.items[0].messageId'), 'retry-notice');
+  assert.match(f.document.getElementById('un-status').textContent, /未読・保存状態/);
+});
+
+test('task list retries a cacheless prepared-sheet read that overlaps the short write phase', () => {
+  const f = fixture(undefined, {holdBoot: true, initialRoute: 'assignment'});
+  const first = f.take('getTaskDisplayPayloadForWeb', '未完了');
+  first.settled = true;
+  first.failure(new Error('課題表示データを更新中です。表示データの更新後に再試行します。'));
+  f.flushTimers();
+  const retry = f.take('getTaskDisplayPayloadForWeb', '未完了');
+  f.reply(retry, {items: [item('retry-task')], testCaseClockState: {testCaseModeEnabled: false}});
+  assert.deepEqual(f.ids('notificationData.active'), ['retry-task']);
+  assert.ok(f.document.getElementById('list').children.length > 0);
+  assert.doesNotMatch(f.document.getElementById('list').textContent, /更新中/);
+});
+
 test('the initial data response supplies test-clock state without triggering another list read', () => {
   const f = fixture(undefined, {holdBoot: true, initialRoute: 'assignment'});
   const boot = f.take('getTaskDisplayPayloadForWeb');
@@ -393,6 +426,15 @@ test('task display cache write waits for paint while university list opening doe
     'rendered notice lists must not issue a background full-body cache request');
   assert.equal(university.pending('getUniversityNoticeBodyForWeb').length, 0,
     'notice bodies are fetched only after a card is selected');
+});
+
+test('a sync-warmed task cache response skips the redundant post-display cache RPC', () => {
+  const f = fixture(undefined, {holdBoot: true});
+  const initial = f.take('getTaskDisplayPayloadForWeb');
+  f.reply(initial, {items: [item('SYNC-WARMED-TASK')], cacheToken: ''});
+  f.flushAnimationFrame();
+  f.flushAnimationFrame();
+  assert.deepEqual(f.calls.map(call => call.method), ['getTaskDisplayPayloadForWeb']);
 });
 
 test('discovering test mode invalidates old client data and rejects the old source reply', () => {

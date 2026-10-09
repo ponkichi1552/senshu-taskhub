@@ -17,6 +17,8 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData) 
  document.getElementById('un-refresh').disabled = true;
  if (!keepCurrentItems || forceRefresh) document.getElementById('un-status').textContent = 'お知らせを読み込み中…';
  let compatibilityFallbackStarted = false;
+ let transientRetryCount = 0;
+ const transientRetryDelays = [100, 250, 500, 1000, 1500, 2000, 3000];
   const handleSuccess = payload => {
   if (requestId !== universityState.requestId) return;
   const items = Array.isArray(payload) ? payload : payload && Array.isArray(payload.items) ? payload.items : null;
@@ -70,8 +72,18 @@ function loadUniversityNotices(onSuccess, onFailure, forceRefresh, initialData) 
   const currentQuery = document.getElementById('un-search').value.trim();
   if (currentQuery) handleUniversitySearchInput();
  };
- const handleFailure = () => {
+ const handleFailure = error => {
   if (requestId !== universityState.requestId) return;
+  const errorMessage = getErrorMessage(error);
+  if (/大学通知表示データを更新中/.test(errorMessage) && transientRetryCount < transientRetryDelays.length) {
+   const delay = transientRetryDelays[transientRetryCount++];
+   setTimeout(() => {
+    if (requestId !== universityState.requestId) return;
+    google.script.run.withSuccessHandler(handleSuccess).withFailureHandler(handleFailure)
+     .getUniversityNoticePayloadForWeb(Boolean(forceRefresh));
+   }, delay);
+   return;
+  }
   universityState.loading = false; document.getElementById('un-refresh').disabled = false;
   if (!keepCurrentItems) document.getElementById('un-status').textContent = '読み込めませんでした。「更新」で再試行してください。';
   if (typeof onFailure === 'function') onFailure(new Error('大学のお知らせを読み込めませんでした。'));
@@ -145,10 +157,11 @@ function renderUniversityNotices() {
   (universityState.bodySearchQuery===q&&universityState.bodySearchMessageIds instanceof Set
    ? universityState.bodySearchMessageIds.has(String(n.messageId))
    : universityNoticeSearchText_(n).includes(normalizedQuery))));
- const list=document.getElementById('un-list');list.replaceChildren();
+ const list=document.getElementById('un-list');const fragment=document.createDocumentFragment();
  document.getElementById('un-count').textContent=items.length+'件のお知らせ · 新しい順';
- if(!items.length)list.append(unElement('p','un-empty',universityState.items.length?'該当するお知らせはありません。':'お知らせはまだありません。'));
- items.forEach(n=>{const b=unElement('button','un-item');b.type='button';b.setAttribute('aria-current',n.messageId===universityState.selected);const preview=String(n.preview||'');b.setAttribute('aria-label',[n.read?'既読':'未読',n.source,n.receivedAt,n.title||'件名なし',preview].filter(Boolean).join('　'));b.append(unElement('div','un-meta',(n.read?'':'● 未読　')+n.source+'　'+n.receivedAt),unElement('div','un-title',n.title||'件名なし'),unElement('div','un-excerpt',preview));b.onclick=()=>{universityState.selected=n.messageId;document.getElementById('un-shell').classList.add('is-reading');if(!n.read)updateUniversityNotice(n,{read:true});renderUniversityNotices();renderUniversityDetail()};list.append(b)});
+ if(!items.length)fragment.append(unElement('p','un-empty',universityState.items.length?'該当するお知らせはありません。':'お知らせはまだありません。'));
+ items.forEach(n=>{const b=unElement('button','un-item');b.type='button';b.setAttribute('aria-current',n.messageId===universityState.selected);const preview=String(n.preview||'');b.setAttribute('aria-label',[n.read?'既読':'未読',n.source,n.receivedAt,n.title||'件名なし',preview].filter(Boolean).join('　'));b.append(unElement('div','un-meta',(n.read?'':'● 未読　')+n.source+'　'+n.receivedAt),unElement('div','un-title',n.title||'件名なし'),unElement('div','un-excerpt',preview));b.onclick=()=>{universityState.selected=n.messageId;document.getElementById('un-shell').classList.add('is-reading');if(!n.read)updateUniversityNotice(n,{read:true});renderUniversityNotices();renderUniversityDetail()};fragment.appendChild(b)});
+ list.replaceChildren(fragment);
 }
 function updateUniversityNotice(n, change) {
  if(n.pending)return;
