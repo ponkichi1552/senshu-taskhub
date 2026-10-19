@@ -144,6 +144,11 @@ function areUniversityNoticeCollectionsEqual_(previousItems, nextItems) {
  return true;
 }
 function unElement(tag, cls, text) {const el=document.createElement(tag);el.className=cls;if(text!==undefined)el.textContent=text;return el;}
+function universityNoticeBodyForDisplay_(value) {
+ const body=String(value||'').replace(/\r\n?/g,'\n');
+ const inCampusFooter=/\n[\t \u3000]*(?:以上[\t \u3000]*\n[\t \u3000]*)?={3,}[\t \u3000]*\n[\t \u3000]*※※このメールは専修大学のin Campus発信専用です。返信はできません。※※[\t \u3000]*(?:\n[\t \u3000]*)*$/;
+ return body.replace(inCampusFooter,'').replace(/[\t \u3000\n]+$/,'');
+}
 function universityNoticeSearchText_(notice) {
  return [notice.title, notice.from, notice.source, notice.preview, notice.bodyLoaded ? notice.body : '']
   .map(value => String(value || '').normalize('NFKC').toLowerCase()).join(' ');
@@ -214,7 +219,7 @@ function renderUniversityDetail() {
  const back=unElement('button','un-back','← 一覧に戻る');back.onclick=()=>document.getElementById('un-shell').classList.remove('is-reading');
  const top=unElement('div','un-detail-top');const save=unElement('button','un-save',n.saved?'★ 保存済み':'☆ 保存する');save.setAttribute('aria-pressed',Boolean(n.saved));save.disabled=Boolean(n.pending);save.onclick=()=>{updateUniversityNotice(n,{saved:!n.saved});renderUniversityNotices();renderUniversityDetail()};top.append(unElement('span','un-meta',n.source),save);
  pane.append(back,top,unElement('h2','',n.title||'件名なし'),unElement('p','un-meta',(n.from||'')+'　'+n.receivedAt));
- pane.append(unElement('div','un-body',n.bodyLoaded ? (n.body||'本文はありません。') : n.bodyLoadFailed ? '本文を読み込めませんでした。' : '本文を読み込み中…'));
+ pane.append(unElement('div','un-body',n.bodyLoaded ? (universityNoticeBodyForDisplay_(n.body)||'本文はありません。') : n.bodyLoadFailed ? '本文を読み込めませんでした。' : '本文を読み込み中…'));
  if (n.bodyLoadFailed) {const retry=unElement('button','un-save','本文を再読み込み');retry.onclick=()=>{n.bodyLoadFailed=false;loadUniversityNoticeBody_(n)};pane.append(retry)}
  else if (!n.bodyLoaded) loadUniversityNoticeBody_(n);
  try{const url=new URL(n.gmailLink);if(url.protocol==='https:'&&url.hostname==='mail.google.com'){const a=unElement('a','un-mail','Gmailで元のお知らせを開く ↗');a.href=url.href;a.target='_blank';a.rel='noopener noreferrer';pane.append(a)}}catch{}

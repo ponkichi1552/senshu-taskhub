@@ -4,6 +4,15 @@
 
 > 詳細な変更記録は、README / CHANGELOG整理直前の[CHANGELOG](https://github.com/ponkichi1552/senshu-taskhub/blob/97895df64e16aae783106513bf0531617b61ab12/CHANGELOG.md)に保存しています。以下では、主要な設計変更を追いやすい単位にまとめています。
 
+## 2026-10-19 本番 v137 とApps Scriptソースを同期
+
+本番Apps Scriptを `clasp pull` してGitHub `main` の `taskhub-split/taskhub-split/` と照合しました。Apps Script側の `.js` ファイル名をリポジトリの `.gs` に対応させて比較した結果、38ファイル中32ファイルは内容が一致し、6ファイルに差がありました。本番から取得した内容で `Index.html`、`ScriptsCourseFilter.html`、`ScriptsRendering.html`、`Styles.html`、`UniversityScripts.html`、`UniversityView.html` を同期しました。`MAIL_LINKING.md` と `STORAGE.md` はリポジトリ内の資料で、Apps Scriptの実行ファイルではありません。反映後の再照合では38ファイルすべての内容一致を確認しました。
+
+- 課題一覧に読み込み状態の通知を追加し、初期表示カードの詳細を選んだ時に読み込む動作と、メニュー操作の処理を本番に合わせました。
+- 大学通知は先頭一覧を先に表示して残りをバックグラウンドで読み込みます。更新との競合時に操作中の既読・重要状態を保ち、明示的な更新ボタンの処理を使うようにしました。
+- 選択中の「すべて・未読・保存済み」を薄緑の枠で示すスタイルを含め、本番のHTML/CSSをそのまま同期しました。
+- UI回帰テストのヘッダー名の期待値も、古い「課題通知Hub」から現行の「課題通知」へ揃えました。
+
 ## 2026-10-10 README / CHANGELOGの全面整理
 
 READMEを現在のmain実装、Chrome拡張機能、Google権限、表示データ構成、CI/CDに合わせて更新しました。CHANGELOGは主要な設計変更と検証を時系列で追える構成に整理し、更新前の詳細版は上記コミットのファイルに残しています。

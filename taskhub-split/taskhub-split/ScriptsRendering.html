@@ -53,18 +53,18 @@
     card.className = `card ${getCardClassByGroupKey(currentGroupKey)}`;
     const currentIndex = cardIndex++;
     const detailMessageId = encodeURIComponent(String(item.messageId || '')).replaceAll("'", '%27');
+    const cardCourseLabel = getAssignmentCardCourseLabel(item);
     card.innerHTML = `
-      <div class="source">${escapeHtml(item.source || '')}</div>
-      <div class="course">${escapeHtml(item.courseName || '授業名未抽出')}</div>
-      <div class="title">${escapeHtml(item.title || 'タイトル未抽出')}</div>
-      <div class="due">期限：${escapeHtml(item.dueDate || '未検出')}</div>
-      <div class="status">状態：${escapeHtml(getDisplayDueStatus(item.dueStatus))} / ${escapeHtml(getDisplayStatus(item.status))}</div>
-      <div class="status">メール受信：${escapeHtml(item.receivedAt || '')}</div>
-      ${item.supplementKey ? '<div class="status">inCampusの課題詳細で補足済み</div>' : ''}
+      <div class="card-topline">
+        <div class="card-course" title="${escapeAttribute(cardCourseLabel)}">${escapeHtml(cardCourseLabel)}</div>
+      </div>
+      <div class="card-title-line">
+        <div class="title">${escapeHtml(item.title || 'タイトル未抽出')}</div>
+        <div class="card-due ${getDueTextClassByGroupKey(currentGroupKey)}">期限：${escapeHtml(item.dueDate || '未検出')}</div>
+      </div>
       <div class="button-row">
         ${getClassroomOpenButtonHtml(item)}
-        ${getGmailOpenButtonHtml(item)}
-        ${item.firstPaintOnly ? '<button disabled>詳細を読み込み中</button>' : `<button onclick="toggleBody(${currentIndex}, '${detailMessageId}')">詳細</button>`}
+        ${item.firstPaintOnly ? '<button class="card-action card-details" type="button" disabled>詳細を読み込み中</button>' : `<button class="card-action card-details" type="button" onclick="toggleBody(${currentIndex}, '${detailMessageId}')">詳細</button>`}
         ${getStatusActionButtonHtml(item, viewMode)}
       </div>
       <div class="body" id="body-${currentIndex}">${escapeHtml(item.body || '')}</div>
@@ -94,6 +94,22 @@ function getPreparedTaskGroupInfo(key, viewMode) {
   return {label: labels[key] || labels.unknown};
 }
 
+function getAssignmentCardCourseLabel(item) {
+  const source = String(item && item.source || '').trim();
+  const sourceLabel = source === 'Google Classroom' ? 'Classroom' : source;
+  const course = String(item && item.courseName || '授業名未抽出').trim();
+  const period = String(item && item.weekdayPeriod || '').trim().replace(/^\[|\]$/g, '');
+  const courseLabel = period && !course.includes(period) ? `${course} [${period}]` : course;
+  return [sourceLabel, courseLabel].filter(Boolean).join(' / ') || '授業名未抽出';
+}
+
+function getDueTextClassByGroupKey(key) {
+  if (key === 'expired') return 'is-due-expired';
+  if (key === 'today') return 'is-due-today';
+  if (key === 'tomorrow') return 'is-due-tomorrow';
+  return 'is-due-neutral';
+}
+
   function getClassroomOpenButtonHtml(item) {
     const url = item && item.classroomUrl ? String(item.classroomUrl).trim() : '';
 
@@ -102,19 +118,6 @@ function getPreparedTaskGroupInfo(key, viewMode) {
     }
 
     return `<a class="button classroom-button" href="${escapeAttribute(url)}" target="_blank" rel="noopener noreferrer">課題を開く</a>`;
-  }
-
-  function getGmailOpenButtonHtml(item) {
-    const url = item && item.gmailLink ? String(item.gmailLink).trim() : '';
-
-    try {
-      const parsedUrl = new URL(url);
-      if (parsedUrl.protocol !== 'https:' || parsedUrl.hostname !== 'mail.google.com') return '';
-    } catch (e) {
-      return '';
-    }
-
-    return `<a class="button" href="${escapeAttribute(url)}" target="_blank" rel="noopener noreferrer">元メール</a>`;
   }
 
   function isSafeHttpUrl(url) {
@@ -150,10 +153,10 @@ function getPreparedTaskGroupInfo(key, viewMode) {
     }
 
     if (viewMode === 'completed') {
-      return `<button onclick="markAsUndone('${encodedMessageId}')">未完了に戻す</button>`;
+      return `<button class="card-action card-complete is-completed" type="button" aria-label="クリックして未完了に戻す" title="クリックして未完了に戻す" onclick="markAsUndone('${encodedMessageId}')">✓ 完了</button>`;
     }
 
-    return `<button onclick="markAsDone('${encodedMessageId}')">完了</button>`;
+    return `<button class="card-action card-complete" type="button" aria-label="完了にする" onclick="markAsDone('${encodedMessageId}')">完了</button>`;
   }
 
   function getCardClassByGroupKey(key) {

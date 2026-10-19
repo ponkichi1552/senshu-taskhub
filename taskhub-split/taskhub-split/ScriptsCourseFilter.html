@@ -152,17 +152,15 @@
 
   function openAssignmentMenu() {
     const drawer = document.getElementById('assignment-menu-drawer');
-    const backdrop = document.getElementById('assignment-menu-backdrop');
     const toggle = document.getElementById('assignment-menu-toggle');
 
-    if (!drawer || !backdrop) {
+    if (!drawer) {
       return;
     }
 
     drawer.inert = false;
     drawer.setAttribute('aria-hidden', 'false');
     drawer.classList.add('is-open');
-    backdrop.classList.add('is-open');
 
     if (toggle) {
       toggle.setAttribute('aria-expanded', 'true');
@@ -171,7 +169,6 @@
 
   function closeAssignmentMenu() {
     const drawer = document.getElementById('assignment-menu-drawer');
-    const backdrop = document.getElementById('assignment-menu-backdrop');
     const toggle = document.getElementById('assignment-menu-toggle');
 
     if (drawer) {
@@ -180,18 +177,12 @@
       drawer.setAttribute('aria-hidden', 'true');
     }
 
-    if (backdrop) {
-      backdrop.classList.remove('is-open');
-    }
-
     if (toggle) {
       toggle.setAttribute('aria-expanded', 'false');
     }
   }
 
   function selectAssignmentMenu(destination) {
-    closeAssignmentMenu();
-
     if (destination === 'completed') {
       loadCompletedNotifications();
     } else if (destination === 'search') {
@@ -294,7 +285,7 @@ function isGroupOpen(viewMode, groupKey) {
   return getDefaultGroupOpen(viewMode, groupKey);
 }
 
-function toggleGroup(viewMode, groupKey) {
+  function toggleGroup(viewMode, groupKey) {
   const stateKey = getGroupStateKey(viewMode, groupKey);
   const nextOpen = !isGroupOpen(viewMode, groupKey);
 
@@ -317,5 +308,19 @@ function toggleGroup(viewMode, groupKey) {
   if (groupArrow) {
     groupArrow.textContent = nextOpen ? '⌃' : '⌄';
   }
+}
+
+if (document && typeof document.addEventListener === 'function') {
+  document.addEventListener('click', event => {
+    const drawer = document.getElementById('assignment-menu-drawer');
+    const toggle = document.getElementById('assignment-menu-toggle');
+    if (!drawer || !drawer.classList.contains('is-open')) return;
+    if ((drawer.contains && drawer.contains(event.target)) || (toggle && toggle.contains(event.target))) return;
+    closeAssignmentMenu();
+  });
+
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') closeAssignmentMenu();
+  });
 }
 </script>

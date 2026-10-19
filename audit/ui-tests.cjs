@@ -476,7 +476,7 @@ test('assignment hamburger drawer routes unfinished, completed, and search while
   const header = index.match(/<header class="assignment-header">([\s\S]*?)<\/header>/);
   const drawer = index.match(/<nav id="assignment-menu-drawer"[\s\S]*?<\/nav>/);
   assert.ok(header && header[1].includes('assignment-menu-toggle'));
-  assert.ok(header[1].indexOf('assignment-menu-toggle') < header[1].indexOf('課題通知Hub'));
+  assert.ok(header[1].indexOf('assignment-menu-toggle') < header[1].indexOf('課題通知'));
   assert.ok(drawer);
   const destinations = Array.from(drawer[0].matchAll(/<button id="assignment-menu-[^"]+"[^>]*>([\s\S]*?)<\/button>/g), match => match[1].replace(/<[^>]*>/g, '').trim());
   assert.deepEqual(destinations, ['○未完了', '✓完了', '⌕検索']);
@@ -497,12 +497,14 @@ test('assignment hamburger drawer routes unfinished, completed, and search while
   f.c.selectAssignmentMenu('completed');
   assert.equal(f.read('currentScreen'), 'completed');
   assert.equal(navCompleted.classList.contains('active'), true);
-  assert.equal(assignmentDrawer.inert, true);
+  assert.equal(assignmentDrawer.inert, false);
+  assert.equal(assignmentDrawer.classList.contains('is-open'), true);
   assert.ok(f.pending('getTaskDisplayPayloadForWeb').length);
 
   f.c.selectAssignmentMenu('search');
   assert.equal(f.document.getElementById('course-filter-panel').classList.contains('is-open'), true);
   assert.equal(navSearch.classList.contains('active'), true);
+  assert.equal(assignmentDrawer.classList.contains('is-open'), true);
   f.c.selectCourseFilter('仮想情報演習');
   assert.equal(f.document.getElementById('course-filter-panel').classList.contains('is-open'), false);
   assert.equal(navSearch.classList.contains('active'), true);
@@ -511,6 +513,7 @@ test('assignment hamburger drawer routes unfinished, completed, and search while
   assert.equal(f.read('currentScreen'), 'active');
   assert.equal(navActive.classList.contains('active'), true);
   assert.equal(navSearch.classList.contains('active'), true);
+  assert.equal(assignmentDrawer.classList.contains('is-open'), true);
 });
 
 test('reverse active/completed replies preserve completed screen and home cache', () => {
